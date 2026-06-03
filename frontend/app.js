@@ -3290,6 +3290,28 @@ function portal() {
       }
     },
 
+    // Open a background-task result file. Its output_file lives under
+    // /tmp/claude-<uid>/.../tasks/<id>.output — OUTSIDE the archive root, so
+    // the archive-scoped /api/files/read (and openByPathToasted's parent-dir
+    // list) can't reach it. Route through the dedicated /api/chat/task-output
+    // endpoint via openFile's readUrl override. No tree reveal (not in tree).
+    async openTaskOutput(ts) {
+      if (!ts || !ts.output_file) {
+        this.toast(this.lang === "zh" ? "没有结果文件" : "No result file", "warn");
+        return;
+      }
+      const path = ts.output_file;
+      const name = path.split("/").pop();
+      const url = "/api/chat/task-output?session_id="
+        + encodeURIComponent(this.currentId)
+        + "&path=" + encodeURIComponent(path);
+      try {
+        await this.openFile({ path, name }, { readUrl: url });
+      } catch (e) {
+        this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
+      }
+    },
+
     async login() {
       this.loginErr = "";
       this.token = this.tokenInput.trim();
@@ -4287,17 +4309,27 @@ function portal() {
       const st = this.tabState[sid];
       const expect = !!(st && st.pendingQueue && st.pendingQueue.length && !st._queuePaused);
       let active = false, startedAt = 0, uText = "", uImages = [], uDocs = [];
+      let continuation = false;
       try {
         const r = await fetch("/api/chat/sessions/" + sid + "/active",
                                { headers: this.hdr() });
         if (r.ok) {
           const d = await r.json();
           active = !!d.active; startedAt = d.started_at;
+          continuation = !!d.continuation;
           uText = d.user_text || "";
           uImages = d.user_images || [];
           uDocs = d.user_docs || [];
         }
       } catch (_e) {}
+      if (active && continuation && !this.streaming && this.currentId === sid) {
+        // The slot holds a bg-task continuation turn, not a queued item. Hand
+        // it to the continuation poller (no user bubble, no truncation) instead
+        // of the queue-drain reconnect below.
+        if (st) st._draining = false;
+        this.send({ reconnect: true, continuation: true, startedAt });
+        return;
+      }
       if (active && !this.streaming && this.currentId === sid) {
         if (st) st._draining = false;
         // FIX (queue live-render): when the SERVER drained a queued item and
@@ -4334,6 +4366,107 @@ function portal() {
         setTimeout(() => this._attachToServerTurn(sid, tries - 1), 350);
       } else if (st) {
         st._draining = false;
+      }
+    },
+    // ===== background-task continuation poller =====
+    // When an SDK background task (Agent / Bash run_in_background) is still
+    // running after its turn ended, the server keeps a watcher alive that — on
+    // completion — opens a HEADLESS CONTINUATION turn (broadcast in
+    // _active_turns, is_continuation=true) carrying the card flip + the model's
+    // auto-continue reaction. The browser only opens an SSE on send/reconnect,
+    // so without this poller the completion (30-60s later) would never surface
+    // live; the user would have to reload. While the open session shows a
+    // 'running' bg-task card, poll /active and attach in continuation mode the
+    // moment the watcher's broadcast appears. Self-stops once no running card
+    // remains (the task settled → card flipped) or after a hard cap.
+    _bgHasRunningCard(sid) {
+      const st = this.tabState[sid];
+      if (!st || !st.messages) return false;
+      return st.messages.some(m =>
+        m && m.role === "tool_use" && m.task_status
+        && m.task_status.state === "running");
+    },
+    _ensureBgContPoller(sid) {
+      this._bgContPollers = this._bgContPollers || {};
+      if (this._bgContPollers[sid]) return;          // already polling
+      if (!this._bgHasRunningCard(sid)) return;       // nothing to wait for
+      // Hard cap mirrors the server's MUSELAB_TASK_WATCH_TIMEOUT (1800s): at an
+      // 8s cadence that's ~225 ticks. Prevents an interval lingering forever if
+      // the user navigates away and the running card never resolves on the FE.
+      let ticksLeft = 230;
+      const tick = async () => {
+        if (ticksLeft-- <= 0) { this._stopBgContPoller(sid); return; }
+        // Card settled (flipped to done/failed) → done waiting.
+        if (!this._bgHasRunningCard(sid)) { this._stopBgContPoller(sid); return; }
+        // Not viewing this session, or already streaming → retry next tick.
+        if (this.currentId !== sid || this.streaming) return;
+        // PRIMARY completion path: a run_in_background task's terminal status
+        // round-trips through the session JSONL as a <task-notification> record
+        // (NOT a typed TaskNotificationMessage, so the cross-turn watcher's
+        // continuation never opens in practice). The backend history rebuild
+        // stamps the launching card's terminal task_status from that record;
+        // here we poll the history tail and reconcile it onto the live running
+        // cards so the badge flips ✅ in-place without a manual reload — then
+        // the next tick's _bgHasRunningCard check self-stops the poller.
+        try {
+          const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80",
+                                  { headers: this.hdr() });
+          if (hr.ok) {
+            const hs = await hr.json();
+            const settled = {};
+            (hs.messages || []).forEach(m => {
+              if (m && m.role === "tool_use" && m.id && m.task_status
+                  && m.task_status.state
+                  && m.task_status.state !== "running") {
+                settled[m.id] = m.task_status;
+              }
+            });
+            const st = this.tabState[sid];
+            if (st && st.messages) {
+              st.messages.forEach(m => {
+                if (m && m.role === "tool_use" && m.task_status
+                    && m.task_status.state === "running" && settled[m.id]) {
+                  // Reassign the whole object so Alpine's :class re-evaluates.
+                  m.task_status = Object.assign({}, m.task_status, settled[m.id]);
+                }
+              });
+            }
+          }
+        } catch (_e) {}
+        // BELT: the cross-turn continuation broadcast (works if a future SDK
+        // delivers a typed TaskNotificationMessage). Harmless no-op otherwise.
+        try {
+          const r = await fetch("/api/chat/sessions/" + sid + "/active",
+                                 { headers: this.hdr() });
+          if (!r.ok) return;
+          const d = await r.json();
+          if (d.active && d.continuation && !this.streaming
+              && this.currentId === sid) {
+            // Dedup: /active surfaces a finished continuation from the
+            // server's _recent_turns for the full 60s TTL, so if ANOTHER
+            // bg task keeps this poller alive the same continuation would be
+            // re-reconnected every 8s → duplicate reaction bubbles. Key on
+            // the continuation's started_at (unique epoch per broadcast) and
+            // replay each one at most once. The normal single-task case
+            // self-stops on the card flip and never reaches a second tick,
+            // but this makes the multi-task case safe too.
+            this._consumedConts = this._consumedConts || {};
+            const ckey = sid + ":" + d.started_at;
+            if (!this._consumedConts[ckey]) {
+              this._consumedConts[ckey] = true;
+              this.send({ reconnect: true, continuation: true,
+                           startedAt: d.started_at });
+            }
+          }
+        } catch (_e) {}
+      };
+      this._bgContPollers[sid] = setInterval(tick, 8000);
+      tick();   // kick once immediately
+    },
+    _stopBgContPoller(sid) {
+      if (this._bgContPollers && this._bgContPollers[sid]) {
+        clearInterval(this._bgContPollers[sid]);
+        delete this._bgContPollers[sid];
       }
     },
     async removePendingQueueItem(sid, idx) {
@@ -4933,19 +5066,18 @@ function portal() {
     webIsUrl(url) {
       return /^https?:\/\//.test(url || "");
     },
-    // Subagent task card data (Task tool with subagent_type field).
-    subagentCardInfo(m) {
-      if (!m || (m.name !== "Task" && m.name !== "Agent")) return null;
-      const inp = m.input || {};
-      return {
-        subagentType: inp.subagent_type || "general-purpose",
-        description: inp.description || "",
-        prompt: inp.prompt || "",
-        // Background mode shows distinct visual since the result may
-        // not arrive in this turn.
-        background: !!inp.run_in_background,
-        isolation: inp.isolation || "",
+    // Background-task status badge for the subagent card. `state` comes from
+    // the SDK Task* lifecycle (running / completed / failed / stopped; "done"
+    // is the forward-compat fallback for an unknown terminal status).
+    taskStatusLabel(state) {
+      const map = {
+        running:   "⏳ " + this.t("subagent.task_running"),
+        completed: "✅ " + this.t("subagent.task_completed"),
+        failed:    "❌ " + this.t("subagent.task_failed"),
+        stopped:   "⏹ " + this.t("subagent.task_stopped"),
+        done:      "✅ " + this.t("subagent.task_completed"),
       };
+      return map[state] || map.running;
     },
     // Skill card data — name + description + trigger summary.
     skillCardInfo(m) {
@@ -6411,7 +6543,10 @@ function portal() {
           // resumes from the true start, not from the reconnect moment
           // (otherwise the footer "running time" resets to 0 on every
           // reload / tab-switch / SSE re-subscribe to an in-flight turn).
-          this.send({ reconnect: true, startedAt: d.started_at });
+          // continuation: a bg-task watcher's headless turn — attach in
+          // continuation mode so we DON'T truncate the launching card.
+          this.send({ reconnect: true, startedAt: d.started_at,
+                       continuation: !!d.continuation });
           return;
         }
         // No active turn. The server drains the queue on its own when a turn
@@ -6419,6 +6554,10 @@ function portal() {
         // left after a process restart, which intentionally does NOT auto-
         // resume) just show in the UI with a Resume button — we don't auto-
         // kick here, matching the interrupted-turns "wait for the user" policy.
+        // But if this loaded session has a still-⏳ bg-task card (the JSONL
+        // rebuild rendered a running task), arm the continuation poller so its
+        // eventual completion surfaces live without a manual reload.
+        this._ensureBgContPoller(sid);
       } catch (e) { /* silent */ }
     },
 
@@ -8757,7 +8896,11 @@ function portal() {
         }
       }
       else {
-        const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
+        // `opts.readUrl` lets callers point at a non-archive backend route
+        // (e.g. bg-task .output files under /tmp via /api/chat/task-output)
+        // that the archive-scoped /api/files/read can't reach.
+        const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
+        const r = await fetch(readUrl, { headers: this.hdr() });
         if (r.ok) {
           this.previewMode = "text";
           this.rawText = await r.text();
@@ -11415,6 +11558,13 @@ function portal() {
       // to subscribe to the existing TurnBroadcast (empty prompt =
       // attach), all the EventSource handlers below stay the same.
       const isReconnect = !!opts.reconnect;
+      // Continuation mode: a reconnect that attaches to the bg-task watcher's
+      // HEADLESS CONTINUATION turn (it published the finished task's card flip
+      // + the model's auto-continue reaction). Unlike a queue-drain reconnect,
+      // we must NOT truncate the in-flight portion — the launching tool_use
+      // card lives there and the replayed task_notification needs to flip it
+      // to ✅done. The continuation's events APPEND after the existing cards.
+      const isContinuation = isReconnect && !!opts.continuation;
       // Resumed mode: _drainPendingQueue popped a previously-enqueued
       // message and asked us to send it. Pull text + attachments from
       // the item (NOT from this.input / this.pendingImages — those may
@@ -11569,7 +11719,7 @@ function portal() {
           })),
           docs: readyDocs.map(d => ({ name: d.name, kind: d.kind })),
         });
-      } else {
+      } else if (!isContinuation) {
         // Truncate the in-flight portion: the backend broadcast will
         // replay every event from the start of the turn (thinking +
         // assistant + tool_use + ...), and our handlers below push
@@ -11583,6 +11733,10 @@ function portal() {
           sendState.messages.splice(lastUserIdx + 1);
         }
       }
+      // (isContinuation: keep the existing messages intact — the watcher's
+      // broadcast only replays the NEW completion events: task_notification
+      // (flips the still-present running card) + the auto-continue reaction
+      // (appends as a fresh assistant bubble). Nothing to truncate.)
       // Single id-list for both kinds — backend dispatches by stored kind.
       const attachIds = isReconnect ? [] : [
         ...readyImages.map(im => im.id),
@@ -11834,6 +11988,25 @@ function portal() {
       };
       streamState._renderStreamingHtml = renderStreamingHtml;
 
+      // Attach SDK-native background-task lifecycle state to the launching
+      // tool_use card. The Task* messages (TaskStarted/Progress/Notification)
+      // carry tool_use_id = the SDK id of the Agent/Bash tool_use that started
+      // the background task, so we locate that message in the live turn and
+      // stamp `task_status` on it. The subagent card (index.html) renders
+      // ⏳ running → ✅/❌ from this. merge=true so a later progress/terminal
+      // event keeps fields an earlier event already set.
+      const applyTaskStatus = (toolUseId, patch, merge = true) => {
+        if (!toolUseId) return;
+        const msgs = streamState.messages;
+        for (let k = msgs.length - 1; k >= 0; k--) {
+          if (msgs[k] && msgs[k].id === toolUseId) {
+            const prev = (merge && msgs[k].task_status) ? msgs[k].task_status : {};
+            msgs[k].task_status = Object.assign({}, prev, patch);
+            return;
+          }
+        }
+      };
+
       es.addEventListener("text", ev => {
         let d;
         try { d = JSON.parse(ev.data); } catch (_) { return; }
@@ -11892,7 +12065,13 @@ function portal() {
         // backend/chat.py:1361 included id; the live stream path
         // just forgot to copy it across).
         const msg = { role: "tool_use", name: d.name, id: d.id,
-                       summary: d.summary, input: d.input };
+                       summary: d.summary, input: d.input,
+                       // Pre-declare the reactive key so a later
+                       // task_started/notification event (applyTaskStatus)
+                       // reliably triggers Alpine re-render. Adding a
+                       // brand-new key after the fact is unreliable for
+                       // :class re-eval (cf. ask_user_question pendingAnswers).
+                       task_status: null };
         if (d.todos != null) msg.todos = d.todos;
         if (d.task != null) msg.task = d.task;
         if (d.plan != null) msg.plan = d.plan;
@@ -11928,6 +12107,42 @@ function portal() {
           bash: d.bash || null,
         });
 
+        _scrollIfActive();
+      });
+      es.addEventListener("task_started", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        applyTaskStatus(d.tool_use_id, {
+          task_id: d.task_id,
+          state: "running",
+          description: d.description || "",
+        });
+        _scrollIfActive();
+      });
+      es.addEventListener("task_progress", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        applyTaskStatus(d.tool_use_id, {
+          task_id: d.task_id,
+          state: "running",
+          usage: d.usage || null,
+          last_tool_name: d.last_tool_name || "",
+        });
+      });
+      es.addEventListener("task_notification", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        // SDK status ∈ {completed, failed, stopped}; map unknown → "done"
+        // so a future status value still renders a terminal (not stuck)
+        // state instead of silently staying on ⏳.
+        const st = (d.status === "completed" || d.status === "failed"
+                     || d.status === "stopped") ? d.status : "done";
+        applyTaskStatus(d.tool_use_id, {
+          task_id: d.task_id,
+          state: st,
+          summary: d.summary || "",
+          output_file: d.output_file || "",
+        });
         _scrollIfActive();
       });
       es.addEventListener("ask_user_question", ev => {
@@ -12116,6 +12331,13 @@ function portal() {
         // path will pick it up. If the queue's tab isn't the active one,
         // drain bails too and activateTab handles it on return.
         this.$nextTick(() => this._drainPendingQueue(streamSid));
+        // If this turn left an SDK background task running (its card is still
+        // ⏳), start polling /active so the server's continuation turn (card
+        // flip + model auto-continue) surfaces live when the task finishes.
+        // Re-evaluated here after every turn — incl. a continuation's own
+        // `done`, which (having flipped the card) leaves no running card, so
+        // _ensureBgContPoller no-ops and the existing poller self-stops.
+        this.$nextTick(() => this._ensureBgContPoller(streamSid));
       });
       es.addEventListener("error", ev => {
         flushRender();
