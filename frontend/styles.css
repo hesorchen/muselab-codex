@@ -1898,6 +1898,83 @@ body.kb-open .mobile-tab-bar { display: none; }
    ========================================================================== */
 .preview-body { flex: 1; overflow: auto; position: relative; background: var(--c-bg-0); }
 .preview-body.drag-hover { outline: 2px dashed var(--c-accent); outline-offset: -8px; }
+
+/* Find-in-preview widget — floats top-right over the scrolling content,
+   VSCode-style. Sticky so it stays pinned while the user scrolls hits. */
+.preview-find {
+  position: sticky; top: var(--sp-2); z-index: 60;
+  width: max-content; max-width: calc(100% - var(--sp-4));
+  /* right-align the max-content block: auto left margin pushes it over */
+  margin: var(--sp-2) var(--sp-2) 0 auto;
+}
+.preview-find-bar {
+  display: flex; align-items: center; gap: var(--sp-1);
+  padding: var(--sp-1) var(--sp-2);
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+}
+.preview-find-icon { color: var(--c-fg-3); flex: 0 0 auto; }
+.preview-find-input {
+  width: 180px; max-width: 40vw;
+  border: none; outline: none; background: transparent;
+  color: var(--c-fg-0); font-size: var(--fs-sm);
+  padding: 2px 0;
+}
+.preview-find-input::placeholder { color: var(--c-fg-4); }
+.preview-find-count {
+  font-size: var(--fs-xs); color: var(--c-fg-3);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+  min-width: 2.5em; text-align: right;
+}
+.preview-find-btn {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px;
+  border: none; border-radius: var(--r-sm);
+  background: transparent; color: var(--c-fg-2);
+  font-size: var(--fs-sm); cursor: pointer; line-height: 1;
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.preview-find-btn:hover:not(:disabled) { background: var(--c-bg-3); color: var(--c-fg-0); }
+.preview-find-btn.active { background: var(--c-accent-soft); color: var(--c-accent); }
+.preview-find-btn:disabled { opacity: 0.35; cursor: default; }
+.preview-find-list {
+  margin-top: var(--sp-1);
+  max-height: 40vh; overflow: auto;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-md);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.18);
+  padding: 4px;
+}
+.preview-find-item {
+  display: flex; gap: var(--sp-1); align-items: baseline;
+  padding: 4px 6px; border-radius: var(--r-sm);
+  font-size: var(--fs-xs); color: var(--c-fg-2);
+  cursor: pointer; white-space: nowrap;
+}
+.preview-find-item:hover { background: var(--c-bg-3); }
+.preview-find-item.active { background: var(--c-accent-soft); color: var(--c-fg-0); }
+.preview-find-item-idx {
+  flex: 0 0 auto; color: var(--c-fg-4);
+  font-variant-numeric: tabular-nums; min-width: 1.5em; text-align: right;
+}
+.preview-find-item-snip { overflow: hidden; text-overflow: ellipsis; font-family: var(--font-mono); }
+.preview-find-item-snip mark,
+.preview-find-list mark { background: var(--c-accent-soft); color: var(--c-accent); padding: 0 1px; border-radius: 2px; }
+
+/* Injected highlight marks in the live preview content. */
+.preview-body mark.find-hit {
+  background: rgba(255, 213, 0, 0.38);
+  color: inherit; border-radius: 2px;
+  scroll-margin: 40px;
+}
+.preview-body mark.find-hit-active {
+  background: var(--c-accent); color: #fff;
+  box-shadow: 0 0 0 2px var(--c-accent-soft);
+}
 .preview-drop-overlay {
   position: absolute; inset: 0; z-index: 50;
   background: rgba(0, 0, 0, 0.35);

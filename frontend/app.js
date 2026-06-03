@@ -237,6 +237,14 @@ function portal() {
     // concrete pixel value and stop auto-fitting.
     openFilesHeight: null,
     previewMode: "", rawText: "", renderedMd: "", previewLang: "plaintext",
+    // Find-in-preview (magnifier). Searches the rendered DOM text of the
+    // md/text preview modes only (html/pdf live in a sandboxed iframe we
+    // can't reach; img has no text; xlsx/csv paginate). Case-insensitive,
+    // keyword match. `matches` holds serializable {snippet} for the results
+    // list; the parallel live <mark> elements are kept off-reactive in
+    // _pfEls so Vue/Alpine never proxies DOM nodes.
+    previewFind: { open: false, query: "", matches: [], active: -1, count: 0, listOpen: false },
+    _pfEls: [],
     // xlsx preview state. previewMode==='xlsx' uses xlsxSheets (array of
     // {name, rows, rows_truncated, cols_truncated}). xlsxActive picks the
     // sheet tab. xlsxLimits carries the server's row/col caps for the UI
@@ -8754,6 +8762,127 @@ function portal() {
         this.xlsxSheetsTruncated = !!e.xlsxSheetsTruncated;
       }
     },
+    // ----- Find in preview (magnifier) ----------------------------------
+    // The live container whose DOM text we search/highlight. Only the two
+    // text-rendering modes are addressable; everything else returns null and
+    // the magnifier button is hidden for them.
+    _previewFindContainer() {
+      const body = document.querySelector(".pane.preview .preview-body");
+      if (!body) return null;
+      if (this.previewMode === "md") return body.querySelector(".markdown");
+      if (this.previewMode === "text") return body.querySelector("pre.text code") || body.querySelector("pre.text");
+      return null;
+    },
+    togglePreviewFind() {
+      if (this.previewFind.open) { this.closePreviewFind(); return; }
+      this.previewFind.open = true;
+      // Focus the input on next paint, then re-run any leftover query.
+      this.$nextTick(() => {
+        const inp = document.querySelector(".preview-find-input");
+        if (inp) inp.focus();
+        if (this.previewFind.query) this.runPreviewFind();
+      });
+    },
+    closePreviewFind() {
+      this._clearPreviewFindMarks();
+      this.previewFind.open = false;
+      this.previewFind.matches = [];
+      this.previewFind.active = -1;
+      this.previewFind.count = 0;
+      this.previewFind.listOpen = false;
+    },
+    // Unwrap every <mark class="find-hit"> we injected, restoring the original
+    // text so a re-run (or close) leaves the DOM exactly as the renderer left
+    // it. parent.normalize() re-merges the split text nodes.
+    _clearPreviewFindMarks() {
+      this._pfEls = [];
+      const container = this._previewFindContainer();
+      if (!container) return;
+      const marks = container.querySelectorAll("mark.find-hit");
+      marks.forEach((m) => {
+        const parent = m.parentNode;
+        if (!parent) return;
+        parent.replaceChild(document.createTextNode(m.textContent), m);
+        parent.normalize();
+      });
+    },
+    _escHtml(s) {
+      return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    },
+    _previewFindSnippet(text, start, len) {
+      const a = Math.max(0, start - 30);
+      const b = Math.min(text.length, start + len + 30);
+      const pre = (a > 0 ? "…" : "") + this._escHtml(text.slice(a, start));
+      const hit = this._escHtml(text.slice(start, start + len));
+      const post = this._escHtml(text.slice(start + len, b)) + (b < text.length ? "…" : "");
+      return pre + "<mark>" + hit + "</mark>" + post;
+    },
+    runPreviewFind() {
+      this._clearPreviewFindMarks();
+      this.previewFind.matches = [];
+      this.previewFind.active = -1;
+      this.previewFind.count = 0;
+      const q = this.previewFind.query || "";
+      if (!q) return;
+      const container = this._previewFindContainer();
+      if (!container) return;
+      const needle = q.toLowerCase();
+      // Collect candidate text nodes first (mutating during a TreeWalker pass
+      // would invalidate the walker).
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT, {
+        acceptNode: (n) => {
+          if (!n.nodeValue) return NodeFilter.FILTER_REJECT;
+          const p = n.parentNode;
+          if (p && (p.nodeName === "SCRIPT" || p.nodeName === "STYLE")) return NodeFilter.FILTER_REJECT;
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      });
+      const textNodes = [];
+      let node;
+      while ((node = walker.nextNode())) textNodes.push(node);
+      const matches = [];
+      const els = [];
+      for (const tn of textNodes) {
+        const text = tn.nodeValue;
+        const lower = text.toLowerCase();
+        const starts = [];
+        let idx = 0, from = 0;
+        while ((idx = lower.indexOf(needle, from)) !== -1) { starts.push(idx); from = idx + needle.length; }
+        if (!starts.length) continue;
+        const frag = document.createDocumentFragment();
+        let cursor = 0;
+        for (const s of starts) {
+          if (s > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, s)));
+          const mark = document.createElement("mark");
+          mark.className = "find-hit";
+          mark.textContent = text.slice(s, s + needle.length);
+          frag.appendChild(mark);
+          els.push(mark);
+          matches.push({ snippet: this._previewFindSnippet(text, s, needle.length) });
+          cursor = s + needle.length;
+        }
+        if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+        tn.parentNode.replaceChild(frag, tn);
+      }
+      this._pfEls = els;
+      this.previewFind.matches = matches;
+      this.previewFind.count = matches.length;
+      if (matches.length) this.previewFindGoto(0);
+    },
+    previewFindGoto(i) {
+      const els = this._pfEls;
+      if (!els.length) return;
+      i = ((i % els.length) + els.length) % els.length;
+      els.forEach((e) => e && e.classList.remove("find-hit-active"));
+      const el = els[i];
+      if (el) {
+        el.classList.add("find-hit-active");
+        el.scrollIntoView({ block: "center", behavior: "smooth" });
+      }
+      this.previewFind.active = i;
+    },
+    previewFindNext() { if (this._pfEls.length) this.previewFindGoto(this.previewFind.active + 1); },
+    previewFindPrev() { if (this._pfEls.length) this.previewFindGoto(this.previewFind.active - 1); },
     async openFile(n, opts = {}) {
       // Unsaved-edits guard: switching to a DIFFERENT file while the editor
       // is dirty would silently drop the changes. Confirm first; abort the
@@ -8762,6 +8891,10 @@ function portal() {
       if (this.editing && n && n.path !== this.selected && !this._confirmLoseEdits()) {
         return;
       }
+      // Switching to a different file invalidates any open find session — the
+      // old file's <mark> nodes get blown away by the new x-html/x-text render
+      // anyway, so drop the find UI + state cleanly.
+      if (this.previewFind.open && n && n.path !== this.selected) this.closePreviewFind();
       // VSCode-style preview tab: a plain single-click in the tree opens the
       // file in ONE reusable, ephemeral italic "preview" slot. The slot
       // always FOLLOWS the user's latest single-click — opening any other
@@ -9121,6 +9254,9 @@ function portal() {
       // read endpoint for md / text. Useful when the file changed outside
       // muselab's normal write paths (terminal git pull, external editor).
       if (!this.selected) return;
+      // Re-render replaces the content nodes our find marks live in; close the
+      // find session so it doesn't dangle on detached <mark> elements.
+      if (this.previewFind.open) this.closePreviewFind();
       this.previewVersion = Date.now();
       // File content changed underneath us — drop any stale cached body so a
       // later tab switch back re-fetches instead of serving the old render.
@@ -10458,6 +10594,9 @@ function portal() {
         this.editing = false;
         return;
       }
+      // Entering edit mode hides the rendered .markdown/pre.text containers our
+      // find marks live in — close find so it can't point at a hidden DOM.
+      if (this.previewFind.open) this.closePreviewFind();
       // 进入编辑：确保 rawText 已加载（html/img/pdf 走 raw 模式时没 fetch 文本）
       if (!this.rawText || this.previewMode === "html" || this.previewMode === "pdf" || this.previewMode === "img") {
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(this.selected), { headers: this.hdr() });
