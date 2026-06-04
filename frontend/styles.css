@@ -750,11 +750,13 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      two lines. Surgical strikes:
      ============================================================ */
 
-  /* Files pane head: drop upload / mkdir / hidden-toggle / refresh.
+  /* Files pane head: drop mkdir / hidden-toggle / refresh on mobile.
      User asks Muse for new dirs; pull-to-refresh covers reload (planned).
-     Theme toggle is KEPT on mobile (marker `.files-keep-mobile`) — phone
-     users switch theme often and Settings is too many taps away. The
-     file-search bar lives below the header and stays visible regardless. */
+     KEPT on mobile (marker `.files-keep-mobile`): theme toggle (phone users
+     switch theme often, Settings is too many taps away) and upload (touch
+     has no drag-drop, and per-node context-menu upload is dir-only — the
+     header button is the only way to push a file to the archive root from a
+     phone). The file-search bar lives below the header and stays visible. */
   .pane.files .pane-head .icon-btn:not(.files-keep-mobile) { display: none; }
 
   /* Command palette magnifier — on phones it moves OUT of the cramped chat

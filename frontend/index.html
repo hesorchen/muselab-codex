@@ -276,7 +276,7 @@
       <header class="pane-head">
         <span class="pane-title"><span class="icon"><svg><use href="#i-folder"/></svg></span><span x-text="t('pane.files')"></span></span>
         <span class="spacer"></span>
-        <button @click="$refs.upload.click()" class="icon-btn" :title="t('btn.upload')"><svg><use href="#i-upload"/></svg></button>
+        <button @click="$refs.upload.click()" class="icon-btn files-keep-mobile" :title="t('btn.upload')"><svg><use href="#i-upload"/></svg></button>
         <button @click="mkdirPrompt()" class="icon-btn" :title="t('btn.new_dir')"><svg><use href="#i-folder-plus"/></svg></button>
         <button @click="toggleHidden()" class="icon-btn"
                 :class="showHidden ? 'active' : ''"
