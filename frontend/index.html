@@ -380,17 +380,18 @@
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
           <span class="path" x-text="contextInfo.archive_root || '—'"></span>
         </div>
-      <ul class="filelist" x-init="_attachPTR($el, () => reloadTree())">
+      <ul class="filelist" x-init="_attachPTR($el, () => reloadTree())"
+          @mousedown.self="onMarqueeStart($event)">
         <template x-for="n in visible" :key="n.path">
-          <li :class="{file: !n.is_dir, dir: n.is_dir, sel: selected===n.path, 'drag-over': dragOver===n.path}"
+          <li :class="{file: !n.is_dir, dir: n.is_dir, sel: isRowSelected(n), 'drag-over': dragOver===n.path}"
               :style="`padding-left:${10 + n.depth*14}px; --depth: ${n.depth}`"
               :data-path="n.path"
               :data-depth="n.depth"
               :data-ext="fileExtClass(n)"
               :draggable="isPointerDevice"
               @dragstart="onTreeNodeDragStart($event, n)"
-              @dragend="dragOver=''; dragOverRoot=false"
-              @click="onNodeClick(n)"
+              @dragend="dragOver=''; dragOverRoot=false; _dragSrcPath=null; _dragSrcPaths=null"
+              @click="onNodeClick($event, n)"
               @touchstart="onTreeTouchStart($event, n)"
               @touchmove="onTreeTouchMove($event)"
               @touchend="onTreeTouchEnd($event)"
@@ -428,6 +429,12 @@
           </li>
         </template>
       </ul>
+      <!-- Marquee (rubber-band) selection box. Lives in .filelist-wrap (which
+           is position:relative + overflow:hidden, so the box is clipped to the
+           pane) and is drawn in viewport-relative coords so it tracks a fixed
+           screen region while the list auto-scrolls underneath. Desktop only. -->
+      <div class="tree-marquee" x-show="marquee.active"
+           :style="`left:${marquee.x}px; top:${marquee.y}px; width:${marquee.w}px; height:${marquee.h}px`"></div>
       </div>
 
       <!-- 搜索结果 -->
@@ -2743,40 +2750,45 @@
   <div class="ctx-menu" x-show="ctxMenu.show"
        :style="`top:${ctxMenu.y}px; left:${ctxMenu.x}px`"
        @click.away="ctxMenu.show=false">
+    <!-- 批量模式：右键命中多选集合时，只显示批量操作 -->
+    <button class="ctx-item danger" @click="ctxMenu.show=false; deleteSelected()" x-show="ctxMenu.multi > 1">
+      <span class="icon"><svg><use href="#i-trash"/></svg></span>
+      <span x-text="(lang==='zh' ? '删除选中 ' : 'Delete ') + ctxMenu.multi + (lang==='zh' ? ' 项' : ' selected')"></span>
+    </button>
     <!-- 目录专属：新建 -->
-    <button class="ctx-item" @click="ctxAction('newFile')" x-show="(ctxMenu.node && ctxMenu.node.is_dir)">
+    <button class="ctx-item" @click="ctxAction('newFile')" x-show="!ctxMenu.multi && (ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-file"/></svg></span><span x-text="t('btn.new_file')"></span>
     </button>
-    <button class="ctx-item" @click="ctxAction('newDir')" x-show="(ctxMenu.node && ctxMenu.node.is_dir)">
+    <button class="ctx-item" @click="ctxAction('newDir')" x-show="!ctxMenu.multi && (ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-folder-plus"/></svg></span><span x-text="t('btn.new_dir')"></span>
     </button>
-    <button class="ctx-item" @click="ctxAction('upload')" x-show="(ctxMenu.node && ctxMenu.node.is_dir)">
+    <button class="ctx-item" @click="ctxAction('upload')" x-show="!ctxMenu.multi && (ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-upload"/></svg></span><span x-text="t('btn.upload')"></span>
     </button>
-    <div class="ctx-sep" x-show="(ctxMenu.node && ctxMenu.node.is_dir)"></div>
+    <div class="ctx-sep" x-show="!ctxMenu.multi && (ctxMenu.node && ctxMenu.node.is_dir)"></div>
     <!-- 文件专属 -->
-    <button class="ctx-item" @click="ctxAction('open')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
+    <button class="ctx-item" @click="ctxAction('open')" x-show="!ctxMenu.multi && !(ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-eye"/></svg></span><span x-text="t('btn.preview')"></span>
     </button>
-    <button class="ctx-item" @click="ctxAction('mention')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
+    <button class="ctx-item" @click="ctxAction('mention')" x-show="!ctxMenu.multi && !(ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-at"/></svg></span><span x-text="t('btn.at_mention')"></span>
     </button>
-    <button class="ctx-item" @click="ctxAction('download')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
+    <button class="ctx-item" @click="ctxAction('download')" x-show="!ctxMenu.multi && !(ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-download"/></svg></span><span x-text="t('btn.download')"></span>
     </button>
     <!-- 文件专属：复制为 .bak -->
-    <button class="ctx-item" @click="ctxAction('copyAsBak')" x-show="!(ctxMenu.node && ctxMenu.node.is_dir)">
+    <button class="ctx-item" @click="ctxAction('copyAsBak')" x-show="!ctxMenu.multi && !(ctxMenu.node && ctxMenu.node.is_dir)">
       <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_as_bak')"></span>
     </button>
     <!-- 通用 -->
-    <button class="ctx-item" @click="ctxAction('copyPath')">
+    <button class="ctx-item" @click="ctxAction('copyPath')" x-show="!ctxMenu.multi">
       <span class="icon"><svg><use href="#i-copy"/></svg></span><span x-text="t('btn.copy_path')"></span>
     </button>
-    <button class="ctx-item" @click="ctxAction('rename')">
+    <button class="ctx-item" @click="ctxAction('rename')" x-show="!ctxMenu.multi">
       <span class="icon"><svg><use href="#i-edit"/></svg></span><span x-text="t('btn.rename')"></span>
     </button>
-    <div class="ctx-sep"></div>
-    <button class="ctx-item danger" @click="ctxAction('delete')">
+    <div class="ctx-sep" x-show="!ctxMenu.multi"></div>
+    <button class="ctx-item danger" @click="ctxAction('delete')" x-show="!ctxMenu.multi">
       <span class="icon"><svg><use href="#i-trash"/></svg></span><span x-text="t('btn.delete')"></span>
     </button>
   </div>

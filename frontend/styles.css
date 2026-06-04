@@ -1659,6 +1659,29 @@ body.kb-open .mobile-tab-bar { display: none; }
 }
 .filelist li.sel .icon { color: var(--c-accent); }
 .filelist li.drag-over { background: var(--c-accent); color: white; box-shadow: inset 0 0 0 2px white; }
+
+/* Marquee (rubber-band) drag-select box. Absolutely positioned inside
+   .filelist-wrap (position:relative), below the sticky root bar (z-index:2)
+   so the bar still covers it at the top. pointer-events:none so it never
+   eats the mousemove/up that drive the drag. */
+.tree-marquee {
+  position: absolute;
+  z-index: 1;
+  pointer-events: none;
+  border: 1px solid var(--c-accent);
+  border-radius: 2px;
+  background: rgba(80, 140, 255, 0.15);                         /* fallback */
+  background: color-mix(in srgb, var(--c-accent) 16%, transparent);
+}
+/* Count badge used as the drag image for a multi-item drag. Parked off-screen
+   (it only needs to exist long enough for setDragImage to snapshot it). */
+.tree-drag-badge {
+  position: fixed; top: 0; left: -9999px;
+  padding: 2px 9px; border-radius: 11px;
+  background: var(--c-accent); color: #fff;
+  font-size: var(--fs-xs); font-weight: 600;
+  white-space: nowrap;
+}
 /* "Reveal in tree" flash — fires from revealInTree() so the user always
    sees feedback, even when the target row is already onscreen or isn't
    the currently selected file. Pulses background + left-bar accent twice

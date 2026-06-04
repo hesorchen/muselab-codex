@@ -210,6 +210,18 @@ function portal() {
     // Highlight flag for the sticky root bar while a tree node / OS file is
     // dragged over it (drop = move/upload to archive root).
     dragOverRoot: false,
+    // ===== multi-select (desktop) =====
+    // `selectedPaths` is the batch set (paths); `selected` stays the single
+    // active/preview/edit focus so all the single-target logic (preview pane,
+    // editor, copy-as-bak) keeps working untouched. Sets are reassigned (not
+    // mutated in place) on every change — Alpine's Proxy doesn't trap Set
+    // mutation, same gotcha as `expanded`.
+    selectedPaths: new Set(),
+    _selAnchor: "",                 // anchor row for Shift-range selection
+    // Marquee (rubber-band) drag-select box, rendered inside .filelist-wrap in
+    // viewport-relative coords (so it tracks a fixed screen region while the
+    // list auto-scrolls underneath — matching native OS marquee feel).
+    marquee: { active: false, x: 0, y: 0, w: 0, h: 0 },
     searchQ: "", searchMode: false, searching: false,
     searchHits: [], searchTruncated: false,
     grepHits: [], grepTruncated: false,
@@ -618,7 +630,7 @@ function portal() {
     // ===== toast / modal / ctx menu =====
     toasts: [], _toastId: 0,
     modal: { show: false, title: "", body: "", input: null, confirm: null, cancel: null, okText: "", cancelText: "", danger: false },
-    ctxMenu: { show: false, x: 0, y: 0, node: null },
+    ctxMenu: { show: false, x: 0, y: 0, node: null, multi: 0 },
     // File-tree clipboard. Ctrl+C on a selected file (focus outside any
     // input) sets this; Ctrl+V calls /api/files/copy-bak to materialise a
     // .bak in the currently-selected directory (or the source's parent if
@@ -914,7 +926,22 @@ function portal() {
         // 退出编辑 — guard against silently discarding unsaved edits when ESC
         // is pressed out of habit (blur the focus). Only confirm when dirty.
         if (this.editing) { if (this._confirmLoseEdits()) this.editing = false; return; }
+        if (this.selectedPaths.size) { this.clearTreeSelection(); return; }  // 清空多选
         if (this.streaming) { this.stop(); return; }          // 停止流式
+      }
+      // Delete / Backspace → batch-trash the multi-selection. Only fires when
+      // there's an explicit batch set (size > 0) and focus is outside any
+      // text field / editor — so it never hijacks normal Backspace or deletes
+      // the merely-previewed file out from under the user.
+      if ((ev.key === "Delete" || ev.key === "Backspace") && this.selectedPaths.size > 0) {
+        const ae = document.activeElement;
+        const tag = ae && ae.tagName;
+        const inField = tag === "INPUT" || tag === "TEXTAREA"
+                        || (ae && ae.isContentEditable);
+        if (inField || this.editing) return;
+        ev.preventDefault();
+        this.deleteSelected();
+        return;
       }
       // `?` shows keyboard cheat-sheet — only when nothing has focus
       // (we don't want to swallow it inside the chat textarea or any
@@ -8197,7 +8224,28 @@ function portal() {
       this.reloadTree();
       this.toast(this.t(this.showHidden ? "toast.hidden_shown" : "toast.hidden_hidden"), "info", 1500);
     },
-    async onNodeClick(n) {
+    async onNodeClick(ev, n) {
+      // ---- Desktop multi-select modifiers ----
+      // Ctrl/Cmd-click toggles a single row in/out of the batch set; Shift-
+      // click selects the range from the anchor. Both suppress the default
+      // open/expand so a multi-select gesture never also flips a preview or
+      // collapses a folder. Touch never carries these modifiers, and marquee
+      // is desktop-only, so this is effectively desktop-only behavior.
+      if (ev && (ev.ctrlKey || ev.metaKey)) {
+        this._toggleSelect(n.path);
+        this._selAnchor = n.path;
+        this.selected = n.path;          // active focus follows the toggled row
+        return;
+      }
+      if (ev && ev.shiftKey) {
+        if (ev.preventDefault) ev.preventDefault();   // suppress text selection
+        this._rangeSelect(n.path);
+        this.selected = n.path;
+        return;
+      }
+      // ---- Plain click → single selection (clears any batch set) ----
+      this.clearTreeSelection();
+      this._selAnchor = n.path;
       if (n.is_dir) {
         if (this.expanded.has(n.path)) this.collapse(n);
         else await this.expand(n);
@@ -8206,6 +8254,39 @@ function portal() {
         // Single-click ⇒ ephemeral preview tab (VSCode behavior).
         await this.openFile(n, { preview: true });
       }
+    },
+    // ===== multi-select helpers =====
+    // Row highlight. While a batch selection is active (size > 0), ONLY set
+    // members highlight — this makes Ctrl-click toggle-off and marquee-replace
+    // read correctly even when `selected` (the preview focus) still points at
+    // a row outside the box. With no batch, fall back to the single
+    // active/preview highlight (unchanged legacy behavior).
+    isRowSelected(n) {
+      if (this.selectedPaths.size) return this.selectedPaths.has(n.path);
+      return this.selected === n.path;
+    },
+    clearTreeSelection() {
+      if (this.selectedPaths.size) this.selectedPaths = new Set();
+      this._selAnchor = "";
+    },
+    _setSelection(paths) {
+      this.selectedPaths = new Set(paths);
+    },
+    _toggleSelect(path) {
+      const s = new Set(this.selectedPaths);
+      if (s.has(path)) s.delete(path);
+      else s.add(path);
+      this.selectedPaths = s;
+    },
+    // Range-select from the anchor to `targetPath` in flattened `visible`
+    // order. Falls back to a single selection when the anchor is gone.
+    _rangeSelect(targetPath) {
+      const anchor = this._selAnchor || this.selected || targetPath;
+      const ai = this.visible.findIndex(x => x.path === anchor);
+      const ti = this.visible.findIndex(x => x.path === targetPath);
+      if (ai < 0 || ti < 0) { this._setSelection([targetPath]); return; }
+      const [lo, hi] = ai <= ti ? [ai, ti] : [ti, ai];
+      this._setSelection(this.visible.slice(lo, hi + 1).map(x => x.path));
     },
     // Double-click a tree file ⇒ pin it as a permanent tab. The two preceding
     // single-click events already opened it in the preview slot; this just
@@ -8245,11 +8326,21 @@ function portal() {
     },
     // ===== context menu =====
     openCtxMenu(ev, n) {
+      // Right-clicking a row that's part of a batch selection keeps the whole
+      // set and shows batch actions; right-clicking outside the set falls back
+      // to single-target (and clears the stale batch so the menu acts on what
+      // was actually clicked).
+      let multi = 0;
+      if (n && this.selectedPaths.size > 1 && this.selectedPaths.has(n.path)) {
+        multi = this.selectedPaths.size;
+      } else if (this.selectedPaths.size) {
+        this.clearTreeSelection();
+      }
       // Clamp to viewport so menu doesn't overflow.
       const MENU_W = 200, MENU_H = 280;
       const x = Math.min(ev.clientX, window.innerWidth - MENU_W - 8);
       const y = Math.min(ev.clientY, window.innerHeight - MENU_H - 8);
-      this.ctxMenu = { show: true, x, y, node: n };
+      this.ctxMenu = { show: true, x, y, node: n, multi };
     },
     async ctxAction(action) {
       const n = this.ctxMenu.node;
@@ -10162,14 +10253,47 @@ function portal() {
     _DRAG_MIME_INTERNAL: "application/x-muselab-path",
 
     onTreeNodeDragStart(ev, n) {
+      // Multi-drag: if the grabbed row is part of a batch selection, drag the
+      // WHOLE set. Dragging a row that's NOT in the set is a fresh single drag
+      // — clear any stale selection so the highlight matches what moves.
+      let paths;
+      if (this.selectedPaths.size > 1 && this.selectedPaths.has(n.path)) {
+        paths = Array.from(this.selectedPaths);
+      } else {
+        paths = [n.path];
+        if (!this.selectedPaths.has(n.path)) this.clearTreeSelection();
+      }
+      // Payload = newline-joined paths. Single drags stay one line, so the
+      // existing single-path consumers keep working via _parseDragPaths.
       // Stamp both our custom mime (used in onDrop to know "this is a
       // tree-internal move, not an OS upload") and text/plain (broad
       // compatibility — some browsers strip custom types in certain
       // scenarios). text/plain doubles as fallback.
-      ev.dataTransfer.setData(this._DRAG_MIME_INTERNAL, n.path);
-      ev.dataTransfer.setData("text/plain", n.path);
+      const payload = paths.join("\n");
+      ev.dataTransfer.setData(this._DRAG_MIME_INTERNAL, payload);
+      ev.dataTransfer.setData("text/plain", payload);
       ev.dataTransfer.effectAllowed = "move";
-      this._dragSrcPath = n.path;
+      this._dragSrcPath = n.path;        // representative (dragover guards)
+      this._dragSrcPaths = paths;
+      // Count badge as the drag image for multi-drag, so the user sees how
+      // many items are in flight.
+      if (paths.length > 1 && ev.dataTransfer.setDragImage) {
+        const badge = document.createElement("div");
+        badge.className = "tree-drag-badge";
+        badge.textContent = this.lang === "zh"
+          ? `${paths.length} 项` : `${paths.length} items`;
+        document.body.appendChild(badge);
+        ev.dataTransfer.setDragImage(badge, -8, -8);
+        setTimeout(() => badge.remove(), 0);
+      }
+    },
+    // Parse the internal-drag payload (newline-joined paths) into an array,
+    // falling back to the stashed representative path if the dataTransfer
+    // payload is unavailable (some drop scenarios).
+    _parseDragPaths(ev, fallback) {
+      const raw = (ev.dataTransfer && ev.dataTransfer.getData(this._DRAG_MIME_INTERNAL))
+                  || fallback || "";
+      return raw.split("\n").map(s => s.trim()).filter(Boolean);
     },
     // ===== long-press → context menu (touch) =====
     // HTML5 drag-and-drop is dead on touch and iOS Safari hijacks long-press
@@ -10258,8 +10382,9 @@ function portal() {
       const types = Array.from(ev.dataTransfer?.types || []);
       const isInternal = types.includes(this._DRAG_MIME_INTERNAL);
       if (isInternal) {
-        const src = ev.dataTransfer.getData(this._DRAG_MIME_INTERNAL) || wasSrc;
-        await this.moveTreeItem(src, targetDir);
+        const srcs = this._parseDragPaths(ev, wasSrc);
+        this._dragSrcPaths = null;
+        await this.moveTreeItems(srcs, targetDir);
         return;
       }
 
@@ -10323,8 +10448,9 @@ function portal() {
       this._dragSrcPath = null;
       const types = Array.from(ev.dataTransfer?.types || []);
       if (types.includes(this._DRAG_MIME_INTERNAL)) {
-        const src = ev.dataTransfer.getData(this._DRAG_MIME_INTERNAL) || wasSrc;
-        await this.moveTreeItem(src, "");
+        const srcs = this._parseDragPaths(ev, wasSrc);
+        this._dragSrcPaths = null;
+        await this.moveTreeItems(srcs, "");
         return;
       }
       // OS file upload → archive root.
@@ -10369,6 +10495,197 @@ function portal() {
       const openTab = this.tabs.find(t => t.path === srcPath);
       if (openTab) openTab.path = newPath;
       await this.reloadTree();
+    },
+    // Batch move: drag a multi-selection onto a folder (or the root bar).
+    // Delegates to the single-item path when there's only one, so toasts /
+    // edge-case messaging stay specific. For >1 we validate each item (skip
+    // no-ops and cycles), fire the renames in parallel, then reload + reroute
+    // open tabs ONCE. No backend batch endpoint — same parallel-then-refresh
+    // pattern as _uploadFilesToDir.
+    async moveTreeItems(srcPaths, targetDir) {
+      const list = (srcPaths || []).filter(Boolean);
+      if (!list.length) return;
+      if (list.length === 1) {
+        await this.moveTreeItem(list[0], targetDir);
+        this.clearTreeSelection();
+        return;
+      }
+      const plan = [];
+      for (const src of list) {
+        const srcParent = src.split("/").slice(0, -1).join("/");
+        if (srcParent === targetDir) continue;                       // no-op
+        if (src === targetDir || (targetDir + "/").startsWith(src + "/")) continue; // cycle
+        const name = src.split("/").pop();
+        plan.push({ src, dst: targetDir ? `${targetDir}/${name}` : name });
+      }
+      if (!plan.length) { this.clearTreeSelection(); return; }
+      const results = await Promise.allSettled(plan.map(p =>
+        fetch("/api/files/rename", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ src: p.src, dst: p.dst }),
+        }).then(r => (r.ok ? p : Promise.reject(new Error(p.src))))
+      ));
+      const okItems = results.filter(r => r.status === "fulfilled").map(r => r.value);
+      const failed = results.length - okItems.length;
+      // Reroute the active focus + any open tabs for moved items.
+      for (const { src, dst } of okItems) {
+        if (this.selected === src) this.selected = dst;
+        const tab = this.tabs.find(t => t.path === src);
+        if (tab) tab.path = dst;
+      }
+      this.clearTreeSelection();
+      await this.reloadTree();
+      const zh = this.lang === "zh";
+      const into = targetDir ? `/${targetDir}` : (zh ? "/(根)" : "/(root)");
+      if (failed && !okItems.length) {
+        this.toast(zh ? `${failed} 项移动失败` : `${failed} item(s) failed to move`, "error", 4000);
+      } else if (failed) {
+        this.toast(zh ? `已移动 ${okItems.length} 项到 ${into}，${failed} 项失败`
+                      : `Moved ${okItems.length} to ${into}, ${failed} failed`, "warn", 4000);
+      } else {
+        this.toast(zh ? `已移动 ${okItems.length} 项到 ${into}`
+                      : `Moved ${okItems.length} items to ${into}`, "success", 2200);
+      }
+    },
+    // Batch-trash the current multi-selection. Single selection delegates to
+    // the per-file doDelete (which has the nicer single-item confirm + Undo
+    // toast). For >1 we confirm once, soft-delete in parallel, then reload +
+    // sync tabs. No per-item Undo for batches — items are still recoverable
+    // from the trash modal.
+    async deleteSelected() {
+      const paths = Array.from(this.selectedPaths);
+      if (paths.length <= 1) {
+        const p = paths[0] || this.selected;
+        const node = p && this._findTreeNode(p);
+        if (node) await this.doDelete(node);
+        return;
+      }
+      const zh = this.lang === "zh";
+      const ok = await this.confirm({
+        title: zh ? "批量移到垃圾桶" : "Move to trash",
+        body: zh ? `把选中的 ${paths.length} 项移到垃圾桶？可在垃圾桶里恢复。`
+                 : `Move ${paths.length} selected items to trash? Recoverable from the trash.`,
+        okText: zh ? "移到垃圾桶" : "Move to trash",
+      });
+      if (!ok) return;
+      const results = await Promise.allSettled(paths.map(p =>
+        fetch("/api/files/delete", {
+          method: "DELETE",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: p }),
+        }).then(r => (r.ok ? p : Promise.reject(new Error(p))))
+      ));
+      const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
+      const failed = results.length - okPaths.length;
+      for (const p of okPaths) {
+        this.tabs = this.tabs.filter(t => t.path !== p);
+        if (this.selected === p) { this.selected = ""; this.previewMode = ""; }
+      }
+      this.trash.count += okPaths.length;
+      this.clearTreeSelection();
+      await this.reloadTree();
+      if (failed && !okPaths.length) {
+        this.toast(zh ? `${failed} 项删除失败` : `${failed} item(s) failed to delete`, "error", 4000);
+      } else if (failed) {
+        this.toast(zh ? `已移到垃圾桶 ${okPaths.length} 项，${failed} 项失败`
+                      : `Trashed ${okPaths.length}, ${failed} failed`, "warn", 4000);
+      } else {
+        this.toast(zh ? `已移到垃圾桶 ${okPaths.length} 项`
+                      : `Moved ${okPaths.length} items to trash`, "success", 3000);
+      }
+    },
+    // ===== marquee (rubber-band) drag-select — desktop only =====
+    // Started from EMPTY list space only (@mousedown.self on the <ul>), so a
+    // mousedown ON a row still begins a native file drag — no conflict with
+    // the HTML5 move-DnD. Drawn in viewport coords relative to .filelist-wrap;
+    // rows whose bounding box intersects the box join the selection each frame.
+    onMarqueeStart(ev) {
+      if (!this.isPointerDevice) return;       // desktop pointers only
+      if (ev.button !== 0) return;             // left button only
+      this._marqueeList = ev.currentTarget;    // the <ul class="filelist">
+      this._marqueeStart = { x: ev.clientX, y: ev.clientY };
+      this._marqueeCur = { x: ev.clientX, y: ev.clientY };
+      // Holding Ctrl/Cmd/Shift adds to the existing selection; plain drag
+      // replaces it.
+      this._marqueeAdditive = ev.ctrlKey || ev.metaKey || ev.shiftKey;
+      this._marqueeBase = this._marqueeAdditive ? new Set(this.selectedPaths) : new Set();
+      this._marqueeMoved = false;
+      this.marquee = { active: false, x: 0, y: 0, w: 0, h: 0 };
+      this._onMarqueeMove = (e) => this._marqueeMove(e);
+      this._onMarqueeUp = (e) => this._marqueeUp(e);
+      window.addEventListener("mousemove", this._onMarqueeMove);
+      window.addEventListener("mouseup", this._onMarqueeUp);
+      ev.preventDefault();                     // no text selection while dragging
+    },
+    _marqueeMove(ev) {
+      if (!this._marqueeStart) return;
+      const dx = ev.clientX - this._marqueeStart.x;
+      const dy = ev.clientY - this._marqueeStart.y;
+      // Threshold so a tiny jitter on a plain click doesn't draw a box.
+      if (!this._marqueeMoved && Math.abs(dx) < 4 && Math.abs(dy) < 4) return;
+      this._marqueeMoved = true;
+      this._marqueeCur = { x: ev.clientX, y: ev.clientY };
+      if (this._marqueeRAF) return;
+      this._marqueeRAF = requestAnimationFrame(() => {
+        this._marqueeRAF = 0;
+        this._marqueeUpdate();
+      });
+    },
+    _marqueeUpdate() {
+      if (!this._marqueeStart || !this._marqueeCur || !this._marqueeList) return;
+      const list = this._marqueeList;
+      const wrap = list.parentElement;          // .filelist-wrap (position:relative)
+      const wr = wrap.getBoundingClientRect();
+      const lr = list.getBoundingClientRect();
+      // Auto-scroll when the cursor nears the list's top/bottom edge.
+      const EDGE = 28;
+      let scrollDelta = 0;
+      if (this._marqueeCur.y < lr.top + EDGE) {
+        scrollDelta = -Math.min(18, lr.top + EDGE - this._marqueeCur.y);
+      } else if (this._marqueeCur.y > lr.bottom - EDGE) {
+        scrollDelta = Math.min(18, this._marqueeCur.y - (lr.bottom - EDGE));
+      }
+      if (scrollDelta) list.scrollTop += scrollDelta;
+      // Box in viewport coords.
+      const x0 = Math.min(this._marqueeStart.x, this._marqueeCur.x);
+      const y0 = Math.min(this._marqueeStart.y, this._marqueeCur.y);
+      const x1 = Math.max(this._marqueeStart.x, this._marqueeCur.x);
+      const y1 = Math.max(this._marqueeStart.y, this._marqueeCur.y);
+      // Render relative to the wrap (which clips via overflow:hidden).
+      this.marquee = { active: true, x: x0 - wr.left, y: y0 - wr.top, w: x1 - x0, h: y1 - y0 };
+      // Hit-test every rendered row.
+      const sel = new Set(this._marqueeBase);
+      list.querySelectorAll(":scope > li[data-path]").forEach(li => {
+        const r = li.getBoundingClientRect();
+        if (r.bottom > y0 && r.top < y1 && r.right > x0 && r.left < x1) {
+          sel.add(li.dataset.path);
+        }
+      });
+      this.selectedPaths = sel;
+      // Keep the loop alive while auto-scrolling so rows keep getting picked
+      // up even if the cursor holds still in the edge zone.
+      if (scrollDelta && !this._marqueeRAF) {
+        this._marqueeRAF = requestAnimationFrame(() => {
+          this._marqueeRAF = 0;
+          this._marqueeUpdate();
+        });
+      }
+    },
+    _marqueeUp() {
+      window.removeEventListener("mousemove", this._onMarqueeMove);
+      window.removeEventListener("mouseup", this._onMarqueeUp);
+      if (this._marqueeRAF) { cancelAnimationFrame(this._marqueeRAF); this._marqueeRAF = 0; }
+      const moved = this._marqueeMoved;
+      const additive = this._marqueeAdditive;
+      this._marqueeStart = null;
+      this._marqueeCur = null;
+      this._marqueeList = null;
+      this._marqueeMoved = false;
+      this.marquee = { active: false, x: 0, y: 0, w: 0, h: 0 };
+      // A plain click on empty space (no drag) clears the selection.
+      if (!moved && !additive) this.clearTreeSelection();
+      if (moved && this.selectedPaths.size) this._selAnchor = "";
     },
     async mkdirPrompt() {
       const zh = this.lang === "zh";
