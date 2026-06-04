@@ -8288,6 +8288,15 @@ function portal() {
       const [lo, hi] = ai <= ti ? [ai, ti] : [ti, ai];
       this._setSelection(this.visible.slice(lo, hi + 1).map(x => x.path));
     },
+    // Drop any path whose ANCESTOR is also in the set. Deleting / moving a
+    // folder already takes its descendants with it, so firing both in
+    // parallel races: the folder gets trashed first and the child's path
+    // 404s ("not found"). Keeping only top-level ancestors makes batch ops
+    // idempotent regardless of whether the user also picked nested children
+    // (possible via Ctrl-click / Shift-range, which can span dirs + files).
+    _pruneDescendants(paths) {
+      return paths.filter(p => !paths.some(q => q !== p && p.startsWith(q + "/")));
+    },
     // Double-click a tree file ⇒ pin it as a permanent tab. The two preceding
     // single-click events already opened it in the preview slot; this just
     // promotes that slot to permanent (openFile's `existing && !asPreview`
@@ -8575,6 +8584,16 @@ function portal() {
         });
       } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
       if (!r.ok) {
+        // 404 = already gone (stale tree row, or its parent dir was trashed
+        // moments ago). The goal state is reached, so refresh the tree to
+        // drop the phantom row rather than surfacing a "not found" error.
+        if (r.status === 404) {
+          this.tabs = this.tabs.filter(t => t.path !== n.path);
+          if (this.selected === n.path) { this.selected = ""; this.previewMode = ""; }
+          await this.reloadTree();
+          this.toast(zh ? `${n.name} 已不存在，已刷新列表` : `${n.name} no longer exists — refreshed`, "info", 2500);
+          return;
+        }
         this.errToast("delete", await r.text());
         return;
       }
@@ -8762,6 +8781,16 @@ function portal() {
         });
       } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
       if (!r.ok) {
+        // 404 = already gone — refresh instead of erroring (see doDelete).
+        if (r.status === 404) {
+          this.tabs = this.tabs.filter(t => t.path !== path);
+          this._previewCacheDel(path);
+          if (this.selected === path) { this.selected = ""; this.previewMode = ""; }
+          await this.reloadTree();
+          const zh = this.lang === "zh";
+          this.toast(zh ? `${name} 已不存在，已刷新列表` : `${name} no longer exists — refreshed`, "info", 2500);
+          return;
+        }
         this.errToast("delete", await r.text());
         return;
       }
@@ -10503,7 +10532,7 @@ function portal() {
     // open tabs ONCE. No backend batch endpoint — same parallel-then-refresh
     // pattern as _uploadFilesToDir.
     async moveTreeItems(srcPaths, targetDir) {
-      const list = (srcPaths || []).filter(Boolean);
+      const list = this._pruneDescendants((srcPaths || []).filter(Boolean));
       if (!list.length) return;
       if (list.length === 1) {
         await this.moveTreeItem(list[0], targetDir);
@@ -10554,7 +10583,7 @@ function portal() {
     // sync tabs. No per-item Undo for batches — items are still recoverable
     // from the trash modal.
     async deleteSelected() {
-      const paths = Array.from(this.selectedPaths);
+      const paths = this._pruneDescendants(Array.from(this.selectedPaths));
       if (paths.length <= 1) {
         const p = paths[0] || this.selected;
         const node = p && this._findTreeNode(p);
@@ -10574,7 +10603,9 @@ function portal() {
           method: "DELETE",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path: p }),
-        }).then(r => (r.ok ? p : Promise.reject(new Error(p))))
+          // 404 = already gone (e.g. a child whose parent dir we just trashed
+          // in the same batch) — count it as done, not a failure.
+        }).then(r => (r.ok || r.status === 404 ? p : Promise.reject(new Error(p))))
       ));
       const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okPaths.length;
