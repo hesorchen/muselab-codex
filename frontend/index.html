@@ -381,14 +381,14 @@
           <span class="path" x-text="contextInfo.archive_root || '—'"></span>
         </div>
       <ul class="filelist" x-init="_attachPTR($el, () => reloadTree())"
-          @mousedown.self="onMarqueeStart($event)">
+          @mousedown="onMarqueeStart($event)">
         <template x-for="n in visible" :key="n.path">
           <li :class="{file: !n.is_dir, dir: n.is_dir, sel: isRowSelected(n), 'drag-over': dragOver===n.path}"
               :style="`padding-left:${10 + n.depth*14}px; --depth: ${n.depth}`"
               :data-path="n.path"
               :data-depth="n.depth"
               :data-ext="fileExtClass(n)"
-              :draggable="isPointerDevice"
+              :draggable="isPointerDevice && isRowSelected(n)"
               @dragstart="onTreeNodeDragStart($event, n)"
               @dragend="dragOver=''; dragOverRoot=false; _dragSrcPath=null; _dragSrcPaths=null"
               @click="onNodeClick($event, n)"

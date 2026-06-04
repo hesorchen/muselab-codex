@@ -10596,13 +10596,22 @@ function portal() {
       }
     },
     // ===== marquee (rubber-band) drag-select — desktop only =====
-    // Started from EMPTY list space only (@mousedown.self on the <ul>), so a
-    // mousedown ON a row still begins a native file drag — no conflict with
-    // the HTML5 move-DnD. Drawn in viewport coords relative to .filelist-wrap;
-    // rows whose bounding box intersects the box join the selection each frame.
+    // VSCode behaviour: only ALREADY-SELECTED rows are draggable (see
+    // :draggable="isPointerDevice && isRowSelected(n)" in the template), so a
+    // mousedown on an UNSELECTED file / empty space starts a marquee box
+    // instead of a native file drag. mousedown bubbles up from <li> to the
+    // <ul> (no `.self`), and we bail out only when the press lands on a
+    // draggable (selected) row or an interactive control. Drawn in viewport
+    // coords relative to .filelist-wrap; intersecting rows join the selection.
     onMarqueeStart(ev) {
       if (!this.isPointerDevice) return;       // desktop pointers only
       if (ev.button !== 0) return;             // left button only
+      // Don't hijack mousedowns on the inline action buttons (+ / ⋯).
+      if (ev.target.closest("button, a, input, textarea")) return;
+      // A press on a SELECTED row (which is draggable) must start a native
+      // drag, not a marquee. Unselected rows fall through to marquee.
+      const li = ev.target.closest("li[data-path]");
+      if (li && li.classList.contains("sel")) return;
       this._marqueeList = ev.currentTarget;    // the <ul class="filelist">
       this._marqueeStart = { x: ev.clientX, y: ev.clientY };
       this._marqueeCur = { x: ev.clientX, y: ev.clientY };
@@ -10657,6 +10666,7 @@ function portal() {
       // Hit-test every rendered row.
       const sel = new Set(this._marqueeBase);
       list.querySelectorAll(":scope > li[data-path]").forEach(li => {
+        if (li.classList.contains("dir")) return;   // folders aren't marquee-selectable
         const r = li.getBoundingClientRect();
         if (r.bottom > y0 && r.top < y1 && r.right > x0 && r.left < x1) {
           sel.add(li.dataset.path);
