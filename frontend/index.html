@@ -2488,6 +2488,7 @@
                让这个 form 不参与布局，只提供 DOM 语义。 -->
           <form autocomplete="off" onsubmit="return false" style="display:contents">
           <textarea x-model="input" x-ref="chatInput"
+                    rows="1"
                     :disabled="!availableModels.length"
                     class="chat-input-textarea"
                     name="muselab-chat-message"
