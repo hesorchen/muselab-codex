@@ -492,6 +492,14 @@ function portal() {
               total_output_tokens: 0, total_cache_read_tokens: 0,
               total_cache_creation_tokens: 0, cache_hit_pct: 0,
               budget_usd: 0, budget_used_pct: 0 },
+    // Pro/Max rate-limit state: per-window snapshot from /api/chat/rate-limit,
+    // updated live by the `rate_limit` SSE event. Empty windows = never seen
+    // (third-party / API-key setups never report).
+    rateLimit: { windows: {}, updated_at: 0 },
+    // Precomputed footer badge (most-constrained window) — recomputed only when
+    // rateLimit changes, NOT per render, so the toolbar x-show is a cheap
+    // property read. null = nothing to show.
+    rlBadge: null,
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
     atBottom: true,
@@ -3806,6 +3814,7 @@ function portal() {
         }
       } catch {}
       await this.fetchMcp();
+      await this.fetchRateLimit();
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r.ok) {
@@ -3814,6 +3823,92 @@ function portal() {
           this._rebindModelSelect();
         }
       } catch {}
+    },
+
+    // Pull the current Pro/Max rate-limit snapshot. SSE pushes live deltas
+    // during a turn, but a freshly-loaded page (or one that hasn't sent a turn
+    // yet this session) needs the snapshot to show quota immediately.
+    async fetchRateLimit() {
+      try {
+        const r = await fetch("/api/chat/rate-limit", { headers: this.hdr() });
+        if (r.ok) {
+          const d = await r.json();
+          this.rateLimit = { windows: d.windows || {}, updated_at: d.updated_at || 0 };
+          this.rlBadge = this.rateLimitWorst();
+        }
+      } catch {}
+    },
+
+    // The single window worth showing in the toolbar. Prefers the highest
+    // *numeric* utilization; if the SDK has only reported windows without a
+    // utilization number yet (status "allowed", plenty of headroom), still
+    // surface one (preferring the 5h window) so the chip stays resident rather
+    // than vanishing whenever usage is low. Returns null only when no window is
+    // known at all — third-party / API-key setups the CLI never rate-limit-
+    // reports — which hides the chip. `pct` is 0–100 rounded or null (unknown);
+    // `text` is the visible label; `warn`/`crit` drive color.
+    rateLimitWorst() {
+      const ws = this.rateLimit && this.rateLimit.windows;
+      if (!ws) return null;
+      let worst = null;   // window with the highest numeric utilization
+      let known = null;   // any reported window, preferring five_hour
+      for (const k in ws) {
+        const w = ws[k];
+        if (!w) continue;
+        if (!known || w.rate_limit_type === "five_hour") known = w;
+        const u = (typeof w.utilization === "number") ? w.utilization : null;
+        if (u === null) continue;
+        if (!worst || u > worst._u) worst = { ...w, _u: u };
+      }
+      const pick = worst || known;
+      if (!pick) return null;
+      const pct = worst ? Math.round(worst._u * 100) : null;
+      const rejected = pick.status === "rejected";
+      const warning = pick.status === "allowed_warning";
+      // Visible label: window tag (5h / 7d …) + a percentage when the SDK gave
+      // one, else a status word — so the chip reads as a quota indicator
+      // ("5h 82%", "5h 正常") rather than a bare icon.
+      const tag = this.rateLimitWindowLabel(pick.rate_limit_type || "");
+      let val;
+      if (pct !== null) val = pct + "%";
+      else if (rejected) val = this.t("rl.limited");
+      else if (warning) val = this.t("rl.near");
+      else val = this.t("rl.ok");
+      const text = tag ? `${tag} ${val}` : val;
+      return {
+        type: pick.rate_limit_type || "",
+        pct,
+        text,
+        resets_at: pick.resets_at || null,
+        status: pick.status || "allowed",
+        // Color tiers: rejected/warning status OR ≥90% → crit; ≥75% → warn;
+        // unknown utilization with a healthy status stays neutral (muted).
+        crit: rejected || warning || (pct !== null && pct >= 90),
+        warn: pct !== null && pct >= 75,
+      };
+    },
+
+    // Human label for a rate-limit window key. The h/d abbreviations are
+    // universal; only "overage" gets a zh form.
+    rateLimitWindowLabel(type) {
+      const m = {
+        five_hour: "5h",
+        seven_day: "7d",
+        seven_day_opus: "7d Opus",
+        seven_day_sonnet: "7d Sonnet",
+        overage: this.t("rl.overage"),
+      };
+      return m[type] || type || "";
+    },
+
+    // "resets in 3h 12m" style relative string for the reset epoch (seconds).
+    rateLimitResetText(epoch) {
+      if (!epoch) return "";
+      const secs = epoch - Math.floor(Date.now() / 1000);
+      if (secs <= 0) return "";
+      const h = Math.floor(secs / 3600);
+      const m = Math.floor((secs % 3600) / 60);
+      return h > 0 ? `${h}h ${m}m` : `${m}m`;
     },
 
     // Standalone MCP fetch — called both from fetchStats (initial / periodic)
@@ -12653,6 +12748,18 @@ function portal() {
           output_file: d.output_file || "",
         });
         _scrollIfActive();
+      });
+      es.addEventListener("rate_limit", ev => {
+        let d;
+        try { d = JSON.parse(ev.data); } catch (_) { return; }
+        // Merge this window's update into the per-window snapshot (each event
+        // carries one window). Reassign the object so Alpine sees the change.
+        const key = d.rate_limit_type || "_";
+        this.rateLimit = {
+          windows: { ...(this.rateLimit.windows || {}), [key]: d },
+          updated_at: d.updated_at || (Date.now() / 1000),
+        };
+        this.rlBadge = this.rateLimitWorst();
       });
       es.addEventListener("ask_user_question", ev => {
         let d;

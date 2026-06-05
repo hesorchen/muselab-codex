@@ -5161,6 +5161,19 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .chat-toolbar-ring svg circle:nth-child(2) {
   transition: stroke-dashoffset var(--t-base), stroke var(--t-base);
 }
+/* Pro/Max rate-limit badge — compact pill next to the context ring. Muted by
+   default (it's ambient info), escalates to warn/crit color as quota fills. */
+.chat-toolbar-rl {
+  display: inline-flex; align-items: center; gap: 3px;
+  height: 26px; padding: 0 6px;
+  font-size: 11px; font-variant-numeric: tabular-nums;
+  color: var(--c-text-3);
+  border-radius: var(--r-md);
+  cursor: default; user-select: none;
+}
+.chat-toolbar-rl svg { display: block; opacity: 0.8; }
+.chat-toolbar-rl.warn { color: var(--c-warn); }
+.chat-toolbar-rl.crit { color: var(--c-danger); }
 .chat-toolbar-spacer { flex: 1; }
 /* Send button — primary accent, icon-only (compact). Streaming state
    swaps to a danger-style stop button automatically. */

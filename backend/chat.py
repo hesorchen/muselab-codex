@@ -11,7 +11,7 @@ import urllib.parse
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Response
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
@@ -20,9 +20,12 @@ from claude_agent_sdk import (
     AssistantMessage, UserMessage, TextBlock, ThinkingBlock, ResultMessage,
     ToolUseBlock, ToolResultBlock, StreamEvent,
     TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage,
+    RateLimitEvent,
     ClaudeSDKError,
     ThinkingConfigEnabled, ThinkingConfigDisabled,
+    EffortLevel,
     get_session_messages,
+    project_key_for_directory,
     delete_session as sdk_delete_session,
     rename_session as sdk_rename_session,
     tag_session as sdk_tag_session,
@@ -54,6 +57,12 @@ from . import permission_request as perm
 # the calling thread — acceptable here because these reads are small and
 # the SDK gives us no async variant for the default store.
 _vendor_msg_lock = threading.Lock()
+
+# Valid `effort` overrides, sourced from the SDK's own EffortLevel literal
+# so a new tier added upstream is honored automatically (A-level SDK-as-truth
+# fix — was a hardcoded tuple that would silently drop unknown values). ""
+# (SDK adaptive default) is intentionally NOT here; callers guard `if effort`.
+_VALID_EFFORT = get_args(EffortLevel)
 
 
 def _cli_project_roots() -> list[Path]:
@@ -87,20 +96,20 @@ def _cli_project_roots() -> list[Path]:
 
 
 def _cli_encode_cwd(path: str) -> str:
-    """Mirror Claude CLI's projects-dir encoding: every non-alphanumeric
-    character becomes ``-``.
+    """Mirror Claude CLI's projects-dir encoding (e.g. ``/home/alice`` →
+    ``-home-alice``).
 
-    Examples::
-
-        /home/alice              → -home-alice
-        /home/alice/archive      → -home-alice-archive
-
-    Note: a naive ``str.replace("/", "-")`` only handles slashes and
-    breaks for paths containing ``_`` or ``.`` — the CLI replaces those
-    too. The cost dashboard, transcript search, and tests all share this
-    helper so the encoding stays in lockstep.
+    Delegates to the SDK's own ``project_key_for_directory()`` so the
+    encoding stays in lockstep with the CLI even if the rule changes —
+    the previous hand-rolled ``"".join(c if c.isalnum() else "-" ...)``
+    silently drifted on non-ASCII paths (it kept unicode letters via
+    ``str.isalnum`` while the CLI replaces them too: ``/home/用户`` →
+    hand-rolled ``-home-用户`` vs CLI/SDK ``-home---``), which would
+    mis-locate sessions under a unicode archive root. The cost dashboard,
+    transcript search, and tests all import this helper, so keeping the
+    name (a thin SDK delegate) keeps every call site in lockstep.
     """
-    return "".join(c if c.isalnum() else "-" for c in path)
+    return project_key_for_directory(path)
 
 
 def _find_session_jsonl(sid: str) -> Path | None:
@@ -538,6 +547,44 @@ _stats = {"total_cost_usd": 0.0, "total_messages": 0,
           "total_input_tokens": 0, "total_output_tokens": 0,
           "total_cache_read_tokens": 0, "total_cache_creation_tokens": 0}
 
+# Latest Pro/Max rate-limit state, keyed by window type (five_hour /
+# seven_day / seven_day_opus / seven_day_sonnet / overage). The SDK pushes a
+# RateLimitEvent whenever the limit state changes; each event carries ONE
+# window's RateLimitInfo (utilization 0.0–1.0, status, resets_at). We keep the
+# most-recent value per window so a fresh page can fetch a snapshot
+# (GET /api/chat/rate-limit) while live deltas arrive over SSE. Empty until the
+# first event lands this process — the CLI only emits these for OAuth
+# (Pro/Max) sessions, never for third-party API-key vendors.
+_rate_limit_state: dict[str, dict] = {}
+_rate_limit_updated_at: float = 0.0
+
+
+def _rate_limit_payload(info) -> dict:
+    """Serialize a SDK RateLimitInfo into a JSON-safe dict. Every field via
+    getattr-default so a future SDK adding/renaming fields degrades gracefully
+    instead of crashing the turn (same discipline as the Task* handlers)."""
+    return {
+        "status": getattr(info, "status", None),
+        "rate_limit_type": getattr(info, "rate_limit_type", None),
+        "utilization": getattr(info, "utilization", None),
+        "resets_at": getattr(info, "resets_at", None),
+        "overage_status": getattr(info, "overage_status", None),
+        "overage_resets_at": getattr(info, "overage_resets_at", None),
+        "overage_disabled_reason": getattr(info, "overage_disabled_reason", None),
+    }
+
+
+def _record_rate_limit(info) -> dict:
+    """Store the latest RateLimitInfo under its window key and return the
+    JSON-safe payload (with an updated_at stamp) for SSE emission."""
+    global _rate_limit_updated_at
+    payload = _rate_limit_payload(info)
+    payload["updated_at"] = _rate_limit_updated_at = time.time()
+    # rate_limit_type is Optional; bucket an untyped event under "_" so it
+    # still surfaces rather than vanishing.
+    _rate_limit_state[payload.get("rate_limit_type") or "_"] = payload
+    return payload
+
 # Per-session current state — populated from the LATEST ResultMessage of each
 # session. The model's `input_tokens` on a turn ≈ current context window size,
 # so tracking the most-recent value gives a meaningful "context meter".
@@ -940,8 +987,11 @@ async def _build_and_connect_client(
     # Effort knob (SDK 0.2.82+). Anthropic Opus 4.7's adaptive thinking
     # picks an effort automatically; this override lets users force a
     # deeper budget on specific tabs (e.g. xhigh for research). SDK
-    # rejects unknown strings, so guard the literal set.
-    _VALID_EFFORT = ("low", "medium", "high", "xhigh", "max")
+    # rejects unknown strings, so guard against its OWN literal set
+    # (derived from EffortLevel) — if the SDK adds a new tier, this picks
+    # it up automatically instead of silently dropping the user's choice.
+    # ("" = SDK adaptive default; the `if effort` guard handles it, so it
+    # need not appear in _VALID_EFFORT.)
     if effort and effort in _VALID_EFFORT:
         opts_kwargs["effort"] = effort
     # Wire the SDK's can_use_tool callback UNCONDITIONALLY (2026-05-23).
@@ -2845,6 +2895,20 @@ async def patch_session_api(sid: str, req: SessionPatchReq) -> dict:
 
 
 # ====== usage / reset ======
+
+@router.get("/rate-limit", dependencies=[Depends(require_token)])
+def rate_limit() -> dict:
+    """Latest Pro/Max rate-limit snapshot, per window, as last pushed by the
+    SDK's RateLimitEvent. SSE delivers live deltas (`rate_limit` event); this
+    endpoint gives a freshly-loaded page the current state without waiting for
+    the next turn. `windows` is empty until the first event arrives this
+    process (and stays empty for pure third-party / API-key setups, which the
+    CLI never rate-limit-reports). `updated_at` is 0.0 when never seen."""
+    return {
+        "windows": _rate_limit_state,
+        "updated_at": _rate_limit_updated_at,
+    }
+
 
 @router.get("/usage", dependencies=[Depends(require_token)])
 async def usage() -> dict:
@@ -4787,6 +4851,14 @@ def _render_continuation_message(msg, state: dict):
                     yield {"event": "tool_result",
                            "data": json.dumps(
                                _render_tool_result(block, tool_name=tname))}
+    elif isinstance(msg, RateLimitEvent):
+        # A rate-limit change can land during a background-task continuation
+        # too; record + surface it here so the store stays current off the
+        # main turn loop (mirrors event_gen's _handle_rate_limit).
+        info = getattr(msg, "rate_limit_info", None)
+        if info is not None:
+            payload = _record_rate_limit(info)
+            yield {"event": "rate_limit", "data": json.dumps(payload)}
 
 
 async def _watch_inflight_tasks(
@@ -5688,6 +5760,17 @@ async def _start_turn(
                 # an in-turn completion is already visible live in this stream.
                 _settle_background_task(session_id, tid)
 
+        async def _handle_rate_limit(msg):
+            """SDK RateLimitEvent → record the window's RateLimitInfo and emit a
+            `rate_limit` SSE event. Runs inside the detached event_gen task, so
+            the store is updated even with no live subscriber; a later GET
+            /api/chat/rate-limit returns the snapshot."""
+            info = getattr(msg, "rate_limit_info", None)
+            if info is None:
+                return
+            payload = _record_rate_limit(info)
+            yield {"event": "rate_limit", "data": json.dumps(payload)}
+
         async def _handle_result_message(msg):
             """ResultMessage = turn complete. Update cumulative cost / stats,
             write per-message sidecar annotations, bump session metadata, then
@@ -6049,6 +6132,12 @@ async def _start_turn(
                     # check them BEFORE any generic SystemMessage branch (none
                     # exists today) so they reach the task handler.
                     async for ev in _handle_task_message(msg):
+                        yield ev
+                elif isinstance(msg, RateLimitEvent):
+                    # Pro/Max quota signal the SDK pushes on limit-state change.
+                    # muselab used to silently drop it; capture into the per-
+                    # window store + push a live `rate_limit` SSE event.
+                    async for ev in _handle_rate_limit(msg):
                         yield ev
                 elif isinstance(msg, ResultMessage):
                     async for ev in _handle_result_message(msg):

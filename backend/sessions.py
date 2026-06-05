@@ -491,6 +491,9 @@ def update_model(sid: str, model: str) -> None:
 # effort is one of: "" (auto/SDK default) | "low" | "medium" | "high" | "xhigh" | "max"
 # Empty string means "let the SDK pick" — same as no override. Stored on the
 # session so picking a deep-research effort on one tab doesn't leak into others.
+# The non-empty values mirror the SDK's EffortLevel literal; the authoritative
+# gate lives in chat.py (_VALID_EFFORT = get_args(EffortLevel)). This comment is
+# documentation only — keep it in sync if the SDK adds a tier.
 def update_effort(sid: str, effort: str) -> None:
     with _INDEX_LOCK:
         idx = _load_index()

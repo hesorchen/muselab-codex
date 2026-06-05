@@ -773,7 +773,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "claude-agent-sdk", specifier = ">=0.2.82" },
+    { name = "claude-agent-sdk", specifier = ">=0.2.82,<0.3" },
     { name = "fastapi", specifier = ">=0.136.3" },
     { name = "openpyxl", specifier = ">=3.1.5" },
     { name = "pillow", specifier = ">=12.2.0" },

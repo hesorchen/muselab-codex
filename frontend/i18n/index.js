@@ -253,6 +253,13 @@ window.MUSELAB_STRINGS = {
     "ctx.compact_empty": "当前会话还没有 Muse 的回复，没什么可压缩的",
     "ctx.window_warn": "上下文窗口已用 {pct}%，建议压缩",
     "ctx.window_warn_action": "现在压缩",
+    // Pro/Max rate-limit chip. Window tags (5h / 7d …) stay universal; only
+    // the status words + reset suffix localize.
+    "rl.ok": "正常",
+    "rl.near": "接近上限",
+    "rl.limited": "已限流",
+    "rl.overage": "超额",
+    "rl.resets": "{t}后重置",
     "effort.title": "Effort — Anthropic 官方术语，控制推理预算与 agentic loop 深度（不译）",
     "effort.auto": "Effort · auto",
     "effort.low": "Effort · low",
@@ -610,6 +617,13 @@ window.MUSELAB_STRINGS = {
     "ctx.compact_no_reply": "Model didn't return a summary — check for errors and retry",
     "ctx.window_warn": "Context window {pct}% full — compact recommended",
     "ctx.window_warn_action": "Compact now",
+    // Pro/Max rate-limit chip. Window tags (5h / 7d …) stay universal; only
+    // the status words + reset suffix localize.
+    "rl.ok": "OK",
+    "rl.near": "Near limit",
+    "rl.limited": "Rate-limited",
+    "rl.overage": "Overage",
+    "rl.resets": "resets in {t}",
     "effort.title": "Reasoning effort — thinking budget + agentic loop depth",
     "effort.auto": "Effort · auto",
     "effort.low": "Effort · low",
