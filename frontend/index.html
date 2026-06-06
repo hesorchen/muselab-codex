@@ -2495,10 +2495,22 @@
                composer below is disabled (every send would 401 + lock the
                session to an unreachable model). Point the user at Settings
                so a provider is configured before any turn can fire. -->
+          <!-- Two distinct empty states, same `!availableModels.length` gate:
+               · has_any_provider=false → genuinely nothing configured.
+               · has_any_provider=true  → a provider IS configured (e.g. a
+                 third-party key) but no model is ready yet — credentials
+                 incomplete or still validating. The old single copy ("配置一个
+                 provider") misled users who *had* configured one (2026-06-06).
+               No "switch model" CTA here: availableModels is empty, so there's
+               nothing to switch to — the fix is to check credentials. -->
           <div class="chat-input-noprov" x-show="!availableModels.length" x-cloak>
-            <span x-text="lang==='zh'
-                            ? '还没有可用模型 —— 先配置一个 provider 才能开始对话'
-                            : 'No model available — configure a provider to start chatting'"></span>
+            <span x-text="(contextInfo && contextInfo.has_any_provider)
+                            ? (lang==='zh'
+                                ? '已配置 provider，但当前没有可用模型 —— 凭证可能未填全或仍在校验，打开设置检查一下'
+                                : 'A provider is configured, but no model is ready yet — credentials may be incomplete or still validating. Open Settings to check.')
+                            : (lang==='zh'
+                                ? '还没有可用模型 —— 先配置一个 provider 才能开始对话'
+                                : 'No model available — configure a provider to start chatting')"></span>
             <button class="btn-primary" @click="openSettings()"
                     x-text="lang==='zh' ? '打开设置' : 'Open Settings'"></button>
           </div>
@@ -2592,6 +2604,46 @@
               <option value="xhigh" x-show="_effortAllowed('xhigh', model)" x-text="t('effort.xhigh')"></option>
               <option value="max" x-show="_effortAllowed('max', model)" x-text="t('effort.max')"></option>
             </select>
+            <!-- Mobile-only gear: on phones the permission + effort selects
+                 above are hidden (CSS) and collapsed in here, so the composer
+                 toolbar stays a single row instead of wrapping to two. Desktop
+                 hides this whole group and keeps the selects inline. The selects
+                 inside share the SAME x-model as the inline ones, so flipping
+                 either keeps both in sync — no extra state to reconcile. -->
+            <div class="chat-toolbar-more">
+              <button type="button"
+                      class="chat-toolbar-btn chat-toolbar-more-btn"
+                      :class="{ active: composerSettingsOpen }"
+                      @click.stop="composerSettingsOpen = !composerSettingsOpen"
+                      :title="lang==='zh' ? '会话设置（权限 / Effort）' : 'Session settings (permission / effort)'">
+                <svg><use href="#i-cog"/></svg>
+              </button>
+              <div class="chat-toolbar-more-pop"
+                   x-show="composerSettingsOpen"
+                   x-cloak
+                   @click.outside="composerSettingsOpen = false">
+                <label class="chat-toolbar-more-field">
+                  <span x-text="t('set.label.default_permission')"></span>
+                  <select x-model="permission">
+                    <option value="bypassPermissions">bypass</option>
+                    <option value="acceptEdits">acceptEdits</option>
+                    <option value="default">default</option>
+                    <option value="plan">plan</option>
+                  </select>
+                </label>
+                <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
+                  <span x-text="t('effort.title')"></span>
+                  <select x-model="effort" @change="onEffortChange()">
+                    <option value="" x-text="t('effort.auto')"></option>
+                    <option value="low" x-show="_effortAllowed('low', model)" x-text="t('effort.low')"></option>
+                    <option value="medium" x-show="_effortAllowed('medium', model)" x-text="t('effort.medium')"></option>
+                    <option value="high" x-show="_effortAllowed('high', model)" x-text="t('effort.high')"></option>
+                    <option value="xhigh" x-show="_effortAllowed('xhigh', model)" x-text="t('effort.xhigh')"></option>
+                    <option value="max" x-show="_effortAllowed('max', model)" x-text="t('effort.max')"></option>
+                  </select>
+                </label>
+              </div>
+            </div>
             <!-- Extended-thinking on/off. Default on. Turning it OFF is the
                  escape hatch for the CLI streaming-interleaving 400 ("thinking
                  blocks ... cannot be modified"): a thinking-free session can't
@@ -2644,19 +2696,13 @@
                  third-party / API-key setups, which the CLI never rate-limit-
                  reports. warn ≥75%, crit at ≥90% / warning / rejected status. -->
             <span class="chat-toolbar-rl"
-                  x-show="rlBadge"
+                  x-show="rlBadge && _isClaudeModel(model)"
                   :class="{ warn: rlBadge && rlBadge.warn && !rlBadge.crit,
                             crit: rlBadge && rlBadge.crit }"
-                  :title="rlBadge
-                    ? (rateLimitWindowLabel(rlBadge.type)
-                        + (rlBadge.pct !== null ? ' ' + rlBadge.pct + '%' : '')
-                        + (rlBadge.status === 'rejected' ? ' · ' + t('rl.limited') : '')
-                        + (rateLimitResetText(rlBadge.resets_at)
-                            ? ' · ' + t('rl.resets', { t: rateLimitResetText(rlBadge.resets_at) })
-                            : ''))
-                    : ''">
+                  @click="rlBadge && toast(rlBadgeDesc(), rlBadge.crit ? 'error' : (rlBadge.warn ? 'warn' : 'info'))"
+                  :title="rlBadgeDesc()">
               <svg viewBox="0 0 24 24" width="13" height="13"><use href="#i-gauge"/></svg>
-              <span x-text="rlBadge ? rlBadge.text : ''"></span>
+              <span class="chat-toolbar-rl-text" x-text="rlBadge ? rlBadge.text : ''"></span>
             </span>
             <span class="chat-toolbar-spacer"></span>
             <!-- Send / Stop. While `_sendWaitingForUpload` is true (rare:
@@ -4242,13 +4288,13 @@
           </div>
 
           <div class="sched-create-foot">
-            <span class="sched-create-hint" x-text="scheduler.draft.session_mode === 'fresh'
-                ? (lang==='zh'
-                    ? '运行结果发送到一个新建的 session（每次一个）'
-                    : 'Each run sends output into a brand-new session')
-                : (lang==='zh'
+            <!-- Fresh 模式下这句与上方 mode-hint 重复（都在说「每次新建
+                 session」），只在 Reuse 模式显示——此时它补充了 mode-hint
+                 没讲的「自动创建的同名 session」增量信息。 -->
+            <span class="sched-create-hint" x-show="scheduler.draft.session_mode !== 'fresh'"
+                  x-text="lang==='zh'
                     ? '运行结果发送到自动创建的同名 session'
-                    : 'Output streams into an auto-created session of the same name')"></span>
+                    : 'Output streams into an auto-created session of the same name'"></span>
             <button class="btn-ghost" x-show="scheduler.draft.editingId"
                     @click="cancelEditSched()"
                     x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
@@ -4276,7 +4322,7 @@
               <div class="sched-row sched-row-clickable"
                    :class="{ disabled: !t.enabled }"
                    @click="openSchedTaskSession(t)"
-                   :title="lang==='zh' ? '点击打开最近一次运行的 session' : 'Click to open the most recent run\\'s session'">
+                   :title="lang==='zh' ? '点击打开最近一次运行的 session' : 'Click to open the most recent run session'">
                 <div class="sched-row-main">
                   <div class="sched-row-name">
                     <span x-text="t.name"></span>
@@ -4351,7 +4397,7 @@
                        :class="{ err: !run.ok }"
                        @click="run.session_id && openTab(run.session_id)"
                        :title="run.session_id
-                         ? (lang==='zh' ? '点击打开此次运行的 session' : 'Open this run\\'s session')
+                         ? (lang==='zh' ? '点击打开此次运行的 session' : 'Open this run session')
                          : ''">
                     <div class="sched-task-run-head">
                       <span class="sched-task-run-time"

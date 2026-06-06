@@ -402,6 +402,31 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
    not broken" so the temporary un-clickability reads as intentional. */
 @keyframes icon-btn-run-pulse { 0%, 100% { opacity: 0.35; } 50% { opacity: 0.7; } }
 .icon-btn.is-running { animation: icon-btn-run-pulse 1.2s ease-in-out infinite; }
+
+/* ── Touch hit-area floor (2026-06-06) ──────────────────────────────────
+   Many icon buttons paint at 18–22px, under Apple HIG 44 / Material 48. Rather
+   than enlarge the glyph (which would reflow dense toolbars), grow only the
+   *tap* region via a centered transparent ::before; mouse users keep the tight
+   visual target. 40px balances reach against overlap between adjacent dense
+   buttons (msg copy/edit, scheduler row actions). Scope is standalone action
+   buttons only — deliberately NOT .tree-action (packed file-tree rows: a 40px
+   pad would spill onto neighbouring rows) nor .chat-tab-close (already carries
+   its own 44px ::before on mobile, see ~line 685). */
+@media (pointer: coarse) {
+  .icon-btn,
+  .toast .close,
+  .skills-drawer-close { position: relative; }
+  .icon-btn::before,
+  .toast .close::before,
+  .skills-drawer-close::before {
+    content: "";
+    position: absolute;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: 40px; height: 40px;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .icon-btn.is-running { animation: none; }
 }
@@ -814,6 +839,12 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      bypass / acceptEdits) are short and don't need 150px. */
   .chat-toolbar-select {
     padding: 0 14px 0 4px;
+    /* Floor the width so the base `flex-shrink:1; min-width:0` can't squeeze
+       a select down to "O…" / "b." on narrow phones (user 2026-06-06). The
+       value is a lower bound; max-width above still caps the wide end. When
+       the row genuinely can't fit, the wrap below kicks in instead of
+       crushing labels to one glyph. */
+    min-width: 4.5em;
   }
   .chat-toolbar-permission {
     max-width: 90px;
@@ -1314,7 +1345,38 @@ body.kb-open .mobile-tab-bar { display: none; }
    touch. Bump the primary send button + ring; keep selects at 26px since
    they have a wider hit area via the surrounding text. */
 @media (pointer: coarse) {
-  .chat-toolbar { gap: var(--sp-1); padding: 6px; }
+  /* Mobile composer row: permission + effort collapse behind the gear
+     (.chat-toolbar-more) so the row holds just attach · model · gear · ctx
+     ring · rate-limit · send — fits one line at 390px. flex-wrap stays as a
+     safety net for edge cases (very long model label / sub-360px screens) so
+     nothing gets crushed or pushed off-screen; it won't trigger normally. */
+  .chat-toolbar { gap: var(--sp-1); padding: 6px; flex-wrap: nowrap; }
+  /* Single row, guaranteed: only the model select absorbs overflow (it shrinks
+     + ellipsis-truncates via the base rule's flex-shrink:1/min-width:0). Every
+     fixed control — attach · gear · ring · rl gauge · send · stop — keeps its
+     touch size and never shrinks, so adding the stop button mid-stream can't
+     bump the row to a second line; the model name just truncates further. */
+  .chat-toolbar-btn,
+  .chat-toolbar-more,
+  .chat-toolbar-ring,
+  .chat-toolbar-rl,
+  .chat-toolbar-send { flex-shrink: 0; }
+  /* Show the gear, hide the inline selects it replaces. !important beats the
+     Alpine x-show inline style on the effort select (its own display toggle). */
+  /* !important needed: the base `.chat-toolbar-more { display:none }` lives
+     later in the file (~5192), and @media adds no specificity, so source
+     order would otherwise keep the gear hidden on phones. */
+  .chat-toolbar-more { display: inline-flex !important; }
+  .chat-toolbar-permission,
+  .chat-toolbar-effort { display: none !important; }
+  /* Model name truncates on phones (full name is in the dropdown anyway) — cap
+     it so attach · model · gear · ring · rl · send all fit one row. */
+  .chat-toolbar-select { max-width: 6.5em; }
+  /* Rate-limit badge collapses to just the gauge, sized to match the context
+     ring (18px); the "5h 正常" text is hidden and a tap surfaces it via toast. */
+  .chat-toolbar-rl { cursor: pointer; height: 44px; padding: 0 8px; gap: 0; }
+  .chat-toolbar-rl-text { display: none; }
+  .chat-toolbar-rl svg { width: 18px; height: 18px; opacity: 1; }
   .chat-toolbar-btn,
   .chat-toolbar-ring,
   .chat-toolbar-send {
@@ -5136,6 +5198,39 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   box-shadow: 0 0 0 2px var(--c-accent-soft);
 }
 .chat-toolbar-select option { background: var(--c-bg-1); color: var(--c-fg-0); }
+
+/* Composer "more" group — gear that collapses permission/effort on mobile.
+   Hidden on desktop (the inline selects stay); CSS in the pointer:coarse
+   block flips this on and hides the inline selects instead. */
+.chat-toolbar-more { display: none; position: relative; }
+.chat-toolbar-more-pop {
+  position: absolute;
+  bottom: calc(100% + 8px);   /* pop upward — composer sits at screen bottom */
+  right: 0;
+  z-index: 50;
+  display: flex; flex-direction: column; gap: var(--sp-2);
+  min-width: 190px;
+  padding: var(--sp-2) var(--sp-3);
+  background: var(--c-bg-1);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-lg);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+}
+.chat-toolbar-more-field {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: var(--fs-xs); color: var(--c-fg-2);
+}
+.chat-toolbar-more-field select {
+  height: 38px; width: 100%;
+  padding: 0 10px;
+  background: var(--c-bg-2);
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  color: var(--c-fg-0);
+  font-size: 16px;            /* ≥16px so iOS Safari doesn't zoom on focus */
+  font-family: inherit;
+  cursor: pointer;
+}
 /* Thinking on/off toggle — sits beside the effort dropdown. Compact checkbox
    + label, same muted-fg / hover treatment as the toolbar selects. */
 .chat-toolbar-think {
@@ -5442,7 +5537,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    Toast
    ========================================================================== */
 .toast-stack {
-  position: fixed; top: 16px; right: 16px; z-index: 1000;
+  /* top:16px sat the stack on top of the ~48px top bar / right-pane header
+     icons, so any toast (esp. the first-run shortcut tip) covered them
+     (user 2026-06-06). Drop below the bar; on notched phones add the safe
+     area inset so it clears the status bar too. */
+  position: fixed; top: calc(64px + env(safe-area-inset-top, 0px)); right: 16px; z-index: 1000;
   display: flex; flex-direction: column; gap: var(--sp-2); pointer-events: none;
 }
 .toast {
@@ -6914,11 +7013,13 @@ html { scrollbar-width: thin; scrollbar-color: var(--c-bg-4) transparent; }
 
 .sched-create-foot {
   display: flex; align-items: center; gap: var(--sp-3);
+  justify-content: flex-end;
   padding-top: 4px;
   border-top: 1px solid var(--c-border);
   margin-top: var(--sp-1);
 }
-.sched-create-foot .sched-create-hint { flex: 1; }
+/* hint 存在时（Reuse）靠左、把按钮推到右侧；隐藏时（Fresh）按钮靠右 */
+.sched-create-foot .sched-create-hint { margin-right: auto; }
 .sched-create-hint {
   font-size: var(--fs-xs); color: var(--c-fg-3); line-height: 1.4;
 }

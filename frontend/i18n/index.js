@@ -182,7 +182,7 @@ window.MUSELAB_STRINGS = {
 
     "muse_opener.empty":          "嗨，这里还很空。要不先告诉我一点你的事？或者把任何文件拖进来——体检、笔记、照片都行，我会看着办。",
     "muse_opener.profile_only":   "读了你的 CLAUDE.md。从你最在意的那件事聊起吧，或者点下面任一位缪斯试试。",
-    "muse_opener.some_files":     "我看了你 archive 里的 {n} 份资料。今天想从哪一块开始？要不要我先帮你过一遍最近的更新？",
+    "muse_opener.some_files":     "我看了你 archive 里有内容的 {n} 个板块。今天想从哪一块开始？要不要我先帮你过一遍最近的更新？",
     "muse_opener.rich":           "你 archive 里已经有不少东西了。今天想从哪儿开始，还是让我先给你做个一周回顾？",
     "muse_opener.action_open_profile": "打开 CLAUDE.md 一起填",
     "muse_opener.divider":        "或从一位缪斯说起",
@@ -546,7 +546,7 @@ window.MUSELAB_STRINGS = {
 
     "muse_opener.empty":          "Hey, this place is still empty. Want to tell me a bit about yourself? Or just drag any file in — checkup, notes, a photo, whatever — I'll figure it out.",
     "muse_opener.profile_only":   "Read your CLAUDE.md. Let's start with whatever matters most — or click any muse below to try.",
-    "muse_opener.some_files":     "I scanned the {n} files in your archive. Where would you like to start? Want me to walk through the recent updates first?",
+    "muse_opener.some_files":     "I scanned {n} {n|area|areas} of your archive. Where would you like to start? Want me to walk through the recent updates first?",
     "muse_opener.rich":           "Your archive has quite a lot now. Where shall we start today — or want a weekly recap first?",
     "muse_opener.action_open_profile": "Open CLAUDE.md and fill it together",
     "muse_opener.divider":        "or start with a muse",

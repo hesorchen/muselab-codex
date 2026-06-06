@@ -401,6 +401,10 @@ function portal() {
     messages: [],
     model: "claude-sonnet-4-6",
     permission: "bypassPermissions",
+    // Mobile-only: collapses the per-session settings (permission / effort)
+    // behind a gear in the composer toolbar so the row stays single-line on
+    // narrow phones. Desktop shows those selects inline and ignores this.
+    composerSettingsOpen: false,
     // Reasoning effort override for the current session — "" means let the
     // SDK pick adaptively (the existing default). Persisted on the session
     // via PATCH so each tab keeps its own setting across reloads.
@@ -3909,6 +3913,22 @@ function portal() {
       const h = Math.floor(secs / 3600);
       const m = Math.floor((secs % 3600) / 60);
       return h > 0 ? `${h}h ${m}m` : `${m}m`;
+    },
+
+    // Full human-readable rate-limit description — e.g. "5h 42% · resets in
+    // 3h 12m". Shared by the badge's hover :title (desktop) and its @click
+    // toast (mobile, where the badge collapses to just the gauge icon and the
+    // text is hidden, so a tap surfaces the same detail). Extracted from the
+    // old inline :title expression so both paths stay in sync.
+    rlBadgeDesc() {
+      const b = this.rlBadge;
+      if (!b) return "";
+      let s = this.rateLimitWindowLabel(b.type);
+      if (b.pct !== null && b.pct !== undefined) s += " " + b.pct + "%";
+      if (b.status === "rejected") s += " · " + this.t("rl.limited");
+      const reset = this.rateLimitResetText(b.resets_at);
+      if (reset) s += " · " + this.t("rl.resets", { t: reset });
+      return s;
     },
 
     // Standalone MCP fetch — called both from fetchStats (initial / periodic)
