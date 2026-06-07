@@ -678,7 +678,11 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
   .login { padding: 0 16px; }
   .login input { width: calc(100% - 32px); max-width: 320px; }
   /* Tabs in preview pane — already scrollable horizontally; force on mobile */
-  .tab-bar { overflow-x: auto; }
+  .tab-bar-list { overflow-x: auto; }
+  /* Bigger tap target for the open-tabs picker button on touch screens. */
+  .tab-picker-btn { padding: 0 12px; }
+  .tab-picker-btn svg { width: 17px; height: 17px; }
+  .tab-picker .session-picker-pop { max-height: 50vh; }
 
   /* ===== Chat tab strip — mobile tuning ===== */
   .chat-tabs {
@@ -1836,23 +1840,30 @@ body.kb-open .mobile-tab-bar { display: none; }
 .tab-bar {
   display: flex; align-items: stretch;
   background: var(--c-bg-1); border-bottom: 1px solid var(--c-border);
-  overflow-x: auto; flex-shrink: 0;
+  flex-shrink: 0;
   min-width: 0; max-width: 100%;
+}
+/* Only the tab strip scrolls horizontally — the picker button (.tab-picker)
+   sits outside it so it stays put + dodges the iOS sticky-in-overflow tap bug. */
+.tab-bar-list {
+  display: flex; align-items: stretch;
+  flex: 1; min-width: 0;
+  overflow-x: auto;
   /* Overlay-style scrollbar — invisible at rest, fades in on hover. Matches
      .chat-tabs-list so both tab strips feel the same. */
   scrollbar-width: thin;
   scrollbar-color: var(--c-scrollbar) transparent;
 }
-.tab-bar:hover { scrollbar-color: var(--c-fg-4) transparent; }
-.tab-bar::-webkit-scrollbar { height: 3px; }
-.tab-bar::-webkit-scrollbar-track { background: transparent; }
-.tab-bar::-webkit-scrollbar-thumb {
+.tab-bar-list:hover { scrollbar-color: var(--c-fg-4) transparent; }
+.tab-bar-list::-webkit-scrollbar { height: 3px; }
+.tab-bar-list::-webkit-scrollbar-track { background: transparent; }
+.tab-bar-list::-webkit-scrollbar-thumb {
   background: transparent;
   border-radius: 2px;
   transition: background var(--t-fast);
 }
-.tab-bar:hover::-webkit-scrollbar-thumb { background: var(--c-fg-4); }
-.tab-bar:hover::-webkit-scrollbar-thumb:hover { background: var(--c-fg-3); }
+.tab-bar-list:hover::-webkit-scrollbar-thumb { background: var(--c-fg-4); }
+.tab-bar-list:hover::-webkit-scrollbar-thumb:hover { background: var(--c-fg-3); }
 .tab {
   position: relative;
   display: flex; align-items: center; gap: 6px;
@@ -1893,6 +1904,30 @@ body.kb-open .mobile-tab-bar { display: none; }
   width: 8px; height: 8px; border-radius: 50%;
   background: var(--c-accent); flex-shrink: 0;
 }
+/* Open-tabs quick picker — fixed at the left edge of the tab bar, outside the
+   scrolling .tab-bar-list (mirrors the chat pane's history button). Its
+   dropdown lists only the currently-open file tabs. */
+.tab-picker {
+  position: relative;
+  flex-shrink: 0; display: flex; align-items: stretch;
+  background: var(--c-bg-1);
+  border-right: 1px solid var(--c-border);
+}
+.tab-picker-btn {
+  background: none; border: none; cursor: pointer;
+  color: var(--c-fg-2);
+  padding: 0 8px; display: flex; align-items: center;
+  transition: color var(--t-fast);
+}
+.tab-picker-btn:hover { color: var(--c-accent); }
+.tab-picker-btn svg { width: 15px; height: 15px; }
+/* Position / size come from inline fixed style (toggleEditorTabPicker); bump
+   z-index so the popup floats above the tab strip. */
+.tab-picker .session-picker-pop { z-index: 1500; }
+.tab-picker-pop .session-picker-row .icon {
+  display: flex; align-items: center; flex-shrink: 0; color: var(--c-fg-3);
+}
+.tab-picker-pop .session-picker-row .icon svg { width: 13px; height: 13px; }
 
 /* ==========================================================================
    Brand empty state (preview + chat 共用)

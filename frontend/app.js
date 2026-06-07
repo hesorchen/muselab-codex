@@ -295,6 +295,8 @@ function portal() {
     editing: false, editText: "",
     cmStatus: { line: 1, col: 1, sel: 0, lines: 0, chars: 0, mode: "plaintext", dirty: false },
     tabs: [],   // open file tabs: [{path, name}]
+    editorTabPickerOpen: false,  // open-tabs quick-switch dropdown (left tab bar)
+    editorTabPickerStyle: "",    // inline fixed-position style, set on open
 
     // ===== chat =====
     sessions: [], currentId: "",
@@ -388,6 +390,16 @@ function portal() {
     // active tab. Tabs can be opened from the session picker, closed via × on
     // the tab, or created by the "+ new" button.
     openTabIds: [],
+    // [resident-panes] Which tabs keep their message-pane DOM mounted. The chat
+    // panes (index.html) render one .msg-pane per id HERE — not per openTabIds —
+    // so far-back tabs are unmounted, bounding how much retained DOM the browser
+    // reflows on every switch (the mobile switch-lag root cause: cost scaled with
+    // total nodes across ALL open tabs, not the target session). LRU: current +
+    // the most-recent few. Switching to an evicted-but-loaded tab rebuilds its
+    // bubbles from tabState[id].messages (data always survives; only the DOM is
+    // dropped). _MAX_RESIDENT_PANES caps the set.
+    _residentTabIds: [],
+    _MAX_RESIDENT_PANES: 4,
     renamingTabId: "",   // session id whose name is currently being inline-edited
     renameDraft: "",     // current value of the inline rename <input>
     tabCtxMenu: null,    // {id, x, y} for the right-click tab menu, or null
@@ -982,6 +994,14 @@ function portal() {
       // double. Cheap to gate at the front; expensive to debug after.
       if (this._initialized) return;
       this._initialized = true;
+      // Prewarm the heavy preview vendor bundles (hljs / katex / mermaid)
+      // during browser idle, AFTER first paint. These are lazy-loaded on
+      // first use, but that cold load + compile (mermaid is ~3.3 MB) runs in
+      // the $nextTick AFTER a markdown preview has already painted — so the
+      // content shows, then the page freezes 2–3 s while the bundle parses.
+      // Warming them up front moves that cost off the click path. Fire-and-
+      // forget; failures fall back to the existing on-demand lazy load.
+      this._prewarmPreviewLibs();
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
       // (Cross-tab queue sync via localStorage `storage` events was removed
@@ -1982,13 +2002,26 @@ function portal() {
     isStreamingTurnAvatar(i) {
       if (!this.streaming) return false;
       const msgs = this.messages;
-      if (!msgs || !msgs[i] || msgs[i].role === "user") return false; // 仅 assistant 侧头像
-      const isTurnStart = i === 0 || (msgs[i - 1] && msgs[i - 1].role === "user");
-      if (!isTurnStart) return false;
-      for (let j = i + 1; j < msgs.length; j++) {
-        if (msgs[j] && msgs[j].role === "user") return false; // 后面还有用户消息 → 不是最新轮
+      if (!msgs || !msgs.length) return false;
+      // 最新轮的轮首 = 最后一个 user 之后紧邻的第一条 assistant。这等价于旧
+      // 实现「轮首(前一条是 user 或 i===0) + 其后无 user + 非 user」三条件的
+      // 唯一解 i = lastUserIdx+1（若该位置越界或仍是 user 则无）。旧实现对
+      // 每条消息都 O(n) 向后扫，而本绑定出现 9 处 × 每条 assistant × 每个
+      // 常驻 pane——发送时翻转 streaming 会让它们全部重算，移动端弱 CPU 上
+      // 凑成可感卡顿。这里按 (数组引用, 长度) memo：一次 Alpine flush 内只算
+      // 一次 lastUser，后续 i 全部 O(1) 命中。语义与旧实现严格一致。
+      if (this._stAvatarArr !== msgs || this._stAvatarLen !== msgs.length) {
+        let lastUser = -1;
+        for (let k = msgs.length - 1; k >= 0; k--) {
+          if (msgs[k] && msgs[k].role === "user") { lastUser = k; break; }
+        }
+        let start = lastUser + 1;
+        if (start >= msgs.length || (msgs[start] && msgs[start].role === "user")) start = -1;
+        this._stAvatarArr = msgs;       // 运行时缓存（_ 前缀，不进 Alpine 响应式）
+        this._stAvatarLen = msgs.length;
+        this._stAvatarStart = start;
       }
-      return true;
+      return i === this._stAvatarStart;
     },
     // 显示文案：英文界面 "Muse · Urania · Astronomy"；中文界面 "Muse · 乌拉尼亚 · 天文"（保留希腊名作 hint）
     mascotLabel() {
@@ -3197,7 +3230,13 @@ function portal() {
           this._rerenderMathMessages();
         }).catch((e) => console.warn("[muselab] katex lazy load failed:", e));
       }
-      if (window.renderMathInElement && window.katex) {
+      // Only walk the DOM for math when the source actually carries a math
+      // delimiter. renderMathInElement on a delimiter-free bubble is a no-op
+      // that still recursively scans every text node — wasted work on the vast
+      // majority of (prose / code) messages. Gating on looksLikeMath changes
+      // nothing observable (no delimiter ⇒ nothing to typeset) but skips the
+      // scan; profiling showed KaTeX auto-render eating ~300 ms of a cold load.
+      if (looksLikeMath && window.renderMathInElement && window.katex) {
         try {
           window.renderMathInElement(tmp, {
             delimiters: [
@@ -4102,7 +4141,9 @@ function portal() {
         const r = await fetch("/api/chat/sessions", {
           method: "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ name: "", model: newM }),
+          // open_ids: same open-tab protection as newSession() (this model-fork
+          // also creates a session, which triggers the empty-session recycler).
+          body: JSON.stringify({ name: "", model: newM, open_ids: this.openTabIds || [] }),
         });
         if (!r.ok) {
           this.model = oldM;
@@ -4766,7 +4807,57 @@ function portal() {
     // Hidden panes' bindings still evaluate against this.messages but are
     // display:none, so the (possibly stale) result is never seen.
     paneMessages(tid) {
-      return this._ensureTabState(tid).messages;
+      // Pure read: must NOT mutate tabState (this runs inside an x-for render
+      // getter — creating state here via _ensureTabState both side-effects the
+      // store during render AND races tab teardown, which surfaced as an
+      // uncaught "reading 'length'" when a closing pane briefly resolved to an
+      // undefined iterable). Always hand Alpine a real array.
+      if (!tid) return [];
+      const st = this.tabState && this.tabState[tid];
+      return (st && st.messages) || [];
+    },
+
+    // [resident-panes] The id list the message-pane x-for iterates. Returns the
+    // LRU resident set, but ALWAYS overlays currentId so the VISIBLE pane is
+    // mounted even if some code path set currentId without going through
+    // switchSession's promote (defensive — switchSession + initSessions keep
+    // currentId in _residentTabIds in the normal flow). Pure read: NO mutation
+    // (runs inside x-for render). Reactive on _residentTabIds + currentId, so the
+    // pane set re-evaluates exactly when either changes; :key="tid" keeps stable
+    // panes from rebuilding.
+    residentPaneIds() {
+      const list = this._residentTabIds || [];
+      if (this.currentId && !list.includes(this.currentId)) {
+        return [this.currentId, ...list];
+      }
+      return list;
+    },
+    // [resident-panes] LRU bookkeeping. Promote `tid` to most-recently-used, then
+    // evict panes past _MAX_RESIDENT_PANES from the LRU end — but NEVER evict the
+    // current tab (it's on-screen) or a tab with a live stream (its bubbles are
+    // being written by SSE handlers; unmounting would drop the in-progress reply
+    // from view until a rebuild). An evicted tab's _highlighted is reset so its
+    // future rebuilt DOM re-runs syntax highlight.
+    _promoteResident(tid) {
+      if (!tid) return;
+      const list = (this._residentTabIds || []).filter(x => x !== tid);
+      list.unshift(tid);   // MRU at the front
+      while (list.length > this._MAX_RESIDENT_PANES) {
+        let evicted = false;
+        // Scan from the LRU end for the first evictable (unprotected) pane.
+        for (let i = list.length - 1; i >= 0; i--) {
+          const cand = list[i];
+          if (cand === this.currentId) continue;          // never the visible pane
+          const cst = this.tabState && this.tabState[cand];
+          if (cst && cst.streaming) continue;             // never a live stream
+          list.splice(i, 1);
+          if (cst) cst._highlighted = false;              // rebuilt DOM must re-highlight
+          evicted = true;
+          break;
+        }
+        if (!evicted) break;   // everything left is protected — keep them all
+      }
+      this._residentTabIds = list;
     },
 
     async initSessions() {
@@ -4788,6 +4879,10 @@ function portal() {
       if (!this.openTabIds.includes(this.currentId)) {
         this.openTabIds.push(this.currentId);
       }
+      // [resident-panes] Seed the LRU with the landing tab only. Other restored
+      // tabs lazy-mount on first switch (rebuild path), so a multi-tab restore
+      // doesn't pay to render every pane up front.
+      this._residentTabIds = [this.currentId];
       this._activateTabState(this.currentId);
       const st = this._ensureTabState(this.currentId);
       if (!st._loaded) {
@@ -4796,10 +4891,59 @@ function portal() {
       }
       this.savePrefs();
     },
-    async refreshSessions() {
-      const { ok, data } = await this.api("/api/chat/sessions");
-      if (!ok) return;
+    // Shared session-list pull behind both the explicit refresh and the 10s
+    // quiet poll. Returns true when the list was (re)applied, false on a 304
+    // Not Modified or a transport failure (caller skips re-render).
+    //
+    // E6 / conditional GET: when `conditional` and we hold a prior ETag, send
+    // If-None-Match so an UNCHANGED list comes back bodyless as 304 — skipping
+    // both the JSON parse and the Alpine _applySessionList re-render (the
+    // picker's x-for over this.sessions, the heavy part). The server's weak
+    // ETag (list_sessions_api) flips on any visible change — new/renamed/
+    // deleted session, active-dot toggle — so we never miss an update. We must
+    // read response headers, which the shared api() wrapper hides, so this uses
+    // a direct fetch. Both call paths cache the latest ETag so the next
+    // conditional poll always compares against a fresh baseline.
+    async _pullSessionList(conditional = false, extraIds = "") {
+      const headers = { ...this.hdr() };
+      if (conditional && this._sessionsEtag) {
+        headers["If-None-Match"] = this._sessionsEtag;
+      }
+      // P2 (perf): window the list to the recent N + always-include open tabs.
+      // Without this every poll shipped ALL sessions (147 KB / 391 rows on a
+      // heavy archive) and the frontend re-processed all N on each assignment.
+      // `ids` guarantees an open tab that fell outside the recent window still
+      // arrives, so this.sessions.find(openTabId) never misses (tab title /
+      // model resolve). The ETag is hashed over THIS windowed body server-side,
+      // so a changed open-tab set yields a fresh body, never a stale 304.
+      // extraIds: a caller-supplied id (e.g. a push-notification deep-link
+      // target) that may live OUTSIDE the recent window — force-include it so
+      // the lookup that follows the pull can find it.
+      const _idSet = [...(this.openTabIds || [])];
+      if (extraIds) {
+        for (const x of String(extraIds).split(",")) {
+          if (x && !_idSet.includes(x)) _idSet.push(x);
+        }
+      }
+      const _ids = encodeURIComponent(_idSet.join(","));
+      let r;
+      try {
+        r = await fetch(`/api/chat/sessions?limit=100&ids=${_ids}`, { headers });
+      } catch (_) {
+        return false;  // network blip; next tick retries
+      }
+      if (r.status === 304) return false;  // unchanged — skip re-render
+      if (!r.ok) return false;
+      const et = r.headers.get("etag");
+      if (et) this._sessionsEtag = et;
+      let data = null;
+      try { data = await r.json(); } catch { data = null; }
       this._applySessionList((data && data.sessions) || []);
+      return true;
+    },
+    async refreshSessions() {
+      const ok = await this._pullSessionList(false);
+      if (!ok) return;
       // <select x-model="currentId"> needs a tickle to sync display when
       // sessions populate (same Alpine-x-model-on-dynamic-options race).
       await this._rebindSelect("currentId");
@@ -4810,10 +4954,11 @@ function portal() {
     // currentId watcher on every poll for no benefit. The tickle is only
     // needed when currentId itself must be re-displayed (login /
     // visibilitychange / explicit refresh), not on a background list poll.
+    // Conditional (E6): an unchanged list 304s and never reaches
+    // _applySessionList, so an idle multi-tab user stops re-rendering the
+    // picker every 10s.
     async _syncSessionListQuiet() {
-      const { ok, data } = await this.api("/api/chat/sessions");
-      if (!ok) return;
-      this._applySessionList((data && data.sessions) || []);
+      await this._pullSessionList(true);
     },
     // Shared session-list applier. Snapshots the prior server-side `active`
     // flags BEFORE swapping in the new list (FIX ⑩) so we can detect a
@@ -4827,13 +4972,61 @@ function portal() {
       // bindings (session-picker, history popup) use `s.id`; an undefined
       // key crashes alpine morph with "Cannot read properties of undefined
       // (reading 'after')".
-      this.sessions = (raw || []).filter(s => s && typeof s.id === "string" && s.id);
+      let next = (raw || []).filter(s => s && typeof s.id === "string" && s.id);
+      // Re-inject optimistic sessions the server hasn't acknowledged yet. A
+      // brand-new chat is opened locally before its background registration
+      // POST lands; until the server index has it, this windowed poll won't
+      // return it (its ?ids= force-include only works once it's registered).
+      // Without this, a poll in that window would yank the just-opened row out
+      // of the sidebar. Only re-inject ones still missing AND still open.
+      const _om = this._optimisticMetas || {};
+      const _present = new Set(next.map(s => s.id));
+      const _pending = Object.keys(_om).filter(
+        id => !_present.has(id) && (this.openTabIds || []).includes(id));
+      if (_pending.length) {
+        next = [...(_pending.map(id => _om[id])), ...next];
+      }
+      // Shallow-diff guard (2026-06-07, render 治本): the 10s background poll
+      // returns 200 (not 304) whenever ANY display field changed — including a
+      // streaming session's `active` dot toggling. Re-assigning this.sessions
+      // makes Alpine re-morph the WHOLE picker x-for (measured: 86-217ms
+      // longtasks, worse with many tabs). When nothing the UI actually renders
+      // has changed, skip the assignment entirely so no morph is scheduled.
+      // The ETag 304 path already covers "byte-identical"; this covers
+      // "semantically identical after re-injection" (e.g. our own optimistic
+      // row already present, or fields we don't render that wiggled).
+      if (this._sessionsEqual(this.sessions, next)) return;
+      this.sessions = next;
       for (const s of this.sessions) {
         if (prevActive[s.id] && !s.active && s.id !== this.currentId) {
           const st = this._ensureTabState(s.id);
           if (st && !st.streaming) st.unread = true;
         }
       }
+    },
+    // Field-level equality over the rendered session metadata. Returns true
+    // only when every row matches on the fields the picker / tab bar / chrome
+    // actually display — so a change the user can't see never triggers a
+    // re-render. Order matters (the list is sorted server-side); a reorder is
+    // a real change and returns false.
+    _sessionsEqual(a, b) {
+      if (!Array.isArray(a) || !Array.isArray(b)) return false;
+      if (a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i++) {
+        const x = a[i], y = b[i];
+        if (!x || !y) return false;
+        if (x.id !== y.id) return false;
+        if ((x.name || "") !== (y.name || "")) return false;
+        if ((x.model || "") !== (y.model || "")) return false;
+        if (!!x.pinned !== !!y.pinned) return false;
+        if (!!x.active !== !!y.active) return false;
+        if ((x.updated_at || 0) !== (y.updated_at || 0)) return false;
+        if ((x.message_count || 0) !== (y.message_count || 0)) return false;
+        if ((x.effort || "") !== (y.effort || "")) return false;
+        if ((x.thinking !== false) !== (y.thinking !== false)) return false;
+        if ((x.system_prompt || "") !== (y.system_prompt || "")) return false;
+      }
+      return true;
     },
 
     // Generic select-rebind tickle (model + currentId share this). Flipping
@@ -4846,7 +5039,27 @@ function portal() {
       await this.$nextTick();
       this[field] = cur;
     },
-    async newSession() {
+    // Mint a v4 UUID for a client-created session. crypto.randomUUID is the
+    // happy path, but it's ONLY exposed in *secure* contexts — when muselab is
+    // opened over plain http://<LAN-IP> (the common mobile case) it's
+    // undefined. Fall back to getRandomValues (available on insecure origins
+    // too) and finally Math.random, so a new chat can ALWAYS open instantly,
+    // offline, with no server round-trip.
+    _uuid() {
+      try {
+        if (typeof crypto !== "undefined" && crypto.randomUUID) return crypto.randomUUID();
+      } catch (e) { /* fall through */ }
+      const b = new Uint8Array(16);
+      try { crypto.getRandomValues(b); }
+      catch (e) { for (let i = 0; i < 16; i++) b[i] = (Math.random() * 256) | 0; }
+      b[6] = (b[6] & 0x0f) | 0x40;   // version 4
+      b[8] = (b[8] & 0x3f) | 0x80;   // variant 10xx
+      const h = [];
+      for (let i = 0; i < 16; i++) h.push(b[i].toString(16).padStart(2, "0"));
+      return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-` +
+             `${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
+    },
+    newSession() {
       // No longer stops streams in OTHER tabs — each tab has its own ES in
       // tabState[id].es. The new session starts fresh in its own tab.
       // Default name uses the user's BROWSER-LOCAL clock — the backend
@@ -4854,38 +5067,80 @@ function portal() {
       // in non-UTC timezones saw "新会话 05-19 08:26" when their wall
       // clock said 16:26. Generating the timestamp client-side fixes that
       // for every user without a server-side timezone config.
+      //
+      // OPTIMISTIC CREATE (2026-06-07): the + click must NOT wait on any
+      // network round-trip. A brand-new EMPTY session has nothing to transfer,
+      // yet this used to `await` the create POST (~561ms, and MULTIPLE SECONDS
+      // on a flaky mobile radio) before the tab could open. We now mint the
+      // UUID client-side, build the full meta locally, open the tab
+      // SYNCHRONOUSLY, and fire registration in the BACKGROUND. The send path
+      // binds the SDK session to this same UUID on first message whether or not
+      // the POST has landed yet (chat.py uses session_id= when no JSONL exists
+      // for the id), so the chat works even mid-registration.
       const now = new Date();
       const pad = n => String(n).padStart(2, "0");
       const stamp = `${pad(now.getMonth() + 1)}-${pad(now.getDate())} ` +
                     `${pad(now.getHours())}:${pad(now.getMinutes())}`;
       const prefix = this.lang === "zh" ? "新会话 " : "New chat ";
-      const r = await fetch("/api/chat/sessions", {
-        method: "POST",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ name: prefix + stamp, model: this.model }),
-      });
-      const meta = await r.json();
-      // Optimistic local update — UI switches the moment the backend
-      // confirms the session ID, instead of waiting for two extra HTTP
-      // roundtrips. refreshSessions/_fetchTabUsage run in the background
-      // and will reconcile when they return (~100-200ms later); their
-      // result is consistent with what we just inserted, so the user
-      // sees zero flicker. Previously this was three sequential awaits
-      // (~300-500ms perceived lag for "new chat" click).
-      const existsLocally = this.sessions.some(s => s.id === meta.id);
-      if (!existsLocally) {
+      const id = this._uuid();
+      const ts = now.getTime() / 1000;
+      const meta = {
+        id,
+        name: prefix + stamp,
+        model: this.model || "",
+        system_prompt: "",
+        created_at: ts,
+        updated_at: ts,
+        message_count: 0,
+        auto_named: true,
+        pinned: false,
+        active: false,
+      };
+      // --- synchronous, zero-network UI open ---
+      // Track as optimistic so a sync poll firing before registration lands
+      // doesn't drop the row from the sidebar (see _applySessionList).
+      this._optimisticMetas[id] = meta;
+      if (!this.sessions.some(s => s.id === id)) {
         this.sessions = [meta, ...this.sessions];
       }
-      this.currentId = meta.id;
-      const st = this._ensureTabState(meta.id);
+      this.currentId = id;
+      const st = this._ensureTabState(id);
       st.messages.length = 0;
       st._loaded = true;
-      this._activateTabState(meta.id);
-      if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+      this._activateTabState(id);
+      if (!this.openTabIds.includes(id)) this.openTabIds.push(id);
       this.savePrefs();
-      // Background reconciliation (fire-and-forget).
-      this.refreshSessions();
-      this._fetchTabUsage(meta.id);
+      // --- background registration (fire-and-forget) ---
+      // keepalive: lets the POST survive a tab navigation right after clicking.
+      // We send our minted `id` so the server registers THAT uuid (validated
+      // server-side as a canonical UUID before it touches any file path).
+      fetch("/api/chat/sessions", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        keepalive: true,
+        // open_ids: protect THIS browser's open tabs from the backend's
+        // empty-session recycler (prune_empty_sessions keep_ids) — an open but
+        // still-empty scratch tab must not be swept when a new one is created.
+        body: JSON.stringify({ id, name: meta.name, model: this.model, open_ids: this.openTabIds || [] }),
+      }).then(r => (r && r.ok ? r.json() : null)).then(srv => {
+        // Confirmed: drop the optimistic guard and reconcile any server-side
+        // normalisation (e.g. provider model fallback) into the local row.
+        // The id is ours, so there's nothing to swap.
+        delete this._optimisticMetas[id];
+        if (srv && srv.id === id) {
+          const i = this.sessions.findIndex(s => s.id === id);
+          if (i >= 0) this.sessions[i] = { ...this.sessions[i], ...srv };
+        }
+        // Now that the session exists server-side, the usage meter can bind to
+        // the right model. (Deferred from the click path; the early fetch
+        // inside _activateTabState may 404 harmlessly before registration.)
+        this._fetchTabUsage(id);
+      }).catch(() => {
+        // Registration failed (offline / 5xx). The open tab still works — on
+        // first send the backend writes the JSONL (session_id=id) and the
+        // session reappears in the list via the SDK merge. Keep the optimistic
+        // guard so the row doesn't vanish before then.
+      });
       return meta;
     },
 
@@ -4967,7 +5222,11 @@ function portal() {
       if (!id) return;
       try {
         if (!this.sessions.find(s => s.id === id)) {
-          await this.refreshSessions();
+          // P2: the windowed list won't include an OLD session unless we ask
+          // for it by id. Force-include the deep-link target so a still-living
+          // (but out-of-window) session resolves — and a since-deleted one
+          // still won't appear, preserving the phantom-tab guard below.
+          await this._pullSessionList(false, id);
           if (!this.sessions.find(s => s.id === id)) return;
         }
         await this.openTab(id);
@@ -4999,6 +5258,10 @@ function portal() {
         // preview is now a data URL (base64 thumbnail) — no blob revoke needed.
       }
       this.openTabIds.splice(idx, 1);
+      // [resident-panes] Drop the closed tab's pane from the resident set (its
+      // DOM is unmounting). If it was active, switchSession below re-promotes
+      // the neighbor we land on.
+      this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
       if (wasActive) {
         if (this.openTabIds.length) {
           const nextIdx = Math.min(idx, this.openTabIds.length - 1);
@@ -6413,13 +6676,55 @@ function portal() {
     // time so the popup floats just below it.
     historyPickerStyle: "",
     sessionPickerSearch: "",
+    // P2 (perf): the list is windowed to the recent ~100, so the picker's
+    // client-side filter can no longer reach old sessions. Search goes to the
+    // server (?q=) across the FULL list; results live in these reactive props.
+    // Declared here (not lazily) so Alpine tracks them — a lazily-added prop
+    // wouldn't re-render the picker when the async result lands.
+    // _sessionSearchResults: null = "no server answer yet for the current
+    // query"; filteredSessions() falls back to a local filter until it arrives.
+    _sessionSearchResults: null,
+    _sessionSearchQuery: "",
+    // Optimistic-create (2026-06-07): new sessions are minted client-side and
+    // opened with zero network wait; their registration POST runs in the
+    // background. This holds id→meta for sessions the SERVER hasn't confirmed
+    // yet, so a 10s sync poll that fires inside that ~0.5s window doesn't drop
+    // the brand-new row from the sidebar (the open tab itself survives via
+    // openTabIds, but the list would flicker). Cleared once the POST confirms.
+    _optimisticMetas: {},
     filteredSessions() {
       const q = (this.sessionPickerSearch || "").trim().toLowerCase();
       if (!q) return this.sessions;
+      // Server search has answered for THIS exact query → use the full-archive
+      // result set (reaches sessions outside the recent window).
+      if (this._sessionSearchQuery === q && Array.isArray(this._sessionSearchResults)) {
+        return this._sessionSearchResults;
+      }
+      // Not yet (debounce / network in flight) → instant local feedback over
+      // the loaded window; _searchSessions() replaces it with the server set.
       return this.sessions.filter(s =>
         (s.name && s.name.toLowerCase().includes(q))
         || (s.first_prompt && s.first_prompt.toLowerCase().includes(q))
       );
+    },
+    // Server-side session search. Local filtering only sees the recent window
+    // (P2 pagination), so the picker queries the backend across the full list.
+    // Fired from the search input's @input.debounce.300ms. Stale-guarded: a
+    // slow response for a query the box has since moved off of is dropped.
+    async _searchSessions() {
+      const raw = (this.sessionPickerSearch || "").trim();
+      const q = raw.toLowerCase();
+      if (!q) { this._sessionSearchResults = null; this._sessionSearchQuery = ""; return; }
+      try {
+        const r = await fetch("/api/chat/sessions?q=" + encodeURIComponent(raw),
+                              { headers: this.hdr() });
+        if (!r.ok) return;
+        const data = await r.json();
+        // Drop a late answer for a query the user already moved off of.
+        if ((this.sessionPickerSearch || "").trim().toLowerCase() !== q) return;
+        this._sessionSearchResults = (data && data.sessions) || [];
+        this._sessionSearchQuery = q;
+      } catch (_) { /* keep the local fallback */ }
     },
     // Bucket the filtered list into Pinned / Today / Yesterday / Last 7d /
     // Last 30d / Earlier so a few hundred sessions stay scannable. Pinned
@@ -6498,7 +6803,40 @@ function portal() {
     },
     pickerOpenSession(sid) {
       this.sessionPickerOpen = false;
+      // A search hit may live OUTSIDE the recent window, so its metadata isn't
+      // in this.sessions yet — merge it in so the tab title / model resolve
+      // immediately (the next _pullSessionList keeps it via ?ids=). Without
+      // this the new tab would flash a blank title until the next poll.
+      if (!this.sessions.find(s => s.id === sid)) {
+        const hit = (this._sessionSearchResults || []).find(s => s.id === sid);
+        if (hit) this.sessions = [hit, ...this.sessions];
+      }
       this.openTab(sid);
+    },
+    // Open-tabs quick picker for the file editor tab bar. Computes a fixed
+    // position from the button rect (same trick as toggleHistoryPicker) so the
+    // dropdown escapes the .tab-bar overflow: auto clip.
+    toggleEditorTabPicker(ev) {
+      if (this.editorTabPickerOpen) { this.editorTabPickerOpen = false; return; }
+      const btn = ev && ev.currentTarget;
+      const rect = btn ? btn.getBoundingClientRect() : null;
+      if (rect) {
+        const popW = Math.min(280, window.innerWidth - 16);
+        // Left-align under the button, but stay inside the viewport edges.
+        let left = Math.round(rect.left);
+        if (left + popW > window.innerWidth - 8) left = window.innerWidth - 8 - popW;
+        if (left < 8) left = 8;
+        const top = Math.round(rect.bottom + 4);
+        this.editorTabPickerStyle =
+          `position: fixed; top: ${top}px; left: ${left}px; width: ${popW}px;`;
+      } else {
+        this.editorTabPickerStyle = "";
+      }
+      this.editorTabPickerOpen = true;
+    },
+    pickEditorTab(path) {
+      this.editorTabPickerOpen = false;
+      this.switchTab(path);
     },
     pickerRowMenu(ev, sid) {
       if (ev && ev.stopPropagation) ev.stopPropagation();
@@ -6634,6 +6972,7 @@ function portal() {
       // bumps the user to a remaining session if id was current.
       await this.deleteSessionById(id);
       this.openTabIds = this.openTabIds.filter(x => x !== id);
+      this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
       if (!this.openTabIds.includes(this.currentId)) {
         this.openTabIds.push(this.currentId);
       }
@@ -6650,6 +6989,13 @@ function portal() {
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
+      // [resident-panes] Decide warm vs rebuild BEFORE promoting: was this tab's
+      // pane already mounted? Yes → warm (pure x-show flip, DOM already present).
+      // No (LRU-evicted, or first activation of a background-opened tab) → rebuild
+      // (Alpine re-mounts its bubbles from tabState). Then promote currentId so its
+      // pane is (or stays) resident and any LRU eviction happens now.
+      const _wasResident = (this._residentTabIds || []).includes(this.currentId);
+      this._promoteResident(this.currentId);
       this._activateTabState(this.currentId);
       this.savePrefs();
       // Sync the model + effort dropdowns to THIS session's persisted
@@ -6675,12 +7021,104 @@ function portal() {
       if (!st._loaded) {
         await this.loadSession(this.currentId);
         st._loaded = true;
-      } else {
-        // Already loaded — just re-bind UI state. messages reference unchanged.
+      } else if (_wasResident) {
+        // Already loaded — content is in the DOM, the switch is just an x-show
+        // flip. The click→switch lag came from the browser laying out the
+        // newly-revealed pane (style/layout of every .msg scales with that
+        // tab's history) PLUS scrollToBottom's forced reflow + highlightCode's
+        // full-body walk, all BEFORE the browser could paint the currentId
+        // change — so a big tab "froze" ~1.5s and even small tabs lagged
+        // ~100-200ms.
         this.atBottom = true;
-        this.scrollToBottom(true);
-        this.$nextTick(() => this.highlightCode(".chat-body"));
+        const stCur = this.tabState && this.tabState[this.currentId];
+        const histLen = (stCur && stCur.messages && stCur.messages.length) || 0;
+        // Heavy history → keep the bubbles display:none'd for one frame
+        // (`.chat-body.msgs-hidden .msg { display:none }`, driven by
+        // messagesReady=false) so the tab-bar flip + a loading skeleton PAINT
+        // immediately with ZERO bubble layout. Then reveal on the next frame —
+        // the (unavoidable) layout of N bubbles now happens AFTER the switch is
+        // already on screen, so the click feels instant with a brief loading
+        // state (acceptable per product). Small tabs lay out in a couple ms, so
+        // skip the skeleton to avoid a needless flicker.
+        // Guard the deferred callbacks against a rapid re-switch: if the user
+        // tabs away again before the next frame, the stale callback must not
+        // flip messagesReady / scroll / highlight for a tab that's no longer
+        // visible (it would clobber the now-current tab's state).
+        const target = this.currentId;
+        // Already-highlighted tabs don't need another full-body highlight pass
+        // on every switch: the per-node data-hl sentinel already early-returns,
+        // but the `.chat-body pre code` querySelectorAll still walks EVERY open
+        // pane's DOM each time. Streaming new code sets its own data-hl via the
+        // stream path, so a warm re-activation has nothing new to do. Skip it.
+        const reHighlight = () => { if (!stCur || !stCur._highlighted) { this.highlightCode(".chat-body"); if (stCur) stCur._highlighted = true; } };
+        // Warm switch: settle to the bottom. The loop early-exits as soon as
+        // scrollHeight is stable (2 frames) — a couple frames for a tab whose
+        // heights are already realized, more for tall content-visibility
+        // bubbles that realize as they scroll in — and onChatScroll is
+        // suppressed during it, so the default cap is cheap in the common case
+        // while still landing correctly on tall histories.
+        const settle = () => {
+          this._settleScrollToBottom();
+          this.atBottom = true;
+        };
+        if (histLen > 60) {
+          this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
+          this._afterPaint(() => {
+            if (this.currentId !== target) return;
+            this.messagesReady = true;         // reveal bubbles (layout now, post-switch-paint)
+            this._afterPaint(() => {
+              if (this.currentId !== target) return;
+              settle();
+              reHighlight();
+            });
+          });
+        } else {
+          this.messagesReady = true;           // cheap reveal → no skeleton flash
+          this._afterPaint(() => {
+            if (this.currentId !== target) return;
+            settle();
+            reHighlight();
+          });
+        }
+      } else {
+        // [resident-panes] REBUILD: history is loaded in tabState but this pane
+        // was NOT mounted (LRU-evicted, or first activation of a tab opened in
+        // the background). Promoting currentId above added it to _residentTabIds,
+        // so the message-pane x-for will MOUNT a fresh .msg-pane and render its
+        // bubbles from tabState[id].messages on the next Alpine tick. No refetch
+        // (skip net/parse/md) — wait for the mount to paint, then highlight +
+        // settle scroll. Cost is O(target history), bounded by THIS session, not
+        // the sum of every open tab's retained DOM (that was the lag root cause).
+        this.atBottom = true;
+        const target = this.currentId;
+        const stCur = this.tabState && this.tabState[this.currentId];
+        // Hide bubbles for one frame so the tab-bar flip + skeleton paint
+        // instantly; reveal next frame so the O(M) fresh-mount layout lands AFTER
+        // the switch is on-screen (same trick as the heavy-warm path above).
+        this.messagesReady = false;
+        this._afterPaint(() => {
+          if (this.currentId !== target) return;
+          this.messagesReady = true;
+          this._afterPaint(() => {
+            if (this.currentId !== target) return;
+            this._settleScrollToBottom();
+            this.atBottom = true;
+            // Fresh DOM → always (re)highlight; reset the sentinel first.
+            if (stCur) stCur._highlighted = false;
+            this.highlightCode(".chat-body");
+            if (stCur) stCur._highlighted = true;
+          });
+        });
       }
+    },
+    // Run `fn` AFTER the browser has painted the current frame. A single
+    // requestAnimationFrame fires before paint; the nested one runs at the top
+    // of the FOLLOWING frame, i.e. once the pending DOM change is on screen.
+    // Used to keep layout-forcing / DOM-walking work off the critical path of a
+    // visible state change (e.g. tab switch) so the change paints immediately.
+    _afterPaint(fn) {
+      if (typeof requestAnimationFrame !== "function") { setTimeout(fn, 0); return; }
+      requestAnimationFrame(() => requestAnimationFrame(fn));
     },
     // Background-completion hook: after loadSession populates the
     // JSONL-derived history, ask the backend whether this session has
@@ -6806,7 +7244,7 @@ function portal() {
         const _mobileEarly = this._isMobileLayout();
         const _initialLoadEarly = _mobileEarly
           ? (_coldEarly ? 8 : 15)
-          : (_coldEarly ? 12 : 30);
+          : (_coldEarly ? 12 : 18);
         const FETCH_TAIL = _initialLoadEarly * 5;
         const qs = full ? "?full=1" : ("?tail=" + FETCH_TAIL);
         const r = await fetch("/api/chat/sessions/" + sid + qs, { headers: this.hdr() });
@@ -6911,10 +7349,27 @@ function portal() {
         const startIdx = pickVisibleStart(all);
         const visible = all.slice(startIdx);
         const earlier = all.slice(0, startIdx);
+        // E5: when pickVisibleStart rewound `visible` past the bottom
+        // INITIAL_LOAD (agentic / tool-heavy sessions hit HARD_CAP≈90), that
+        // rewound HEAD sits ABOVE the fold once we scroll to the bottom on first
+        // paint. Rendering its markdown synchronously here — marked + DOMPurify +
+        // KaTeX over up to ~90 bubbles, all while the skeleton is up — is the
+        // remaining pre-reveal main-thread FREEZE on long-session open. So render
+        // only the on-screen tail synchronously (messagesReady can flip with real
+        // content immediately) and stash the head for a post-paint, idle-chunked,
+        // scroll-anchored fill (see _fillDeferredHead). Un-rewound windows keep
+        // the original one-shot path — zero behaviour change for short sessions.
+        let _deferHead = null;
         if (sid === this.currentId) {
-          // Foreground tab: render synchronously so html is ready before the
-          // skeleton reveals (highlight + scroll measure the final layout).
-          visible.forEach(renderMarkdown);
+          if (visible.length > INITIAL_LOAD) {
+            const _headCount = visible.length - INITIAL_LOAD;
+            for (let j = _headCount; j < visible.length; j++) renderMarkdown(visible[j]);
+            _deferHead = visible.slice(0, _headCount);
+          } else {
+            // No rewind: the whole window is the first screen — render it now so
+            // html is ready before the skeleton reveals.
+            visible.forEach(renderMarkdown);
+          }
         } else {
           // Off-screen idle-preload: chunk + yield so warming a big background
           // tab never freezes the page. Awaited, so _loaded (set by the
@@ -6923,7 +7378,12 @@ function portal() {
         }
         // Mutate in place — preserves the Array reference Alpine is watching.
         st.messages.length = 0;
-        st.messages.push(...visible);
+        // Foreground tab fills st.messages INCREMENTALLY via
+        // _revealMessagesChunked below (spreads Alpine's bubble instantiation
+        // over several frames instead of one multi-second main-thread burst).
+        // Off-screen tabs aren't painted (display:none), so there's no freeze
+        // to spread — push them in one shot.
+        if (sid !== this.currentId) st.messages.push(...visible);
         // Stash older messages on the per-tab state; the "Load earlier"
         // button reads from here.
         st._earlierMessages = earlier;
@@ -6965,12 +7425,30 @@ function portal() {
           // the chunked highlighter catches up — very visible on mobile.
           // scrollToBottom runs AFTER reveal so it measures the final layout.
           scheduledReveal = true;
+          // Instantiate bubbles in small chunks (yield to the browser between
+          // each) so a long session's first paint never blocks the main thread
+          // in a single multi-second task. The skeleton stays up until this
+          // resolves, so the user sees a responsive page (tabs / sidebar stay
+          // clickable) instead of a frozen one ("卡死").
+          await this._revealMessagesChunked(sid, st, visible);
           this.$nextTick(async () => {
-            try { await this.highlightCode(".chat-body"); }
+            try { await this.highlightCode(".chat-body"); st._highlighted = true; }
             catch (_e) { /* highlight best-effort — reveal regardless */ }
             if (sid === this.currentId) {
               this.messagesReady = true;
-              this.$nextTick(() => { this.atBottom = true; this.scrollToBottom(true); });
+              this.$nextTick(() => {
+                this.atBottom = true; this.scrollToBottom(true);
+                // E5: the on-screen tail is now painted + pinned to the bottom.
+                // Fill the deferred head above the fold (idle-chunked + scroll-
+                // anchored) so the rewound bubbles are ready before the user
+                // scrolls up, without blocking this first paint.
+                if (_deferHead && _deferHead.length) {
+                  const _kick = () => this._fillDeferredHead(sid, st, _deferHead);
+                  if (typeof window !== "undefined" && window.requestIdleCallback) {
+                    window.requestIdleCallback(_kick, { timeout: 300 });
+                  } else { setTimeout(_kick, 32); }
+                }
+              });
             }
           });
         }
@@ -7039,6 +7517,93 @@ function portal() {
           else resolve();
         };
         pump();
+      });
+    },
+    // Push `visible` into the foreground tab's reactive messages array in small
+    // chunks, yielding a frame between each so Alpine's x-for instantiates the
+    // (directive-heavy) bubble templates incrementally. A single bulk push of
+    // ~30 rich bubbles blocks the main thread for seconds on a long session /
+    // throttled device — the dominant remaining cold-open freeze after the hljs
+    // fix. st.messages is the SAME array Alpine watches (bound via
+    // this.messages = st.messages just before this call), so each push reacts.
+    async _revealMessagesChunked(sid, st, visible) {
+      const CH = this._isMobileLayout() ? 4 : 6;
+      let i = 0;
+      while (i < visible.length) {
+        // Tab was closed+reopened mid-reveal (a fresh st replaced ours, or it
+        // was deleted): our st is now orphaned. Stop pushing — the new
+        // loadSession owns the reveal. Prevents double-fill / duplicate keys.
+        if (this.tabState[sid] !== st) return;
+        st.messages.push(...visible.slice(i, i + CH));
+        i += CH;
+        // Tab switched away mid-reveal: the array is no longer on screen and a
+        // later return won't re-run loadSession (st._loaded is set by the
+        // caller), so finish filling it in one shot to keep it complete, then
+        // stop yielding.
+        if (sid !== this.currentId) {
+          if (i < visible.length) st.messages.push(...visible.slice(i));
+          return;
+        }
+        if (i < visible.length) {
+          await new Promise(r => (window.requestAnimationFrame
+            ? requestAnimationFrame(() => r()) : setTimeout(r, 16)));
+        }
+      }
+    },
+    // E5: render the deferred HEAD — the rewound, above-the-fold bubbles whose
+    // markdown loadSession skipped so first paint wasn't blocked on the whole
+    // window. Runs AFTER the on-screen tail has painted + pinned to the bottom.
+    // Idle-chunked so it never monopolizes the main thread, and each chunk
+    // restores the scroll offset (delta-anchored, exactly like loadEarlierMessages)
+    // so the head growing ABOVE the viewport doesn't shove the latest message
+    // down. .html fills reactively (the same x-html effect the streaming path
+    // mutates); we re-highlight once filled (idempotent via the data-hl sentinel —
+    // covers code + mermaid/HTML artifacts; KaTeX renders inline inside mdRender).
+    // If the user switches away mid-fill we finish the markdown in one shot
+    // off-screen so switching back shows complete content (switchSession re-runs
+    // highlightCode, and st._loaded blocks a re-load that would otherwise repair it).
+    async _fillDeferredHead(sid, st, head) {
+      if (!head || !head.length) return;
+      const renderOne = (m) => {
+        if (m && m.role === "assistant" && m.text && !m.html) m.html = this.mdRender(m.text);
+      };
+      const CH = 5;
+      let i = 0;
+      while (i < head.length) {
+        // Tab closed+reopened → a fresh st owns this session now; drop out.
+        if (this.tabState[sid] !== st) return;
+        // Tab switched away → finish the render in one shot (keeps content
+        // complete for the return switch), then stop. No scroll/highlight: the
+        // bubbles aren't on screen and switchSession re-highlights on return.
+        if (sid !== this.currentId) {
+          for (; i < head.length; i++) renderOne(head[i]);
+          return;
+        }
+        const scrollEl = this.$refs.chatBody;
+        const oldH = scrollEl ? scrollEl.scrollHeight : 0;
+        const oldTop = scrollEl ? scrollEl.scrollTop : 0;
+        const end = Math.min(i + CH, head.length);
+        for (; i < end; i++) renderOne(head[i]);
+        // Wait for Alpine to apply the x-html updates (DOM reflow), then restore
+        // the scroll offset so the user's viewport stays put as the head grows.
+        await new Promise(r => this.$nextTick(() => r()));
+        if (scrollEl && sid === this.currentId) {
+          const grew = scrollEl.scrollHeight - oldH;
+          if (grew) scrollEl.scrollTop = oldTop + grew;
+        }
+        // Yield so the fill never competes with foreground interaction.
+        if (i < head.length) {
+          await new Promise(r => (typeof window !== "undefined" && window.requestIdleCallback
+            ? window.requestIdleCallback(() => r(), { timeout: 120 })
+            : setTimeout(r, 0)));
+        }
+      }
+      // Head fully rendered — re-highlight the chat body once (the data-hl
+      // sentinel skips the already-done tail, so this only touches the head's
+      // code blocks + triggers its mermaid/HTML artifacts).
+      if (this.tabState[sid] !== st || sid !== this.currentId) return;
+      this.$nextTick(() => {
+        if (sid === this.currentId) this.highlightCode(".chat-body");
       });
     },
     _idlePreloadStep() {
@@ -9862,9 +10427,13 @@ function portal() {
       // only within them — O(new blocks) instead of rescanning the whole chat
       // body's O(total blocks) each click. The data-hl sentinel still makes a
       // too-broad scope merely redundant, never wrong.
+      // Only collect BLOCK code (<pre><code>). Inline `code` spans are never
+      // syntax-highlighted (see _highlightOne), so collecting them just to
+      // early-return wastes a full-body querySelectorAll + per-node walk on
+      // every highlight pass (warm tab switches re-run this over a long body).
       const nodes = scopeEls
-        ? this._collectCodeNodes(scopeEls, "code").filter(el => el.dataset.hl !== "1")
-        : Array.from(document.querySelectorAll(root + " code"))
+        ? this._collectCodeNodes(scopeEls, "pre code").filter(el => el.dataset.hl !== "1")
+        : Array.from(document.querySelectorAll(root + " pre code"))
             .filter(el => el.dataset.hl !== "1");
       const runArtifacts = () => {
         // After hljs finishes, scan for Artifact-eligible code blocks (mermaid
@@ -9926,6 +10495,23 @@ function portal() {
       }
       return out;
     },
+    // Candidate languages for highlightAuto when a code block has no explicit
+    // language tag. Computed once (filtered to whatever hljs actually has
+    // registered, so an unbundled language never throws). Covers the langs that
+    // realistically show up in chat; anything outside still renders, just as
+    // plain text instead of mis-detected exotic syntax.
+    _hlAutoSubset() {
+      if (this.__hlSubset) return this.__hlSubset;
+      const want = ["python", "javascript", "typescript", "json", "bash",
+        "shell", "yaml", "sql", "java", "go", "rust", "c", "cpp", "csharp",
+        "html", "xml", "css", "scss", "markdown", "diff", "ini", "dockerfile",
+        "makefile", "php", "ruby", "kotlin", "swift", "lua", "plaintext"];
+      const hl = window.hljs;
+      this.__hlSubset = hl
+        ? want.filter(l => { try { return !!hl.getLanguage(l); } catch { return false; } })
+        : want;
+      return this.__hlSubset;
+    },
     // Highlight a single <code> block (extracted from highlightCode so the
     // chunked pump can call it per element). Idempotent via the data-hl
     // sentinel — see highlightCode for why dedup matters during streaming.
@@ -9944,6 +10530,17 @@ function portal() {
         el.dataset.hl = "1";
         return;
       }
+      // Inline `code` (NOT wrapped in <pre>) is never syntax-highlighted: it's
+      // a word / identifier / path, not a code block. Running hljs on it is
+      // pure waste — and worse, the FIRST highlightAuto call forces hljs to
+      // lazily compile ALL ~39 registered language grammars (multi-second on a
+      // cold load / throttled CPU) even for a 10-char span. Profiling a long
+      // session's cold open showed hljs `exec` dominating (~5 s @4× CPU) while
+      // the only visible <code> were trivial inline spans. Inline styling
+      // (.bubble code) doesn't use the .hljs class, so skipping is invisible.
+      // Just mark done.
+      const _pre = el.parentElement;
+      if (!_pre || _pre.tagName !== "PRE") { el.dataset.hl = "1"; return; }
       const text = el.textContent;
       // Skip expensive syntax highlighting for large files. hljs JavaScript /
       // TypeScript parsers can block the main thread for several seconds on
@@ -9960,7 +10557,12 @@ function portal() {
       try {
         const r = (lang && window.hljs.getLanguage(lang))
           ? window.hljs.highlight(text, { language: lang, ignoreIllegals: true })
-          : window.hljs.highlightAuto(text);
+          // No explicit language → auto-detect, but RESTRICTED to a subset of
+          // common languages. Plain highlightAuto(text) tries every one of the
+          // ~39 registered grammars (and compiles them all on first use); the
+          // subset cuts that to ~15 likely candidates, which is both faster and
+          // less prone to mis-detecting prose-y blocks as some exotic language.
+          : window.hljs.highlightAuto(text, this._hlAutoSubset());
         el.innerHTML = r.value;
         el.classList.add("hljs");
         el.dataset.hl = "1";
@@ -10169,6 +10771,35 @@ function portal() {
     // Language files load in parallel after the core (they depend on
     // window.hljs existing); _loadAssets's sequential model would block
     // them serially, so we hand-roll the parallel tail here.
+    // Idle prewarm of the preview vendor bundles so a markdown file's
+    // post-paint $nextTick (highlightCode → _renderArtifacts) doesn't pay the
+    // cold load+compile of hljs / katex / mermaid (mermaid alone is ~3.3 MB).
+    // Scheduled on requestIdleCallback (fallback: a deferred timeout) so it
+    // never competes with the initial app render. Each step is fire-and-forget
+    // and swallows errors — the on-demand lazy loaders remain the fallback.
+    _prewarmPreviewLibs() {
+      if (this._previewLibsPrewarmed) return;
+      this._previewLibsPrewarmed = true;
+      const warm = () => {
+        // hljs: load the bundle, then force-compile the auto-detect subset
+        // with one throwaway pass so the FIRST real highlight is cheap.
+        this._loadHljs().then(() => {
+          try { window.hljs && window.hljs.highlightAuto("x", this._hlAutoSubset()); } catch (_) {}
+        }).catch(() => {});
+        // katex + mermaid: the dominant cost is the script parse at load time,
+        // so simply loading them off the click path is the win.
+        this._loadKatex().catch(() => {});
+        this._loadMermaid().catch(() => {});
+      };
+      try {
+        if (typeof window !== "undefined" && window.requestIdleCallback) {
+          window.requestIdleCallback(warm, { timeout: 3000 });
+        } else {
+          setTimeout(warm, 1200);
+        }
+      } catch (_) { setTimeout(warm, 1200); }
+    },
+
     async _loadHljs() {
       if (window.hljs) return;
       if (this._hljsLoadPromise) return this._hljsLoadPromise;
@@ -12246,6 +12877,13 @@ function portal() {
     onChatScroll() {
       const el = this.$refs.chatBody;
       if (!el) return;
+      // While WE are programmatically pinning to the bottom (the settle loop),
+      // every per-frame `scrollTop = scrollHeight` fires this handler. Its
+      // geometry read (scrollHeight/clientHeight) forces a synchronous reflow,
+      // so letting it run doubles the per-switch layout thrash (~40ms/switch in
+      // profiling). The settle sets `atBottom` itself, so this recompute is
+      // redundant during that window — skip it.
+      if (this._autoScrolling) return;
       // Strict "at bottom": 2px tolerance only — just enough to absorb
       // sub-pixel geometry (browser zoom / high-DPI displays can report
       // distance as 0.4–1.x even when visually at bottom; pure ==0 would
@@ -12298,25 +12936,49 @@ function portal() {
     // short. Converge: keep pinning to the bottom until scrollHeight has
     // been stable for two consecutive frames (heights realized) or the
     // frame budget is spent.
-    _settleScrollToBottom({ maxFrames = 40 } = {}) {
+    _settleScrollToBottom({ maxFrames } = {}) {
       const el = this.$refs.chatBody;
       if (!el) return;
+      // Mobile WebViews pay a far higher per-frame reflow cost: each
+      // `scrollTop = scrollHeight` below forces a synchronous layout of the
+      // whole content-visibility:auto pane, and 40 of them on a tab switch /
+      // send is the ~0.5s jank users feel on phones (this loop is the shared
+      // top cost of BOTH switchSession's settle() and send's
+      // scrollToBottom(true)). The 2-frame-stable early-exit already returns
+      // in a handful of frames once heights realize, so capping mobile lower
+      // only trims the worst case (tall histories still realizing) — we trade
+      // a few px of landing accuracy for responsiveness. Send-path inaccuracy
+      // self-corrects on the next streaming auto-follow; switch-path is a
+      // harmless short scroll the user can nudge. Desktop keeps the full 40.
+      if (maxFrames == null) maxFrames = this._isMobileLayout() ? 12 : 40;
+      // Cancellation: each call bumps the token; an older loop sees its token
+      // is stale and bails. Without this, switching tabs while a previous
+      // settle is mid-flight left TWO 40-frame `scrollTop = scrollHeight`
+      // loops running — each read of scrollHeight forces a synchronous reflow,
+      // so the leftover loop hogged the main thread for up to ~640ms and made
+      // the NEXT tab click feel laggy (intermittent ~0.5s "no reaction").
+      const myToken = (this._settleToken = (this._settleToken || 0) + 1);
+      // Marks "we're auto-scrolling" so onChatScroll skips its redundant,
+      // reflow-forcing geometry read for the duration of this loop.
+      this._autoScrolling = true;
+      const done = () => { if (this._settleToken === myToken) this._autoScrolling = false; };
       let frames = 0;
       let lastH = -1;
       let stable = 0;
       const step = () => {
+        if (this._settleToken !== myToken) return; // superseded; newer settle owns the flag
         el.scrollTop = el.scrollHeight; // browser clamps to valid range
         frames++;
         const h = el.scrollHeight;
         if (Math.abs(h - lastH) < 1) {
           // Height held steady this frame; require two in a row so a
           // mid-realization plateau doesn't end the loop prematurely.
-          if (++stable >= 2) return;
+          if (++stable >= 2) { done(); return; }
         } else {
           stable = 0;
         }
         lastH = h;
-        if (frames >= maxFrames) return;
+        if (frames >= maxFrames) { done(); return; }
         requestAnimationFrame(step);
       };
       requestAnimationFrame(step);
@@ -12666,6 +13328,12 @@ function portal() {
       const streamState = sendState;
 
       streamState.streaming = true; this.streaming = true;
+      // [resident-panes] A tab with a live stream must stay mounted even if the
+      // user tabs away — its bubbles are being written by the SSE handlers below.
+      // Promote it now (streamState.streaming is already true, so the LRU's
+      // streaming guard will refuse to evict it). When streamSid === currentId
+      // (the common case) this is a harmless re-promote of the front entry.
+      this._promoteResident(streamSid);
       streamState.streamingModel = this.model;
       this.streamingModel = this.model;   // 锁定 — pending bubble 用它，不跟着 dropdown
       // Start the wall-clock NOW, at submit-time — not later in es.onopen.

@@ -1,6 +1,7 @@
 import os
 import threading
 import base64
+import hashlib
 import json
 import asyncio
 import re
@@ -12,7 +13,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, get_args
-from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Response
+from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File, Request, Response
 from sse_starlette.sse import EventSourceResponse
 from pydantic import BaseModel
 from claude_agent_sdk import (
@@ -1456,6 +1457,19 @@ async def disconnect_client(session_id: str) -> None:
 class CreateReq(BaseModel):
     name: str | None = None
     model: str | None = None
+    # Optimistic-create (2026-06-07): the client mints the session UUID up
+    # front so the new-chat tab opens with ZERO network wait, then POSTs here
+    # in the background to register it. When present AND a valid canonical
+    # UUID, we register THIS id instead of generating a fresh one — the send
+    # path binds the SDK session to the same UUID on first message either way
+    # (chat.py uses session_id= when no JSONL exists). Strictly validated
+    # server-side before it ever touches a filesystem path (sidecar).
+    id: str | None = None
+    # P2/B: the client's currently-open tab ids. Passed so empty-session
+    # recycling (prune_empty_sessions) NEVER deletes a blank session the user
+    # has open in a tab and is about to type in. Empty + closed + unpinned +
+    # auto-named is the only thing eligible for cleanup.
+    open_ids: list[str] | None = None
 
 
 _last_orphan_gc_at = 0.0
@@ -1522,8 +1536,44 @@ except Exception:
     pass
 
 @router.get("/sessions", dependencies=[Depends(require_token)])
-def list_sessions_api() -> dict:
-    sessions = sess.list_sessions()
+def list_sessions_api(
+    request: Request,
+    response: Response,
+    limit: int = Query(0, ge=0, le=2000),
+    ids: str = Query(""),
+    q: str = Query(""),
+):
+    # P2 (perf): paginate. `list_sessions()` returns ALL sessions (sorted
+    # pinned→updated_at desc); shipping every one was 147 KB / 391 rows on a
+    # heavy archive, which dominated every poll AND the new-session path. Now:
+    #   q=<term>  → server-side search across the FULL list (name/first_prompt)
+    #   limit=N   → only the N most-recent (pinned already float to the top)
+    #   ids=a,b,c → ALWAYS include these (the client's OPEN tabs) so the
+    #               frontend's this.sessions.find(openTabId) never misses a tab
+    #               that fell outside the recent window.
+    # limit=0 (the default) preserves the old "return everything" behaviour for
+    # any caller that doesn't opt in.
+    full = sess.list_sessions()
+    total = len(full)
+    q_norm = (q or "").strip().lower()
+    if q_norm:
+        subset = [
+            s for s in full
+            if (s.get("name") and q_norm in s["name"].lower())
+            or (s.get("first_prompt") and q_norm in s["first_prompt"].lower())
+        ][:200]
+    elif limit and limit < total:
+        subset = list(full[:limit])
+        have = {s.get("id") for s in subset}
+        keep = {x for x in (ids or "").split(",") if x}
+        if keep:
+            for s in full:
+                sid = s.get("id")
+                if sid in keep and sid not in have:
+                    subset.append(s)
+                    have.add(sid)
+    else:
+        subset = list(full)
     # FIX ⑩: server-authoritative "is this session streaming right now" flag so
     # the session-list blue dot syncs across devices. `_active_turns` is the
     # in-memory registry of live turns (set when a turn starts, popped/`.done`
@@ -1535,14 +1585,15 @@ def list_sessions_api() -> dict:
         if bc is not None and not bc.done
     }
     # Truncate heavy fields for the list view — full content fetched per-session.
-    # Every entry also gets an `active` flag; since we touch every dict anyway,
-    # copy each one so we never mutate the shared list_sessions() cache.
-    for i, s in enumerate(sessions):
+    # Copy each dict (never mutate the shared list_sessions() cache) + add the
+    # live `active` flag. Only the returned subset is processed now, not all N.
+    sessions = []
+    for s in subset:
         s = dict(s)  # don't mutate cache
         if s.get("system_prompt") and len(s["system_prompt"]) > 200:
             s["system_prompt"] = s["system_prompt"][:200] + "…"
         s["active"] = s.get("id") in active_sids
-        sessions[i] = s
+        sessions.append(s)
     # Piggy-back orphan-attachments GC here — runs at most hourly. Cheaper
     # than a cron, and naturally fires whenever the UI is in use.
     global _last_orphan_gc_at
@@ -1553,7 +1604,36 @@ def list_sessions_api() -> dict:
             _gc_orphan_attachments()
         except Exception:
             pass
-    return {"sessions": sessions}
+    # Conditional GET: the picker polls /sessions on a timer; when nothing
+    # changed (same titles, same updated_at, same `active` dots) we let the
+    # client skip both the transfer AND the Alpine list re-render by returning
+    # 304. The ETag is a weak validator (W/) because GZipMiddleware may re-encode
+    # the body — weak comparison is all If-None-Match needs for GET anyway, and
+    # the digest is over the UNcompressed JSON so it's stable across gzip on/off.
+    # We hash the same payload we're about to send (sessions already carry the
+    # live `active` flags + truncated prompts), so any user-visible change flips
+    # the tag. default=str guards stray datetime/Path values in session dicts.
+    body = {"sessions": sessions, "total": total, "returned": len(sessions)}
+    try:
+        _payload = json.dumps(body, sort_keys=True, default=str,
+                              ensure_ascii=False).encode("utf-8")
+        etag = 'W/"' + hashlib.md5(_payload).hexdigest() + '"'
+    except (TypeError, ValueError):
+        etag = ""
+    if etag:
+        # If-None-Match may carry a list ("tag1", "tag2") or "*". Weak-compare by
+        # stripping the W/ prefix from both sides and matching the opaque value.
+        inm = request.headers.get("if-none-match", "")
+        if inm:
+            def _bare(t: str) -> str:
+                t = t.strip()
+                return t[2:] if t.startswith("W/") else t
+            wanted = _bare(etag)
+            if any(_bare(p) == wanted for p in inm.split(",")):
+                # 304 must echo the validator and carry no body.
+                return Response(status_code=304, headers={"ETag": etag})
+        response.headers["ETag"] = etag
+    return body
 
 
 def _resolve_default_model(requested: str = "", *, allow_fallback: bool = True) -> str:
@@ -1641,12 +1721,34 @@ def create_session_api(req: CreateReq) -> dict:
     # unreachable model is exactly what made fresh-install first sessions
     # 401 forever; the frontend gates chat until a provider exists, and the
     # model is resolved on first send.
-    meta = sess.create_session(name=req.name or "",
-                               model=_resolve_default_model(req.model, allow_fallback=False))
-    # Auto-prune: delete any empty sessions left over from previous tabs /
-    # accidental new-session clicks. Skip the one we just created so it
-    # stays available for the user's first message.
-    sess.prune_empty_sessions(keep_ids=[meta["id"]])
+    resolved_model = _resolve_default_model(req.model, allow_fallback=False)
+    client_id = (req.id or "").strip()
+    if client_id:
+        # Optimistic-create path: the client minted this UUID and already
+        # opened the tab. Validate it STRICTLY before register_session writes
+        # SESS_DIR/{id}.sidecar.json — a non-UUID id would be a path-injection
+        # vector. uuid.UUID() rejects garbage; the canonical-form re-check
+        # rejects braces / urn: prefixes / anything that isn't a clean
+        # 36-char hyphenated v4 string, so the id is guaranteed [0-9a-f-] only.
+        try:
+            parsed = uuid.UUID(client_id)
+        except (ValueError, AttributeError, TypeError):
+            raise HTTPException(400, "invalid session id")
+        if str(parsed) != client_id.lower():
+            raise HTTPException(400, "invalid session id")
+        # register_session is idempotent (returns the existing row if the id is
+        # already registered) so a client retry / keepalive resend is safe.
+        meta = sess.register_session(client_id, name=req.name or "",
+                                     model=resolved_model, auto_named=True)
+    else:
+        meta = sess.create_session(name=req.name or "", model=resolved_model)
+    # Auto-prune (B): recycle blank scratch sessions left over from previous
+    # tabs / accidental new-session clicks. keep_ids protects BOTH the session
+    # we just created AND every tab the client currently has open — so a blank
+    # session the user is about to type in is never yanked out from under them.
+    # Still gated by all of prune_empty_sessions' own safety checks (0 messages,
+    # not pinned, auto-named, <2h old) + the MUSELAB_PRUNE_EMPTY_SESSIONS flag.
+    sess.prune_empty_sessions(keep_ids=[meta["id"], *(req.open_ids or [])])
     return meta
 
 
@@ -2343,6 +2445,12 @@ def _compact_summary_uuids(sid: str) -> set[str]:
 # lists can be several MB each, so the cap is deliberately small.
 _SESSION_MSGS_CACHE: dict[tuple[str, bool], tuple[float, int, list]] = {}
 _SESSION_MSGS_CACHE_MAX = 16
+# Also cap by total SOURCE bytes of cached transcripts. The file size (sig[1],
+# already known from stat) is a cheap proxy for parsed-list memory (≈ 2–4× this
+# after Python object overhead). Without a byte bound a single 100MB+ agentic
+# session could sit alongside up to 15 others and push RSS into the GBs — the
+# count cap alone doesn't bound memory when one entry is pathologically large.
+_SESSION_MSGS_CACHE_BYTE_BUDGET = 64 * 1024 * 1024  # 64 MiB of source JSONL
 
 
 def _cached_session_msgs(sid: str, model: str, full: bool) -> list:
@@ -2368,12 +2476,24 @@ def _cached_session_msgs(sid: str, model: str, full: bool) -> list:
             return _cached[2]
     msgs = _full_session_msgs(sid) if full else _get_session_msgs(sid, model)
     if sig is not None:
-        # Bound the cache: drop the oldest insertion (dicts preserve insertion
-        # order) when a NEW key would overflow the cap.
-        if (len(_SESSION_MSGS_CACHE) >= _SESSION_MSGS_CACHE_MAX
-                and key not in _SESSION_MSGS_CACHE):
-            _SESSION_MSGS_CACHE.pop(next(iter(_SESSION_MSGS_CACHE)), None)
+        # Insert at the end (newest). pop-then-set so a re-read of a GROWN
+        # file (new mtime/size) moves the entry to the back of the FIFO rather
+        # than keeping its stale position.
+        _SESSION_MSGS_CACHE.pop(key, None)
         _SESSION_MSGS_CACHE[key] = (sig[0], sig[1], msgs)
+        # Evict oldest (insertion order) until BOTH the count cap and the
+        # source-byte budget hold. Never evict the entry we just inserted
+        # (so an oversized lone session still caches — we just don't let it
+        # coexist with others past the budget).
+        while len(_SESSION_MSGS_CACHE) > 1 and (
+            len(_SESSION_MSGS_CACHE) > _SESSION_MSGS_CACHE_MAX
+            or sum(v[1] for v in _SESSION_MSGS_CACHE.values())
+            > _SESSION_MSGS_CACHE_BYTE_BUDGET
+        ):
+            oldest = next(iter(_SESSION_MSGS_CACHE))
+            if oldest == key:
+                break
+            _SESSION_MSGS_CACHE.pop(oldest, None)
     return msgs
 
 
@@ -3083,32 +3203,58 @@ def _session_usage_from_jsonl(sid: str) -> dict | None:
     last_usage: dict[str, int] = {}
     last_ts: float = 0.0
     last_model: str = ""
+
+    def _extract(line: str) -> tuple[dict, str, float] | None:
+        """(usage, model, ts) for an assistant line that carries usage, else None."""
+        if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
+            return None
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        msg = entry.get("message") or {}
+        u = msg.get("usage") or {}
+        if not isinstance(u, dict) or not u:
+            return None
+        ts_val = 0.0
+        raw_ts = entry.get("timestamp") or ""
+        if raw_ts:
+            try:
+                import datetime as _dt
+                ts_val = _dt.datetime.fromisoformat(
+                    raw_ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                ts_val = 0.0
+        return (u, msg.get("model") or "", ts_val)
+
+    # Fast path: the assistant turn whose usage the meter wants is the most
+    # recent one, sitting at the very END of the transcript. Read only the TAIL
+    # via _read_tail_lines (O(tail)) instead of walking a possibly-100MB+ file
+    # from the top — this fires on every tab switch (cache miss), so the full
+    # walk was a real hot-path cost. Scan the tail in reverse, stop at the first
+    # usage-bearing assistant. Fall back to a full forward scan only if the tail
+    # window holds none (e.g. a final turn longer than the window).
     try:
-        with jsonl_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                if '"type":"assistant"' not in line and '"type": "assistant"' not in line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
-                    continue
-                msg = entry.get("message") or {}
-                u = msg.get("usage") or {}
-                if not isinstance(u, dict) or not u:
-                    continue
-                last_usage = u
-                last_model = msg.get("model") or last_model
-                ts = entry.get("timestamp") or ""
-                if ts:
-                    try:
-                        import datetime as _dt
-                        dt_utc = _dt.datetime.fromisoformat(
-                            ts.replace("Z", "+00:00"))
-                        last_ts = dt_utc.timestamp()
-                    except ValueError:
-                        pass
-    except OSError:
-        return None
+        _tail = _read_tail_lines(jsonl_path, 2000)
+    except Exception:
+        _tail = None
+    if _tail:
+        for line in reversed(_tail):
+            got = _extract(line)
+            if got is not None:
+                last_usage, _m, last_ts = got
+                last_model = _m or last_model
+                break
+    if not last_usage:
+        try:
+            with jsonl_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    got = _extract(line)
+                    if got is not None:
+                        last_usage, _m, last_ts = got
+                        last_model = _m or last_model
+        except OSError:
+            return None
     if not last_usage:
         return None
     # Cumulative cost — sum sidecar annotations. Cheaper than reparsing

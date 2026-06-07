@@ -33,6 +33,30 @@ def test_session_lifecycle(client, auth):
     assert r.status_code == 404
 
 
+def test_sessions_list_conditional_get(client, auth):
+    """GET /sessions is a conditional resource: a matching If-None-Match
+    yields 304 (lets the picker skip transfer + Alpine re-render), and any
+    user-visible change (new session) invalidates the ETag → fresh 200."""
+    # First fetch hands back a weak ETag.
+    r1 = client.get("/api/chat/sessions", headers=auth)
+    assert r1.status_code == 200
+    etag = r1.headers.get("etag")
+    assert etag and etag.startswith('W/"')
+
+    # Echoing it back with nothing changed → 304, no body.
+    r2 = client.get("/api/chat/sessions",
+                    headers={**auth, "If-None-Match": etag})
+    assert r2.status_code == 304
+    assert not r2.content
+
+    # Mutating the list (new session) must flip the tag → 200 with new ETag.
+    client.post("/api/chat/sessions", headers=auth, json={"name": "etag-bust"})
+    r3 = client.get("/api/chat/sessions",
+                    headers={**auth, "If-None-Match": etag})
+    assert r3.status_code == 200
+    assert r3.headers.get("etag") and r3.headers["etag"] != etag
+
+
 def test_default_session_name_includes_timestamp(app_module):
     from backend import sessions as sess
     a = sess.create_session()

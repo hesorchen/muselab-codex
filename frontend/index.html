@@ -559,6 +559,36 @@
       </header>
       <!-- Tab bar (VSCode-style multi-file) -->
       <div class="tab-bar" x-show="tabs.length">
+        <!-- Open-tabs quick picker — fixed at the left edge, OUTSIDE the
+             horizontally-scrolling .tab-bar-list (same structure as the chat
+             pane's history button). Keeping it out of the scroll container
+             avoids the iOS Safari hit-test bug where taps on a position:sticky
+             element inside an overflow-x container are swallowed. The dropdown
+             lists only the currently-open file tabs (not the whole tree). -->
+        <div class="tab-picker" @click.outside="editorTabPickerOpen = false">
+          <button class="tab-picker-btn" type="button"
+                  @click="toggleEditorTabPicker($event)"
+                  :title="lang==='zh' ? '打开的标签' : 'Open tabs'">
+            <svg><use href="#i-list"/></svg>
+          </button>
+          <div x-show="editorTabPickerOpen" x-transition.opacity.duration.150ms
+               class="session-picker-pop tab-picker-pop"
+               :style="editorTabPickerStyle"
+               role="listbox">
+            <template x-for="t in tabs" :key="t.path">
+              <div class="session-picker-row"
+                   :class="{ active: selected === t.path }"
+                   @click="pickEditorTab(t.path)"
+                   role="option"
+                   :title="t.path">
+                <span class="icon"><svg><use :href="iconRef({name: t.name, is_dir: false})"/></svg></span>
+                <span class="ellipsis" x-text="t.name"></span>
+              </div>
+            </template>
+          </div>
+        </div>
+        <!-- Scrolling tab strip — only this part overflows horizontally. -->
+        <div class="tab-bar-list">
         <template x-for="t in tabs" :key="t.path">
           <div :class="'tab' + (selected===t.path ? ' active' : '') + (t.preview ? ' preview' : '') + (previewDragOverPath===t.path ? ' drag-over' : '')"
                :draggable="isPointerDevice"
@@ -583,6 +613,7 @@
             <button class="tab-close" @click.stop="closeTab(t.path)" :title="lang==='zh'?'关闭（中键也可）':'Close (middle-click also)'">×</button>
           </div>
         </template>
+        </div>
       </div>
 
       <!-- Preview tab right-click menu. Uses a fullscreen overlay to catch
@@ -1107,6 +1138,7 @@
                    x-model="sessionPickerSearch"
                    x-ref="sessionPickerSearchInput"
                    :placeholder="lang==='zh' ? '搜索会话名…' : 'Search sessions…'"
+                   @input.debounce.300ms="_searchSessions()"
                    @keydown.escape="sessionPickerOpen = false" />
             <template x-for="g in groupedFilteredSessions()" :key="g.key">
               <div class="session-picker-group">
@@ -1452,7 +1484,7 @@
                by identity, so every `messages`-reading binding inside stays
                correct; hidden panes are display:none so their (stale)
                result is never seen. -->
-          <template x-for="tid in openTabIds" :key="tid">
+          <template x-for="tid in residentPaneIds()" :key="tid">
           <div class="msg-pane" x-show="tid === currentId">
           <template x-for="(m, i) in paneMessages(tid)" :key="m._k || m.uuid || ('m-' + i)">
             <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden')"

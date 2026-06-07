@@ -146,9 +146,20 @@ _SIDECAR_LOCK = threading.Lock()
 # browser tab) noticed the new turns missing from the list for up to 2s
 # after each external write. 0.5s feels live without sacrificing the
 # refresh-storm dedup (a typical storm completes in ~50 ms anyway).
+#
+# 2026-06-07: raised 0.5s → 30s. The 0.5s TTL meant the 10s foreground poll
+# ALWAYS missed the cache and paid the full ~400ms cold rebuild every time
+# (sdk_list_sessions walks every JSONL for metadata — measured 0.38-0.43s on a
+# 330-session archive). Since EVERY muselab-internal mutation (bump_session /
+# rename / delete / pin / create) calls invalidate_sessions_cache() via
+# _save_index, the cache is already correct for muselab-driven changes — the
+# only staleness window is an EXTERNAL `claude --resume` write, which now takes
+# up to 30s to surface in the list (acceptable; rare workflow). The live
+# `active` streaming dots are computed per-request OUTSIDE the cache (from
+# _active_turns in chat.py), so they stay real-time regardless of this TTL.
 
 _LIST_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
-_LIST_CACHE_TTL_S = 0.5
+_LIST_CACHE_TTL_S = 30.0
 _LIST_CACHE_LOCK = threading.Lock()
 
 
@@ -347,6 +358,13 @@ def register_session(sid: str, *, name: str = "", model: str = "",
     }
     with _INDEX_LOCK:
         idx = _load_index()
+        # Idempotent: if this id is already registered (client retry / keepalive
+        # resend of an optimistic-create POST, or a fork that re-registers),
+        # return the existing row instead of appending a duplicate. Duplicate
+        # ids would break list dedupe and x-for :key bindings on the frontend.
+        existing = next((s for s in idx if s.get("id") == sid), None)
+        if existing is not None:
+            return existing
         idx.append(meta)
         _save_index(idx)
     try:
