@@ -11,7 +11,7 @@ from claude_agent_sdk import EffortLevel, project_key_for_directory
 
 def test_cli_encode_cwd_delegates_to_sdk():
     from backend.chat import _cli_encode_cwd
-    for p in ("/home/chenxiaosen",
+    for p in ("/home/alice",
               "/home/a_b.c/x",
               "/home/用户/笔记",   # unicode: hand-rolled drifted here
               "/tmp/muselab-vendor-cli-config-1000/projects"):
