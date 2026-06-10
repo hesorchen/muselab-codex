@@ -1017,9 +1017,9 @@
              picks up any still-running backend turn. The toast gives a
              visible confirmation so the user knows the click registered
              before the page actually unloads. -->
-        <button @click="refreshChat()" class="icon-btn"
-                :title="lang==='zh' ? '刷新 chat（会话/消息/模型重新加载，不刷整个页面）' : 'Refresh chat (reloads sessions, messages and models without a full page reload)'"
-                aria-label="Refresh chat">
+        <button @click="reloadApp()" class="icon-btn"
+                :title="lang==='zh' ? '重新加载（卡住时的兜底：完整刷新页面，等同关掉再打开）' : 'Reload (escape hatch when stuck: full page reload, like closing and reopening)'"
+                aria-label="Reload app">
           <svg><use href="#i-refresh"/></svg>
         </button>
         <!-- Desktop fullscreen toggle — pair of preview-pane's button. Click
