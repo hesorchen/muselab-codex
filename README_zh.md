@@ -4,15 +4,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Self-hosted](https://img.shields.io/badge/deploy-self--hosted-orange.svg)](docs/quickstart_zh.md)
 [![Container](https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker)](https://github.com/hesorchen/muselab/pkgs/container/muselab)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/hesorchen/muselab)
 [![English](https://img.shields.io/badge/lang-English-red)](README.md)
 
-Muse（muselab 内置的 AI 助手）同时阅读你的体检 PDF、预算表格、家庭信息、资产配置、职业规划，帮助你完成跨领域决策。
+**muselab 是一个自托管 AI 工作台：跑在你自己机器上的私人档案库，加上一位直接在档案上干活的 Claude Agent SDK 助手——Muse。**
 
-- 🧠 **最真实的语义信息。** 不向量化，PDF、表格、Markdown、HTML 保留最原始的信息，Muse 直接读取，资料越丰富，任务完成质量越高。
+体检 PDF、预算表格、家庭信息、资产配置、职业规划——Muse 同时读取这一切，帮你完成那些跨领域的决策。档案只存在你自己的硬盘上：没有 SaaS 账号、没有云端副本，离开你机器的，只有发给你所选模型的那次请求。
 
-- 🤖 **Claude Agent SDK × 八家模型。** MCP 工具、Skills、Subagent、plan 模式全部保留——不止聊天，真正交付。Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE，多种模型，一键切换。
+- 🧠 **整文件输入，语义零损耗。** 不向量化、不切块、不建检索索引——PDF、表格、Markdown、HTML 以原始全文进入上下文。资料越丰富，任务完成质量越高。
 
-- 🖥️ **实时渲染，多端同步。** Muse 生成的 HTML 报告、Markdown 文档直接在预览区实时渲染。桌面、手机多端会话同步，支持 PWA 和推送通知。
+- 🤖 **Claude Agent SDK × 八家模型。** MCP 工具、Skills、Subagent、plan 模式全部保留——不止聊天，真正交付。Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE，一键切换。
+
+- 🖥️ **实时渲染，多端同步。** Muse 写出的 HTML 报告、Markdown 文档在预览区即写即渲染；会话从桌面无缝接续到手机，支持 PWA 安装与推送通知。
 
 <p align="center">
   <img src="promo/media/screenshot-desktop.png" height="340"
@@ -21,7 +24,7 @@ Muse（muselab 内置的 AI 助手）同时阅读你的体检 PDF、预算表格
   <img src="promo/media/screenshot-mobile.png" height="340"
        alt="muselab 手机端 —— 同一会话接着聊">
 </p>
-<p align="center"><em>丰富的渲染能力，多端实时同步——HTML 报告、表格、图表即写即渲染，桌面与手机共享同一会话。</em></p>
+<p align="center"><em>桌面三栏布局——档案树、与 Muse 的对话、实时预览；右侧是同一会话在手机上接着聊。</em></p>
 
 ## 看效果
 
@@ -63,16 +66,24 @@ bash scripts/install-linux.sh    # 或 install-macos.sh
 
 - **上手：** [快速入门](docs/quickstart_zh.md) ·
   [定制 CLAUDE.md](docs/personalize-claude-md_zh.md) ·
+  [Skills](docs/skills_zh.md) ·
   [手机端 PWA](docs/mobile_zh.md) ·
   [定时任务](docs/scheduler_zh.md)
 - **模型：** [Providers](docs/providers_zh.md) ·
-  [接入新 provider](docs/add-provider_zh.md)
+  [接入新 provider](docs/add-provider_zh.md) ·
+  [模型路由](docs/routing_zh.md)
+- **内部机制：** [架构](docs/architecture_zh.md) ·
+  [会话](docs/backend-sessions_zh.md) ·
+  [Files API](docs/backend-files_zh.md) ·
+  [安全模型](docs/backend-security_zh.md) ·
+  [前端](docs/frontend_zh.md) ·
+  [基础设施](docs/infrastructure_zh.md)
 - **参考：** [配置](docs/configuration_zh.md) ·
   [数据与备份](docs/data-and-backup_zh.md) ·
   [排错](docs/troubleshooting_zh.md) ·
-  [升级](docs/upgrade_zh.md)
-- **概念：** [架构](docs/architecture_zh.md) ·
-  [同类对比](docs/comparison_zh.md) ·
+  [升级](docs/upgrade_zh.md) ·
+  [词汇表](docs/glossary_zh.md)
+- **概念：** [同类对比](docs/comparison_zh.md) ·
   [九位缪斯](docs/muses_zh.md)
 - **项目：** [安全](SECURITY.md) ·
   [贡献指南](CONTRIBUTING.md) ·

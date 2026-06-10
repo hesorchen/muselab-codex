@@ -22,6 +22,21 @@ For **IDE breadth**, consider claudecodeui or code-server.
 For a **plugin marketplace**, consider LobeChat.
 For **chat over crawled documents**, consider AnythingLLM.
 
+Other names that often come up in the same search:
+
+- [Open WebUI](https://github.com/open-webui/open-webui) — the go-to
+  self-hosted chat UI for local models (Ollama) and OpenAI-compatible
+  endpoints, with its own RAG and tool system. Choose it when local-model
+  chat is the centerpiece; choose muselab when you want the Claude Code
+  agent loop (Read / Grep / Edit / Bash, Skills, MCP) over your own files.
+- [LibreChat](https://github.com/danny-avila/LibreChat) — multi-provider
+  chat with multi-user auth and an agents framework. Choose it for a shared,
+  team-facing chat portal; muselab is deliberately single-user
+  (see [Scope boundaries](#scope-boundaries)).
+- **Obsidian / Logseq AI plugins** — AI inside a note-taking app. They see
+  your vault's notes; muselab's agent works on the whole archive (any file
+  type) and can execute multi-step tasks against it, not just write text.
+
 ## vs. other Claude harnesses
 
 |  | muselab | Claude Code CLI | Claude Desktop | claudecodeui | claude-code-router |

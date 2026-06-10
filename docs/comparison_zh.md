@@ -21,6 +21,12 @@
 需要 **插件市场**，推荐 LobeChat。
 需要 **基于爬取内容的 RAG**，推荐 AnythingLLM。
 
+同类搜索中经常出现的其他名字：
+
+- [Open WebUI](https://github.com/open-webui/open-webui) —— 本地模型（Ollama）及 OpenAI 兼容端点的首选自托管 chat UI，自带 RAG 与工具体系。以本地模型对话为核心时选它；需要在自己文件上跑 Claude Code agent loop（Read / Grep / Edit / Bash、Skills、MCP）时选 muselab。
+- [LibreChat](https://github.com/danny-avila/LibreChat) —— 多提供商对话，带多用户鉴权和 agent 框架。需要面向团队的共享对话门户时选它；muselab 刻意设计为单用户（见[边界](#边界)）。
+- **Obsidian / Logseq AI 插件** —— 笔记应用内嵌 AI。它们只看得到笔记库里的文件；muselab 的 agent 可作用于整个归档目录（任意文件类型），并能对其执行多步骤任务，而不仅仅是生成文字。
+
 ## vs. 其他 Claude harness
 
 |  | muselab | Claude Code CLI | Claude Desktop | claudecodeui | claude-code-router |

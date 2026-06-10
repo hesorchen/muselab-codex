@@ -28,11 +28,11 @@ flowchart TB
 
 - **SDK over raw API.** Claude Agent SDK (same engine as Claude Code), so MCP / Skills / Subagents / plan mode / `CLAUDE.md` auto-load behave uniformly across providers. New providers: see [add-provider.md](add-provider.md).
 
-- **Per-session `env=` override.** Third-party providers are wired by setting `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + an isolated `CLAUDE_CONFIG_DIR`. The last one blocks the CLI from silently falling back to Pro OAuth and routing third-party traffic through your Anthropic account.
+- **Per-session `env=` override.** Third-party providers are wired by setting `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + an isolated `CLAUDE_CONFIG_DIR` ([`backend/endpoints.py:L851`](../backend/endpoints.py#L851)). The last one blocks the CLI from silently falling back to Pro OAuth and routing third-party traffic through your Anthropic account — the full mechanism is in [Model routing § env injection](routing.md#3-third-party-env-injection).
 
 - **No build step.** Edit `frontend/`, refresh the browser. Vetted third-party libs live in `vendor/` (licenses in [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)); installation never touches npm.
 
-- **Client cache keyed by `(session_id, model, effort)`.** Switching model or reasoning effort lands on its own pooled client; each assistant message stores its own `model` field so badges stay accurate after reload.
+- **Client cache keyed by `(session_id, model, effort)`** ([`backend/chat.py:L303`](../backend/chat.py#L303)). Switching model or reasoning effort lands on its own pooled client; each assistant message stores its own `model` field so badges stay accurate after reload. Pool cap, LRU rules: [Model routing § client pool](routing.md#2-the-client-pool).
 
 - **Whole-file as the unit of input.** `MUSELAB_ROOT` is a directory you own; the root-level `CLAUDE.md` auto-loads on every conversation. The assistant reaches files via Read / Grep / Edit on demand — no pre-embedding.
 
@@ -81,9 +81,11 @@ badge, cost, uploaded attachments). See
 
 A chat turn is one Server-Sent Events (SSE) stream:
 
-1. **Browser → backend.** `POST /api/chat/{session_id}` with the prompt and the
-   chosen `model`. Every request carries the `X-Auth-Token` header
-   ([auth.md](configuration.md#authentication)).
+1. **Browser → backend.** `GET /api/chat/stream` with the prompt, session id
+   and chosen `model` as query parameters
+   ([`backend/chat.py:L5043`](../backend/chat.py#L5043)). The auth token rides
+   as `?token=` because `EventSource` cannot set headers
+   ([Security model § authentication](backend-security.md#authentication)).
 2. **Model resolution & lock.** The session is locked to one model
    (`sessions.py`). The first turn pins it; later turns reuse it so a
    conversation never mixes vendors mid-stream (cross-vendor *thinking
@@ -98,11 +100,30 @@ A chat turn is one Server-Sent Events (SSE) stream:
    full loop — tool calls (Read/Grep/Edit/Bash), MCP servers, skills, plan mode
    — against your archive as the working directory.
 5. **Backend → browser (SSE).** Tokens, tool-call events, and a final `done`
-   event stream back. The frontend renders incrementally; each assistant
-   message records its own `model` so badges stay correct after reload.
+   event stream back. The turn is published through a `TurnBroadcast`, so a
+   browser disconnect never kills the reply — reconnecting replays the buffer
+   ([Model routing § SSE turn loop](routing.md#4-the-sse-turn-loop)). The
+   frontend renders incrementally; each assistant message records its own
+   `model` so badges stay correct after reload.
 6. **Persistence.** The CLI appends the transcript to its JSONL; muselab writes
    the sidecar (cost, model, attachments). If the turn was long and Web Push is
    configured, a completion notification fires even with the tab closed.
 
 Scheduled runs ([scheduler.md](scheduler.md)) take the same path from step 3,
 minus a human — they run unattended with the full permission set.
+
+## Going deeper
+
+This page is the map. Each subsystem has its own page with source-linked
+detail:
+
+| Page | Covers |
+|---|---|
+| [Model routing & chat loop](routing.md) | model resolution, client pool, env injection, every SSE event type |
+| [Session internals](backend-sessions.md) | index, sidecars, message queue, attachments, fork, restart recovery |
+| [Files API](backend-files.md) | all `/api/files/*` endpoints, `safe_resolve`, trash |
+| [Security model](backend-security.md) | auth, settings surface, billing isolation, known limitations |
+| [Frontend internals](frontend.md) | no-build SPA, rendering pipeline, SSE client, i18n, service worker |
+| [Skills](skills.md) | bundled skills, discovery, adding your own |
+| [Infrastructure](infrastructure.md) | scripts, systemd/launchd, Docker, tests, CI/CD |
+| [Glossary](glossary.md) | every muselab term of art, defined once |
