@@ -52,6 +52,10 @@ docs/research-code-artifacts-2026-05.md
 # Demo archives — local-only, never published
 demo/
 
+# UI-redesign exploration mockups — internal design-review material
+# (three direction demos + srcdoc comparison page), kept local only.
+ui-redesign-demos/
+
 # internal design notes — kept local, not published
 docs/mcp-architecture.md
 docs/mcp-architecture_zh.md
