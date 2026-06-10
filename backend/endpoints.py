@@ -750,8 +750,14 @@ def restore_anthropic_models() -> bool:
     return True
 
 
+# Tier is left open (`[a-z]+`) rather than a fixed opus|sonnet|haiku allowlist:
+# Anthropic ships new tiers (e.g. "fable") between our releases, and a
+# user-added `claude-fable-5` was rendering as a raw id next to nicely-named
+# built-ins (2026-06-10 user report). The minor-version group is optional and
+# capped at 1-2 digits + a `(?=$|-)` boundary so a date suffix
+# (`claude-fable-5-20260101`) is NOT mistaken for a minor version.
 _CLAUDE_LABEL_RE = __import__("re").compile(
-    r"^claude-(opus|sonnet|haiku)-(\d+)[-.](\d+)", __import__("re").IGNORECASE)
+    r"^claude-([a-z]+)-(\d+)(?:[-.](\d{1,2})(?=$|-))?", __import__("re").IGNORECASE)
 
 
 def label_for(model: str) -> str:
@@ -776,7 +782,10 @@ def label_for(model: str) -> str:
         m = _CLAUDE_LABEL_RE.match(model)
         if m:
             kind = m.group(1).capitalize()
-            return f"{kind} {m.group(2)}.{m.group(3)}"
+            # Minor is optional now (single-version tiers like `claude-fable-5`
+            # have no minor) — render "Fable 5", not "Fable 5.None".
+            ver = m.group(2) if m.group(3) is None else f"{m.group(2)}.{m.group(3)}"
+            return f"{kind} {ver}"
     p = lookup(model)
     if p is not None:
         low = model.lower()

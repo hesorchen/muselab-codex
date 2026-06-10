@@ -8465,6 +8465,39 @@ function portal() {
       }
     },
 
+    // If the Claude model-list editor is open with unsaved changes, persist it
+    // as part of the global "Save". The global save body (PUT /api/settings)
+    // only carries default_model / permission / provider keys — the Claude
+    // model list lives behind a SEPARATE endpoint. So a user who edited the
+    // model list and then hit the panel's main Save (instead of the editor's
+    // own inline Save) got a misleading "No changes" toast and lost the edit
+    // (2026-06-10 user report). This flushes that draft so the global Save
+    // captures it too. Returns 1 if the list actually changed, else 0.
+    // Scope: Claude models only (models_editable row). Third-party providers
+    // keep their explicit per-row Save (they also carry an api_key field we
+    // don't want to auto-submit on a global save).
+    async _flushAnthropicModelDraft() {
+      const prov = (this.settings.providers || []).find(p => p.models_editable);
+      if (!prov) return 0;
+      const dr = this.settings.providerDrafts[prov.id];
+      if (!dr || !dr.open) return 0;
+      const next = this._parseModels(dr.models);
+      const cur = prov.models || [];
+      if (next.join("\n") === cur.join("\n")) return 0;  // no real change
+      const r = await fetch("/api/settings/providers/anthropic-models", {
+        method: "POST",
+        headers: { ...this.hdr(), "Content-Type": "application/json" },
+        body: JSON.stringify({ models: next }),
+      });
+      if (!r.ok) {
+        let msg = "status " + r.status;
+        try { const e = await r.json(); if (e.detail) msg = e.detail; } catch (_) {}
+        throw new Error(msg);
+      }
+      dr.open = false;
+      return 1;
+    },
+
     async _submitProvider(body, pid) {
       try {
         const r = await fetch("/api/settings/providers", {
@@ -8807,6 +8840,17 @@ function portal() {
     },
 
     async saveSettings() {
+      // Flush an open Claude model-list edit first so the global Save captures
+      // it too (see _flushAnthropicModelDraft). modelChanges folds into the
+      // "Saved N settings" tally below so the toast reflects the model edit
+      // instead of misreporting "No changes".
+      let modelChanges = 0;
+      try {
+        modelChanges = await this._flushAnthropicModelDraft();
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "模型列表保存失败：" : "Model list save failed: ") + e.message, "error", 4000);
+        return;
+      }
       const body = {
         default_model: this.settings.draftDefaults.model,
         default_permission: this.settings.draftDefaults.permission,
@@ -8839,9 +8883,10 @@ function portal() {
         // against an older backend that doesn't return the new field.
         // n=0 means the user hit Save without changing anything — show a
         // different toast so they don't think a change was lost.
-        const n = (typeof d.updated_count === "number")
+        const envN = (typeof d.updated_count === "number")
           ? d.updated_count
           : (d.updated || []).length;
+        const n = envN + modelChanges;
         let msg;
         if (n === 0) {
           msg = this.lang === "zh" ? "无改动" : "No changes";
