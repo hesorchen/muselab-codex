@@ -515,7 +515,22 @@
           <svg x-show="!leftOpen || desktopFullPane === 'preview'"><use href="#i-chevron-right"/></svg>
         </button>
         <span class="pane-title" x-text="selected ? selected.split('/').pop() : t('pane.preview')"></span>
-        <span class="spacer"></span>
+        <!-- File path + last-modified strip. Fills the gap between the title
+             and the action icons; when no file is open it's empty but still
+             flex:1, so it doubles as the old `.spacer`. Light/muted styling. -->
+        <div class="pane-fileinfo" x-cloak>
+          <template x-if="selected">
+            <div class="pane-fileinfo-row">
+              <span class="pane-fileinfo-path" :title="selected" x-text="selected"></span>
+              <span class="pane-fileinfo-mtime"
+                    x-show="selectedMeta && selectedMeta.mtime">
+                <span class="pane-fileinfo-mtime-label"
+                      x-text="lang === 'zh' ? '上次修改 ' : 'modified '"></span><span
+                      x-text="selectedMeta && selectedMeta.mtime ? fmtMtime(selectedMeta.mtime) : ''"></span>
+              </span>
+            </div>
+          </template>
+        </div>
         <button x-show="selected && !editing && (previewMode==='md' || previewMode==='text')"
                 @click="togglePreviewFind()" class="icon-btn preview-keep-mobile"
                 :class="{ active: previewFind.open }"

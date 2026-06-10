@@ -814,6 +814,9 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      reload tap. */
   .pane.preview .pane-head .icon-btn:not(.preview-keep-mobile) { display: none; }
   .pane.preview .pane-head .btn-primary { display: none; }
+  /* Keep the path + mtime strip on mobile too (user wants it visible): the
+     two-line stacked layout + 10px font fits the cramped head, and min-width:0
+     ellipsis on the path keeps the action icons right-aligned. */
 
   /* Chat toolbar: keep attach + model + permission + effort + ctx-ring + send.
      Permission restored on mobile (2026-05-28): the prior "low-frequency,
@@ -1434,6 +1437,27 @@ body.kb-open .mobile-tab-bar { display: none; }
 }
 .pane-head .pane-title .icon { color: var(--c-accent); }   /* 三栏 header 图标用主色锚定 */
 .pane-head .spacer { flex: 1; }
+/* Preview-header path + mtime strip. flex:1 + min-width:0 lets it both fill
+   the gap (acting as the old spacer) and shrink/ellipsis a long path instead
+   of shoving the action icons off-screen. */
+.pane-head .pane-fileinfo { flex: 1; min-width: 0; display: flex; align-items: center; overflow: hidden; }
+/* Stack path over mtime — quieter than a single inline row. */
+.pane-head .pane-fileinfo-row {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  min-width: 0; overflow: hidden; line-height: 1.25;
+}
+.pane-head .pane-fileinfo-path {
+  color: var(--c-fg-4); font-size: var(--fs-2xs); font-weight: var(--fw-normal);
+  max-width: 100%;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  /* Left-truncate so the distinctive tail (…/dir/file.md) stays visible. */
+  direction: rtl; text-align: left; unicode-bidi: plaintext;
+}
+.pane-head .pane-fileinfo-mtime {
+  color: var(--c-fg-4); font-size: var(--fs-2xs); opacity: 0.8;
+  flex-shrink: 0; font-variant-numeric: tabular-nums;
+}
+.pane-head .pane-fileinfo-mtime-label { opacity: 0.75; }
 
 /* The files-header command-palette button is mobile-only (the mobile @media
    flips it to inline-flex). On desktop the palette lives in the chat header,

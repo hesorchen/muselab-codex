@@ -618,6 +618,32 @@ def read_file(path: str) -> PlainTextResponse:
     )
 
 
+@router.get("/stat", dependencies=[Depends(require_token)])
+def stat_file(path: str) -> dict:
+    """Lightweight metadata for a single path — name, size, mtime, is_dir.
+
+    Powers the preview header's "real path + last-modified" strip: the
+    frontend only knows a tab's path string, not its on-disk mtime (the
+    tree-list carries mtime but a file opened via chat-link / search is
+    never in the visible tree). One cheap stat() fills that gap without
+    re-reading the whole file. 404 when the path is gone — same contract
+    as /read, so a stale/phantom tab surfaces honestly instead of showing
+    a path that no longer exists."""
+    target = safe_resolve(path)
+    try:
+        st = target.stat()
+    except OSError:
+        raise HTTPException(status_code=404, detail="not found") from None
+    is_dir = target.is_dir()
+    return {
+        "path": str(target.relative_to(ROOT)),
+        "name": target.name,
+        "is_dir": is_dir,
+        "size": 0 if is_dir else st.st_size,
+        "mtime": st.st_mtime,
+    }
+
+
 # Types we serve inline (images / PDF / media render natively in browser).
 INLINE_OK_SUFFIX = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
                     ".pdf", ".mp4", ".webm", ".mp3", ".ogg", ".wav"}

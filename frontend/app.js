@@ -252,6 +252,11 @@ function portal() {
     // concrete pixel value and stop auto-fitting.
     openFilesHeight: null,
     previewMode: "", rawText: "", renderedMd: "", previewLang: "plaintext",
+    // On-disk metadata for the currently-selected file ({path, name, is_dir,
+    // size, mtime} | null). Drives the preview-header path + last-modified
+    // strip. Loaded by a $watch on `selected` → loadSelectedMeta(); null while
+    // nothing is open or the stat fetch 404s (stale/phantom tab).
+    selectedMeta: null,
     // Set when a preview READ fails (404/413/403/…), so the unsupported empty
     // state can show a status-aware reason instead of always blaming the file
     // type. null = no error (genuine "unsupported type" or normal preview).
@@ -1204,6 +1209,12 @@ function portal() {
       // Removed: rightOpen toast ("Muse 回来了") — the panel opening is self-evident.
       // 编辑模式下切换文件时，重新挂载 CM 加载新文件内容
       this.$watch("selected", () => { if (this.editing) { this.unmountCM(); this.mountCM(); } });
+      // Preview-header path + mtime strip: refresh the on-disk metadata
+      // whenever the active file changes (tree click, tab switch, chat link,
+      // boot restore). Fire once now too in case `selected` was restored
+      // before this watcher attached.
+      this.$watch("selected", (p) => this.loadSelectedMeta(p));
+      this.loadSelectedMeta(this.selected);
       // beforeunload guard for the editor: register a handler ONLY while there
       // are unsaved edits, and remove it the moment they're saved/discarded.
       // Attaching beforeunload unconditionally would defeat the browser's
@@ -10313,6 +10324,30 @@ function portal() {
       this.rawText = "";
       this.renderedMd = "";
       this.editing = false;
+      this.selectedMeta = null;
+    },
+    // Fetch on-disk metadata (mtime / size) for the preview-header strip.
+    // Guarded against races: by the time the await resolves the user may have
+    // switched files, so only apply if `path` is still the selected one. A
+    // failed/404 stat clears the strip rather than showing stale numbers.
+    async loadSelectedMeta(path) {
+      if (!path) { this.selectedMeta = null; return; }
+      try {
+        const r = await fetch("/api/files/stat?path=" + encodeURIComponent(path),
+                              { headers: this.hdr() });
+        if (!r.ok) { if (this.selected === path) this.selectedMeta = null; return; }
+        const d = await r.json();
+        if (this.selected === path) this.selectedMeta = d;
+      } catch { if (this.selected === path) this.selectedMeta = null; }
+    },
+    // Format a unix-seconds mtime as "YYYY-MM-DD HH:mm" in local time for the
+    // preview-header strip. Returns "" for a falsy timestamp.
+    fmtMtime(ts) {
+      if (!ts) return "";
+      const d = new Date(ts * 1000);
+      const p = (n) => String(n).padStart(2, "0");
+      return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+             + `${p(d.getHours())}:${p(d.getMinutes())}`;
     },
     closeAllTabs() {
       if (!this.tabs.length) return;
@@ -10371,6 +10406,9 @@ function portal() {
           }
         } catch (_e) { /* network blip */ }
       }
+      // mtime almost certainly changed if the reload was triggered by an
+      // external edit — refresh the header strip too.
+      this.loadSelectedMeta(this.selected);
       this.toast(this.lang === "zh" ? "已刷新预览" : "Preview reloaded",
                   "success", 1200);
     },
@@ -10423,6 +10461,8 @@ function portal() {
           }
         } catch (e) { /* network blip — manual refresh still possible */ }
       }
+      // A tool just wrote this file → its mtime moved; refresh the strip.
+      this.loadSelectedMeta(this.selected);
     },
     downloadUrl(p) { return "/api/files/download?path=" + encodeURIComponent(p) + "&token=" + encodeURIComponent(this.token); },
 
@@ -12089,6 +12129,8 @@ function portal() {
         // mode to light mode: editor saved, preview iframe still showed dark.
         this.previewVersion = Date.now();
         this.editing = false;
+        // Saving moved the file's mtime — refresh the header strip.
+        this.loadSelectedMeta(this.selected);
         this.toast(this.t("toast.saved"), "success");
       } else this.errToast("save", await r.text());
     },
