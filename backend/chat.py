@@ -113,16 +113,35 @@ def _cli_encode_cwd(path: str) -> str:
     return project_key_for_directory(path)
 
 
+_JSONL_PATH_CACHE: dict[str, Path] = {}
+_JSONL_PATH_CACHE_MAX = 4096
+
+
 def _find_session_jsonl(sid: str) -> Path | None:
     """Locate the CLI JSONL for ``sid`` across both project roots.
 
     A session lives in exactly one root (Pro/Claude vs vendor — they're
     mutually exclusive per session), so the first match wins. Returns
     ``None`` when the session has no on-disk transcript yet (truly new
-    session)."""
+    session).
+
+    Positive hits are cached (sid → Path): once a transcript exists its
+    path never moves, so repeat lookups skip the cross-root glob. Misses
+    are deliberately NOT cached — a new session's JSONL appears moments
+    after creation and must be found on the next call. A cached path that
+    has since been deleted (session removal) falls back to a fresh glob.
+    """
+    cached = _JSONL_PATH_CACHE.get(sid)
+    if cached is not None:
+        if cached.is_file():
+            return cached
+        _JSONL_PATH_CACHE.pop(sid, None)
     for projects_root in _cli_project_roots():
         for hit in projects_root.glob(f"*/{sid}.jsonl"):
             if hit.is_file():
+                if len(_JSONL_PATH_CACHE) >= _JSONL_PATH_CACHE_MAX:
+                    _JSONL_PATH_CACHE.clear()
+                _JSONL_PATH_CACHE[sid] = hit
                 return hit
     return None
 
@@ -1535,6 +1554,10 @@ try:
 except Exception:
     pass
 
+# Single-slot ETag digest cache for GET /sessions — see usage below.
+_LIST_ETAG_CACHE: dict[str, tuple] = {}
+
+
 @router.get("/sessions", dependencies=[Depends(require_token)])
 def list_sessions_api(
     request: Request,
@@ -1614,12 +1637,25 @@ def list_sessions_api(
     # live `active` flags + truncated prompts), so any user-visible change flips
     # the tag. default=str guards stray datetime/Path values in session dicts.
     body = {"sessions": sessions, "total": total, "returned": len(sessions)}
-    try:
-        _payload = json.dumps(body, sort_keys=True, default=str,
-                              ensure_ascii=False).encode("utf-8")
-        etag = 'W/"' + hashlib.md5(_payload).hexdigest() + '"'
-    except (TypeError, ValueError):
-        etag = ""
+    # ETag digest cache: hashing ~150KB of JSON on every poll adds up. The
+    # body is fully determined by (list-cache generation, request params,
+    # active turn set), so key on those and skip the dumps+md5 when nothing
+    # changed. Any session mutation bumps the generation; a turn starting /
+    # finishing changes active_sids; different limit/ids/q get their own key.
+    _etag_key = (sess.list_sessions_generation(), limit, ids, q_norm,
+                 frozenset(active_sids))
+    _hit = _LIST_ETAG_CACHE.get("v")
+    if _hit is not None and _hit[0] == _etag_key:
+        etag = _hit[1]
+    else:
+        try:
+            _payload = json.dumps(body, sort_keys=True, default=str,
+                                  ensure_ascii=False).encode("utf-8")
+            etag = 'W/"' + hashlib.md5(_payload).hexdigest() + '"'
+        except (TypeError, ValueError):
+            etag = ""
+        if etag:
+            _LIST_ETAG_CACHE["v"] = (_etag_key, etag)
     if etag:
         # If-None-Match may carry a list ("tag1", "tag2") or "*". Weak-compare by
         # stripping the W/ prefix from both sides and matching the opaque value.
@@ -2453,6 +2489,66 @@ _SESSION_MSGS_CACHE_MAX = 16
 _SESSION_MSGS_CACHE_BYTE_BUDGET = 64 * 1024 * 1024  # 64 MiB of source JSONL
 
 
+# Cache of SHAPED UI message lists keyed by (sid, full) → (jsonl_sig,
+# sidecar_sig, messages). _cached_session_msgs already skips the JSONL
+# re-parse, but get_session_api still re-ran _sdk_messages_to_ui (O(N) over
+# every content block) + the annotation merge on EVERY windowed call (?tail
+# then each ?offset "load earlier") against unchanged inputs. Keying on BOTH
+# the transcript signature and the sidecar signature means any new turn,
+# annotation write, or attachment bind invalidates the entry; the windowing
+# slice still runs live on top. _bind_pending_attachments runs on the cached
+# list too — it's idempotent (skips already-bound messages) and a successful
+# bind writes the sidecar, which changes sidecar_sig and forces a fresh
+# shape on the next call.
+_UI_MSGS_CACHE: dict[tuple[str, bool], tuple[
+    tuple[float, int] | None, tuple[float, int] | None, list]] = {}
+_UI_MSGS_CACHE_MAX = 8
+
+
+def _jsonl_signature(sid: str) -> tuple[float, int] | None:
+    path = _find_session_jsonl(sid)
+    if path is None:
+        return None
+    try:
+        st = path.stat()
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return None
+
+
+def _shaped_ui_messages(sid: str, model: str, full: bool) -> list[dict]:
+    """Shape SDK messages into UI bubbles with a freshness-checked cache.
+
+    Falls back to live shaping whenever either signature is unavailable
+    (no transcript yet / stat failure) so correctness never depends on the
+    cache. The returned list is shared across calls — callers must treat
+    it as read-only EXCEPT _bind_pending_attachments (idempotent, and its
+    sidecar write invalidates this cache)."""
+    jsig = _jsonl_signature(sid)
+    ssig = sess.sidecar_signature(sid)
+    key = (sid, full)
+    if jsig is not None:
+        hit = _UI_MSGS_CACHE.get(key)
+        if hit is not None and hit[0] == jsig and hit[1] == ssig:
+            return hit[2]
+    try:
+        sdk_msgs = _cached_session_msgs(sid, model, full)
+    except Exception:
+        sdk_msgs = []
+    annotations = sess.get_message_annotations(sid)
+    compact_uuids = _compact_summary_uuids(sid)
+    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    if jsig is not None:
+        _UI_MSGS_CACHE.pop(key, None)
+        _UI_MSGS_CACHE[key] = (jsig, ssig, messages)
+        while len(_UI_MSGS_CACHE) > _UI_MSGS_CACHE_MAX:
+            oldest = next(iter(_UI_MSGS_CACHE))
+            if oldest == key:
+                break
+            _UI_MSGS_CACHE.pop(oldest, None)
+    return messages
+
+
 def _cached_session_msgs(sid: str, model: str, full: bool) -> list:
     """Parse session messages with a (mtime, size)-keyed cache so repeated
     reads of an UNCHANGED JSONL (windowed paging, re-opens, idle preload) skip
@@ -2537,17 +2633,14 @@ def get_session_api(
     if meta is None:
         raise HTTPException(404, "session not found")
     model = meta.get("model", "")
-    try:
-        sdk_msgs = _cached_session_msgs(sid, model, full)
-    except Exception:
-        sdk_msgs = []
-    annotations = sess.get_message_annotations(sid)
-    compact_uuids = _compact_summary_uuids(sid)
-    messages = _sdk_messages_to_ui(sdk_msgs, annotations, compact_uuids)
+    messages = _shaped_ui_messages(sid, model, full)
     # Bind any unbound pending image/doc attachments (those persisted
     # before the stream completed could write a uuid annotation) to the
     # user messages that have inline image refs but no thumb/url yet.
-    _bind_pending_attachments(sid, messages)
+    # Runs on the cached list too: idempotent, and a successful bind
+    # rewrites the sidecar → sidecar_sig changes → next call re-shapes.
+    if sess.has_pending_attachments(sid):
+        _bind_pending_attachments(sid, messages)
     # Mid-turn merge: SDK CLI writes the JSONL incrementally — the
     # user prompt lands immediately when the turn starts, but the
     # assistant reply (text/thinking/tool blocks) only commits when
@@ -5040,15 +5133,79 @@ def _sse_ping_event() -> ServerSentEvent:
 _IMAGE_ONLY_PLACEHOLDER = "(image)"
 
 
-@router.get("/stream", dependencies=[Depends(require_token_query)])
+# One-time stream tickets: POST /stream/start (token in HEADER, params in
+# JSON body) mints a short-lived single-use ticket; GET /stream?ticket=…
+# redeems it. This keeps the user PROMPT and the AUTH TOKEN out of the URL —
+# EventSource can't send custom headers or a body, so previously both went
+# into the query string, where they leak into uvicorn/proxy access logs,
+# browser history, and (for the token) Referer-adjacent surfaces. The legacy
+# query-param form still works unchanged for old clients / manual curl.
+_STREAM_TICKETS: dict[str, tuple[float, dict]] = {}
+_STREAM_TICKET_TTL_S = 60.0
+_STREAM_TICKETS_MAX = 64
+
+
+class StreamStartReq(BaseModel):
+    prompt: str = ""
+    session_id: str
+    model: str = ""
+    permission: str = "bypassPermissions"
+    image_ids: str = ""
+
+
+@router.post("/stream/start", dependencies=[Depends(require_token)])
+def stream_start(req: StreamStartReq) -> dict:
+    """Mint a one-time ticket for GET /stream. Auth via header; the prompt
+    travels in the POST body instead of the SSE URL."""
+    import secrets as _secrets
+    now = time.time()
+    # Sweep expired tickets (tiny dict; O(n) is fine).
+    for k in [k for k, (exp, _) in _STREAM_TICKETS.items() if exp < now]:
+        _STREAM_TICKETS.pop(k, None)
+    while len(_STREAM_TICKETS) >= _STREAM_TICKETS_MAX:
+        _STREAM_TICKETS.pop(next(iter(_STREAM_TICKETS)), None)
+    ticket = _secrets.token_urlsafe(32)
+    _STREAM_TICKETS[ticket] = (now + _STREAM_TICKET_TTL_S, {
+        "prompt": req.prompt,
+        "session_id": req.session_id,
+        "model": req.model,
+        "permission": req.permission,
+        "image_ids": req.image_ids,
+    })
+    return {"ticket": ticket}
+
+
+@router.get("/stream")
 async def stream(
     prompt: str = Query(default=""),
-    token: str = Query(...),
-    session_id: str = Query(...),
+    token: str = Query(default=""),
+    session_id: str = Query(default=""),
     model: str = Query(default=""),
     permission: str = Query(default="bypassPermissions"),
     image_ids: str = Query(default=""),
+    ticket: str = Query(default=""),
 ):
+    # Ticket redemption (preferred path — see _STREAM_TICKETS above). The
+    # ticket itself authenticates the request (it was minted via a
+    # header-authed POST) and supplies the real params. Single-use: popped
+    # on first redemption so a leaked URL from a log replay is inert.
+    if ticket:
+        entry = _STREAM_TICKETS.pop(ticket, None)
+        if entry is None or entry[0] < time.time():
+            raise HTTPException(401, "invalid or expired stream ticket")
+        params = entry[1]
+        prompt = params["prompt"]
+        session_id = params["session_id"]
+        model = params["model"]
+        permission = params["permission"]
+        image_ids = params["image_ids"]
+    else:
+        # Legacy query-param auth (old clients / manual use).
+        from .auth import _token_ok
+        if not _token_ok(token):
+            raise HTTPException(401, "bad token")
+        if not session_id:
+            raise HTTPException(422, "session_id required")
     # TTL sweep of the in-memory attachment store on EVERY stream request
     # (not just when this turn carries image_ids). Without this, a user who
     # uploads then never uploads/sends again would leave a 10MB-class base64

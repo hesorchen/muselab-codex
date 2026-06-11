@@ -158,9 +158,44 @@ _SIDECAR_LOCK = threading.Lock()
 # `active` streaming dots are computed per-request OUTSIDE the cache (from
 # _active_turns in chat.py), so they stay real-time regardless of this TTL.
 
-_LIST_CACHE: dict[str, Any] = {"at": 0.0, "data": None}
+_LIST_CACHE: dict[str, Any] = {"at": 0.0, "data": None, "gen": 0}
 _LIST_CACHE_TTL_S = 30.0
 _LIST_CACHE_LOCK = threading.Lock()
+
+
+# Single-flight flag for the stale-while-revalidate background rebuild.
+_LIST_REFRESHING: dict[str, bool] = {"v": False}
+
+
+def _refresh_list_cache_bg() -> None:
+    """Background single-flight rebuild for stale-while-revalidate. Builds a
+    fresh snapshot via _build_sessions_list() and installs it unless an
+    invalidation happened mid-build (data=None) — in that case the next
+    caller must rebuild synchronously to see the post-mutation state, so we
+    must not overwrite the invalidation with our possibly-pre-mutation
+    snapshot."""
+    try:
+        result = _build_sessions_list()
+        now = time.time()
+        with _LIST_CACHE_LOCK:
+            if _LIST_CACHE["data"] is not None:
+                _LIST_CACHE["data"] = result
+                _LIST_CACHE["at"] = now
+                _LIST_CACHE["gen"] += 1
+    except Exception as e:
+        sys.stderr.write(f"[sessions] bg list refresh failed: "
+                         f"{type(e).__name__}: {e}\n")
+    finally:
+        _LIST_REFRESHING["v"] = False
+
+
+def list_sessions_generation() -> int:
+    """Monotonic counter bumped on every fresh list_sessions() rebuild and
+    on invalidation. Lets callers cache values derived from the list (e.g.
+    the /sessions ETag digest) keyed on this instead of re-hashing the same
+    snapshot on every poll."""
+    with _LIST_CACHE_LOCK:
+        return _LIST_CACHE["gen"]
 
 
 def invalidate_sessions_cache() -> None:
@@ -169,22 +204,67 @@ def invalidate_sessions_cache() -> None:
     with _LIST_CACHE_LOCK:
         _LIST_CACHE["at"] = 0.0
         _LIST_CACHE["data"] = None
+        _LIST_CACHE["gen"] += 1
+    _META_CACHE.clear()
 
 
-def _load_sidecar(sid: str) -> dict:
+# Short-TTL per-sid metadata cache. A single GET /sessions/{sid} request can
+# call get_session_meta up to 3 times (meta + cost + ctx paths), and EACH
+# call does a full index.json read plus an SDK get_session_info JSONL probe.
+# 2s is short enough that externally-visible staleness is negligible (the
+# sessions LIST already tolerates 30s), and any muselab-side mutation goes
+# through _save_index → invalidate_sessions_cache which clears this too.
+_META_CACHE: dict[str, tuple[float, dict]] = {}
+_META_CACHE_TTL_S = 2.0
+_META_CACHE_MAX = 256
+
+
+# Parsed-sidecar cache keyed by sid → (mtime, size, dict). Sidecars are
+# re-read + json.loads'd on EVERY GET /sessions/{sid} (annotations), every
+# ctx-window read, etc., and can reach MBs when they hold base64 thumbs.
+# (mtime, size) keying means an external edit (or our own _save_sidecar)
+# is picked up on the next read. Cached dicts are returned as-is: callers
+# that mutate them do so under _SIDECAR_LOCK and immediately _save_sidecar
+# (which drops the cache entry), so mutation never leaks a stale snapshot.
+_SIDECAR_CACHE: dict[str, tuple[float, int, dict]] = {}
+_SIDECAR_CACHE_MAX = 64
+
+
+def _load_sidecar(sid: str, *, use_cache: bool = True) -> dict:
+    """Read + parse the sidecar JSON.
+
+    ``use_cache=False`` (mutator paths) always returns a FRESH parse:
+    read-modify-write callers mutate the returned dict in place before
+    _save_sidecar, and handing them the cached object would leak those
+    in-flight mutations to concurrent readers (and persist them in the
+    cache even if the save never happens)."""
     p = _sidecar_path(sid)
-    if not p.exists():
+    try:
+        st = p.stat()
+    except OSError:
         return {"messages": {}}
+    sig = (st.st_mtime, st.st_size)
+    if use_cache:
+        hit = _SIDECAR_CACHE.get(sid)
+        if hit is not None and hit[0] == sig[0] and hit[1] == sig[1]:
+            return hit[2]
     try:
         d = json.loads(p.read_text(encoding="utf-8"))
         d.setdefault("messages", {})
-        return d
     except Exception:
         return {"messages": {}}
+    if use_cache:
+        if len(_SIDECAR_CACHE) >= _SIDECAR_CACHE_MAX and sid not in _SIDECAR_CACHE:
+            _SIDECAR_CACHE.pop(next(iter(_SIDECAR_CACHE)), None)
+        _SIDECAR_CACHE[sid] = (sig[0], sig[1], d)
+    return d
 
 
 def _save_sidecar(sid: str, data: dict) -> None:
     atomic_write_text(_sidecar_path(sid), json.dumps(data, ensure_ascii=False))
+    # Drop rather than refresh: the next _load_sidecar re-stats and caches
+    # the just-written file, keeping cache state derived purely from disk.
+    _SIDECAR_CACHE.pop(sid, None)
 
 
 # ============================================================================
@@ -290,15 +370,42 @@ def list_sessions() -> list[dict]:
 
     Cached for `_LIST_CACHE_TTL_S` seconds — see cache block in this module.
     Mutations call `invalidate_sessions_cache()` so cache staleness only
-    affects external-to-muselab JSONL writes."""
+    affects external-to-muselab JSONL writes.
+
+    Stale-while-revalidate: when the TTL has expired but a snapshot still
+    exists, return the stale snapshot immediately and rebuild in a single
+    background thread (single-flight via _LIST_REFRESHING). The caller
+    never blocks on the ~400ms sdk_list_sessions walk; the refreshed data
+    lands for the NEXT call. invalidate_sessions_cache() drops the data
+    outright, so muselab-driven mutations still rebuild synchronously on
+    the next call (immediate consistency preserved)."""
     now = time.time()
     with _LIST_CACHE_LOCK:
         cached = _LIST_CACHE.get("data")
-        if cached is not None and (now - _LIST_CACHE["at"]) < _LIST_CACHE_TTL_S:
+        if cached is not None:
+            fresh = (now - _LIST_CACHE["at"]) < _LIST_CACHE_TTL_S
+            if not fresh and not _LIST_REFRESHING["v"]:
+                _LIST_REFRESHING["v"] = True
+                threading.Thread(
+                    target=_refresh_list_cache_bg, daemon=True,
+                ).start()
             # Return a shallow copy of the list so callers that mutate-in-place
             # (e.g. add a transient field for rendering) don't poison the cache.
             # Inner dicts are still shared — read-only callers won't notice.
             return list(cached)
+    result = _build_sessions_list()
+    with _LIST_CACHE_LOCK:
+        _LIST_CACHE["data"] = result
+        _LIST_CACHE["at"] = now
+        _LIST_CACHE["gen"] += 1
+    # Return a shallow copy so caller mutations don't bleed back into cache.
+    return list(result)
+
+
+def _build_sessions_list() -> list[dict]:
+    """The uncached list build: SDK walk + index merge + sort. Called by
+    list_sessions() (sync, cache miss) and _refresh_list_cache_bg() (async,
+    stale-while-revalidate)."""
     index = _load_index()
     index_by_id = {s["id"]: s for s in index}
     sdk_list: list[Any] = []
@@ -322,16 +429,11 @@ def list_sessions() -> list[dict]:
         if s["id"] not in seen:
             out.append(s)
     # Sort: pinned sessions first (descending), then by updated_at desc.
-    result = sorted(
+    return sorted(
         out,
         key=lambda s: (1 if s.get("pinned") else 0, s.get("updated_at", 0)),
         reverse=True,
     )
-    with _LIST_CACHE_LOCK:
-        _LIST_CACHE["data"] = result
-        _LIST_CACHE["at"] = now
-    # Return a shallow copy so caller mutations don't bleed back into cache.
-    return list(result)
 
 
 def create_session(name: str = "", model: str = "", system_prompt: str = "") -> dict:
@@ -381,7 +483,14 @@ def get_session_meta(sid: str) -> dict | None:
     Merges SDK truth (custom_title, last_modified, created_at, tag) with
     muselab index (model, system_prompt, auto_named). Falls back to
     index-only if SDK can't see the session (e.g. CLI hasn't created
-    the JSONL yet) or if SDK is unavailable."""
+    the JSONL yet) or if SDK is unavailable.
+
+    Cached per-sid for _META_CACHE_TTL_S; "not found" (None) is never
+    cached so a just-created session is visible immediately."""
+    now = time.time()
+    hit = _META_CACHE.get(sid)
+    if hit is not None and (now - hit[0]) < _META_CACHE_TTL_S:
+        return hit[1]
     idx = _load_index()
     m = next((s for s in idx if s["id"] == sid), None)
     info = None
@@ -392,9 +501,12 @@ def get_session_meta(sid: str) -> dict | None:
             sys.stderr.write(
                 f"[sessions] sdk_get_session_info({sid}) failed: "
                 f"{type(e).__name__}: {e}\n")
-    if info is not None:
-        return _merge_sdk_with_index(info, m or {})
-    return m
+    meta = _merge_sdk_with_index(info, m or {}) if info is not None else m
+    if meta is not None:
+        if len(_META_CACHE) >= _META_CACHE_MAX and sid not in _META_CACHE:
+            _META_CACHE.pop(next(iter(_META_CACHE)), None)
+        _META_CACHE[sid] = (now, meta)
+    return meta
 
 
 # Back-compat alias — some code calls get_session() expecting metadata.
@@ -558,12 +670,30 @@ def get_message_annotations(sid: str) -> dict[str, dict]:
     return _load_sidecar(sid).get("messages", {})
 
 
+def has_pending_attachments(sid: str) -> bool:
+    """True when the sidecar holds unbound pending image/doc attachments.
+    Cheap (cached sidecar read); lets read paths skip work that only
+    matters while a binding is outstanding."""
+    return bool(_load_sidecar(sid).get("pending_attachments"))
+
+
+def sidecar_signature(sid: str) -> tuple[float, int] | None:
+    """(mtime, size) of the sidecar file, or None when it doesn't exist.
+    Cheap freshness probe for callers that cache anything derived from
+    sidecar content (annotations / pending attachments)."""
+    try:
+        st = _sidecar_path(sid).stat()
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return None
+
+
 def set_message_annotation(sid: str, msg_uuid: str, **fields: Any) -> None:
     """Update one message's annotations (cost, model, images, etc.).
     Fields with value None are skipped (use update with explicit empty
     if you want to clear). Atomic per-call write."""
     with _SIDECAR_LOCK:
-        data = _load_sidecar(sid)
+        data = _load_sidecar(sid, use_cache=False)
         msgs = data.setdefault("messages", {})
         cur = msgs.setdefault(msg_uuid, {})
         for k, v in fields.items():
@@ -600,7 +730,7 @@ def set_session_ctx_window(sid: str, max_tokens: int) -> None:
     if not max_tokens or max_tokens <= 0:
         return
     with _SIDECAR_LOCK:
-        data = _load_sidecar(sid)
+        data = _load_sidecar(sid, use_cache=False)
         if int(data.get("context_max_tokens") or 0) == int(max_tokens):
             return
         data["context_max_tokens"] = int(max_tokens)
@@ -642,7 +772,7 @@ def append_pending_attachments(sid: str, images: list[dict] | None = None,
         return
     now_ms = int(__import__("time").time() * 1000)
     with _SIDECAR_LOCK:
-        data = _load_sidecar(sid)
+        data = _load_sidecar(sid, use_cache=False)
         pend = data.setdefault("pending_attachments", [])
         # GC stale entries first (age them out by ts).
         cutoff = now_ms - _PENDING_ATTACH_TTL_MS
@@ -666,7 +796,7 @@ def consume_one_pending_attachments(sid: str, msg_uuid: str) -> dict | None:
     normal annotation. Returns the bundle (or None if no pending /
     already bound). Idempotent."""
     with _SIDECAR_LOCK:
-        data = _load_sidecar(sid)
+        data = _load_sidecar(sid, use_cache=False)
         msgs = data.setdefault("messages", {})
         cur = msgs.setdefault(msg_uuid, {})
         if cur.get("images") or cur.get("docs"):
