@@ -293,7 +293,7 @@ app = FastAPI(title="muselab", version="1.0.0", lifespan=_lifespan)
 # `Content-Encoding: identity`, and Starlette's GZipMiddleware skips any
 # response that already carries a Content-Encoding header (gzip.py:55-57),
 # so live token streaming is never buffered/compressed.
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
 @app.middleware("http")
@@ -435,15 +435,72 @@ class _VersionedStaticFiles(StaticFiles):
     fresh content.
 
     The query-string presence is the marker — its value doesn't matter, since
-    a stale ?v=… points at the same on-disk file anyway."""
+    a stale ?v=… points at the same on-disk file anyway.
+
+    Large compressible assets (app.js ~900KB, mermaid.min.js ~3.3MB) are
+    additionally served from an in-memory gzip cache: GZipMiddleware would
+    otherwise re-deflate the same multi-MB file from scratch on every cold
+    client (each PWA install / cache-evicted reload), burning tens of ms of
+    CPU per request. Compressed once per (path, mtime), capped small — only
+    a handful of assets qualify."""
+
+    _GZ_MIN_SIZE = 256 * 1024
+    _GZ_EXTS = (".js", ".css", ".json", ".svg", ".webmanifest", ".map")
+    _gz_cache: dict[str, tuple[float, int, bytes]] = {}
+    _gz_cache_max = 8
+
     async def get_response(self, path, scope):
-        resp = await super().get_response(path, scope)
+        gz = await self._try_gzip_response(path, scope)
+        resp = gz if gz is not None else await super().get_response(path, scope)
         query = scope.get("query_string", b"")
         if b"v=" in query:
             resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
         else:
             resp.headers["Cache-Control"] = "no-cache, must-revalidate"
         return resp
+
+    async def _try_gzip_response(self, path, scope):
+        import gzip as _gzip
+        from starlette.responses import Response as _Resp
+        headers = dict(scope.get("headers") or [])
+        ae = headers.get(b"accept-encoding", b"").decode("latin-1")
+        if "gzip" not in ae:
+            return None
+        if not path.lower().endswith(self._GZ_EXTS):
+            return None
+        try:
+            full, st = self.lookup_path(path)
+        except Exception:
+            return None
+        if st is None or not full or st.st_size < self._GZ_MIN_SIZE:
+            return None
+        key = path
+        hit = self._gz_cache.get(key)
+        if hit is None or hit[0] != st.st_mtime or hit[1] != st.st_size:
+            try:
+                raw = Path(full).read_bytes()
+            except OSError:
+                return None
+            # Run the (CPU-bound, GIL-releasing) compress off the event loop.
+            import anyio
+            data = await anyio.to_thread.run_sync(
+                lambda: _gzip.compress(raw, compresslevel=6))
+            if len(self._gz_cache) >= self._gz_cache_max and key not in self._gz_cache:
+                self._gz_cache.pop(next(iter(self._gz_cache)), None)
+            self._gz_cache[key] = (st.st_mtime, st.st_size, data)
+            hit = self._gz_cache[key]
+        import mimetypes
+        mt = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return _Resp(
+            content=hit[2],
+            media_type=mt,
+            headers={
+                "Content-Encoding": "gzip",
+                "Vary": "Accept-Encoding",
+                # Pre-encoded → GZipMiddleware sees Content-Encoding set and
+                # skips double compression.
+            },
+        )
 
 
 # Dynamic manifest handler — MUST be registered before the /static mount

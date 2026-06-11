@@ -1164,12 +1164,30 @@ def _cached_walk(root: Path, ignore: set[str], show_hidden: bool):
         yield dp, dirnames, filenames
 
 
+# Concurrency gate: each grep can burn up to MAX_GREP_TIME_SEC of CPU while
+# holding a threadpool thread. Without a cap, a few rapid keystrokes (or two
+# devices searching at once) stack full-archive scans and starve the pool —
+# every other endpoint (chat, sessions) stalls behind them. Two concurrent
+# scans is plenty for interactive use; excess requests fail fast with 429
+# rather than queueing (the UI debounces and just issues a fresh search).
+_GREP_GATE = threading.BoundedSemaphore(2)
+
+
 @router.get("/grep", dependencies=[Depends(require_token)])
 def grep(q: str, limit: int = 50, show_hidden: bool = False) -> dict:
     """Cross-platform full-text search (pure Python, no grep dependency).
     Uses `_cached_walk` so the directory-listing phase is O(changed-dirs)
     instead of O(all-dirs) — repeat searches on a quiet archive only stat
     file contents, not the directory structure itself."""
+    if not _GREP_GATE.acquire(blocking=False):
+        raise HTTPException(429, "search busy — try again")
+    try:
+        return _grep_impl(q, limit, show_hidden)
+    finally:
+        _GREP_GATE.release()
+
+
+def _grep_impl(q: str, limit: int, show_hidden: bool) -> dict:
     q_lower = q.strip().lower()
     # Minimum query length: a single character matches nearly every file
     # and always runs the full archive scan to the 8s time budget while

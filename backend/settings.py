@@ -109,8 +109,20 @@ def atomic_write_text(path: Path, data: str, encoding: str = "utf-8") -> None:
     # random suffix so each call's tmp is distinct.
     tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{secrets.token_hex(4)}")
     try:
-        tmp.write_text(data, encoding=encoding)
+        with open(tmp, "w", encoding=encoding) as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        # fsync the directory so the rename itself survives power loss.
+        try:
+            dfd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
     finally:
         if tmp.exists():
             try:

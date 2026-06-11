@@ -3143,7 +3143,18 @@ function portal() {
       }
       const out = this._mdRenderUncached(text);
       cache.set(text, out);
-      if (cache.size > 400) cache.delete(cache.keys().next().value);
+      // Evict by BOTH entry count and total bytes: 400 entries of huge
+      // code-dump messages (input + rendered HTML can be 100s of KB each)
+      // could otherwise pin tens of MB. Track an approximate running byte
+      // total (UTF-16 length, ~2 bytes/char) and trim oldest-first.
+      const bytes = (text.length + out.length) * 2;
+      this._mdCacheBytes = (this._mdCacheBytes || 0) + bytes;
+      while (cache.size > 400 || (this._mdCacheBytes > 16 * 1024 * 1024 && cache.size > 1)) {
+        const k = cache.keys().next().value;
+        const v = cache.get(k);
+        this._mdCacheBytes -= (k.length + (v ? v.length : 0)) * 2;
+        cache.delete(k);
+      }
       return out;
     },
 
@@ -4610,6 +4621,12 @@ function portal() {
         if (ticksLeft-- <= 0) { this._stopBgContPoller(sid); return; }
         // Card settled (flipped to done/failed) → done waiting.
         if (!this._bgHasRunningCard(sid)) { this._stopBgContPoller(sid); return; }
+        // Tab hidden → skip the network work entirely (same battery/radio
+        // rationale as _pingHealth). The card badge isn't visible anyway;
+        // the next visible tick reconciles. ticksLeft still counts down so
+        // the hard cap holds even for a permanently-backgrounded tab.
+        if (typeof document !== "undefined"
+            && document.visibilityState !== "visible") return;
         // Not viewing this session, or already streaming → retry next tick.
         if (this.currentId !== sid || this.streaming) return;
         // PRIMARY completion path: a run_in_background task's terminal status
@@ -7525,16 +7542,26 @@ function portal() {
     // Chunk it and yield to the event loop between batches so foreground
     // interaction stays smooth. The tab is only marked _loaded after this
     // resolves, so a later switch never lands on un-rendered (empty) bubbles.
-    _renderMessagesChunked(list, renderFn, chunk = 5) {
+    // Time-budgeted instead of fixed-count: a fixed chunk=5 was either too
+    // slow (5 tiny bubbles per idle slice on a long plain-text session) or
+    // too janky (5 huge code-block bubbles can blow past a frame). Render
+    // as many as fit in ~8ms of work per slice, then yield.
+    _renderMessagesChunked(list, renderFn, budgetMs = 8) {
       return new Promise((resolve) => {
         if (!list || !list.length) { resolve(); return; }
         const yieldToLoop = (typeof window !== "undefined" && window.requestIdleCallback)
           ? (fn) => window.requestIdleCallback(fn, { timeout: 200 })
           : (fn) => setTimeout(fn, 0);
+        const nowMs = (typeof performance !== "undefined" && performance.now)
+          ? () => performance.now() : () => Date.now();
         let i = 0;
         const pump = () => {
-          const end = Math.min(i + chunk, list.length);
-          for (; i < end; i++) renderFn(list[i]);
+          const t0 = nowMs();
+          while (i < list.length) {
+            renderFn(list[i]);
+            i++;
+            if (nowMs() - t0 >= budgetMs) break;
+          }
           if (i < list.length) yieldToLoop(pump);
           else resolve();
         };
@@ -10808,10 +10835,14 @@ function portal() {
         this._loadHljs().then(() => {
           try { window.hljs && window.hljs.highlightAuto("x", this._hlAutoSubset()); } catch (_) {}
         }).catch(() => {});
-        // katex + mermaid: the dominant cost is the script parse at load time,
-        // so simply loading them off the click path is the win.
+        // katex: the dominant cost is the script parse at load time,
+        // so simply loading it off the click path is the win.
+        // mermaid is deliberately NOT prewarmed: its 3.3 MB download +
+        // parse costs far more than every other vendor combined, and most
+        // sessions never render a single diagram. _renderArtifacts lazy-
+        // loads it on the first actual ```mermaid block, which is rare
+        // enough that the one-time cold load there is acceptable.
         this._loadKatex().catch(() => {});
-        this._loadMermaid().catch(() => {});
       };
       try {
         if (typeof window !== "undefined" && window.requestIdleCallback) {
@@ -13449,13 +13480,37 @@ function portal() {
       this.atBottom = true;
       this.scrollToBottom(true);
 
-      const url = "/api/chat/stream"
-        + "?prompt=" + encodeURIComponent(text)
-        + "&session_id=" + encodeURIComponent(streamSid)
-        + "&model=" + encodeURIComponent(this.model)
-        + "&permission=" + encodeURIComponent(this.permission)
-        + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
-        + "&token=" + encodeURIComponent(this.token);
+      // Ticket flow: POST the prompt + params with header auth, get a
+      // one-time ticket, open the SSE with ONLY the ticket in the URL.
+      // Keeps the user's prompt and the auth token out of access logs /
+      // browser history (EventSource can't send headers or a body).
+      // Falls back to the legacy query-param URL if the ticket POST
+      // fails (old backend / transient error) so sending never breaks.
+      let url;
+      try {
+        const tr = await fetch("/api/chat/stream/start", {
+          method: "POST",
+          headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
+          body: JSON.stringify({
+            prompt: text,
+            session_id: streamSid,
+            model: this.model,
+            permission: this.permission,
+            image_ids: attachIds.length ? attachIds.join(",") : "",
+          }),
+        });
+        if (!tr.ok) throw new Error("ticket " + tr.status);
+        const td = await tr.json();
+        url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+      } catch (_) {
+        url = "/api/chat/stream"
+          + "?prompt=" + encodeURIComponent(text)
+          + "&session_id=" + encodeURIComponent(streamSid)
+          + "&model=" + encodeURIComponent(this.model)
+          + "&permission=" + encodeURIComponent(this.permission)
+          + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
+          + "&token=" + encodeURIComponent(this.token);
+      }
       const es = new EventSource(url);
       streamState.es = es; this.es = es;
       // Reset auto-reconnect counter on each successful SSE open. NOTE
