@@ -32,6 +32,7 @@ from claude_agent_sdk import (
     tag_session as sdk_tag_session,
     fork_session as sdk_fork_session,
 )
+from claude_agent_sdk.types import PermissionMode
 from .auth import require_token_query, require_token, require_token_header_or_query
 from .settings import ROOT, MODEL, atomic_write_text, env_float, env_int, is_chinese_locale
 from . import sessions as sess
@@ -41,6 +42,29 @@ from .ask_user_question import (
     unregister_session_queue, submit_answer,
 )
 from . import permission_request as perm
+
+# Valid permission modes, derived from the SDK's PermissionMode literal so
+# the whitelist tracks SDK upgrades automatically. External strings (query
+# params, queue items, tickets) flow into ClaudeAgentOptions / client
+# .set_permission_mode() — a typo'd or stale value would fail the SDK
+# connect (or worse, silently diverge UI state from the real gate), so
+# entry points must normalize through _validate_permission().
+_VALID_PERMISSION_MODES: frozenset = frozenset(get_args(PermissionMode))
+
+
+def _validate_permission(permission: str) -> str:
+    """Return `permission` if it's a valid SDK PermissionMode, else raise
+    HTTPException(400). Empty string falls back to bypassPermissions (the
+    historical default for callers that never sent the param)."""
+    p = (permission or "").strip()
+    if not p:
+        return "bypassPermissions"
+    if p not in _VALID_PERMISSION_MODES:
+        raise HTTPException(
+            400, f"invalid permission mode: {p!r} "
+                 f"(expected one of {sorted(_VALID_PERMISSION_MODES)})")
+    return p
+
 
 # Serialises CLAUDE_CONFIG_DIR overrides. The SDK's get_session_messages()
 # has no explicit config-dir parameter — it reads the PROCESS-GLOBAL
@@ -521,6 +545,11 @@ _TASK_WATCH_TIMEOUT = env_int("MUSELAB_TASK_WATCH_TIMEOUT", 1800, min_value=60)
 # unpinning — bounding the worst case (no auto-continue ever comes) instead of
 # holding the client + the _active_turns slot for the full _TASK_WATCH_TIMEOUT.
 _CONTINUATION_GRACE = env_int("MUSELAB_CONTINUATION_GRACE", 60, min_value=5)
+# Short grace for USER-STOPPED tasks: the CLI doesn't auto-continue after a
+# deliberate stop, so the watcher only needs a token window before closing
+# the continuation (frees the attached FE from an idle "streaming…" footer).
+_STOPPED_CONTINUATION_GRACE = env_int(
+    "MUSELAB_STOPPED_CONTINUATION_GRACE", 5, min_value=1)
 # task_id -> description, surviving across the turn that started the task. The
 # per-turn inflight_tasks dict is local to a turn; if a NEW turn happens to
 # drain a buffered terminal notification (handoff race), it has no description
@@ -931,13 +960,17 @@ async def _build_and_connect_client(
         # version is left enabled too as a fallback if the model forgets the
         # MCP name; the frontend renders both shapes.
         #
-        # MAINTENANCE NOTE (audit E/253): this is a hand-maintained DENYLIST.
-        # It only blocks tool names known at the time of writing — if a future
-        # SDK release adds a new harness-only tool (another plan-mode / cron /
-        # worktree / notification primitive), it will be silently EXPOSED to
-        # the model until someone adds it here. There is no allowlist fallback.
-        # When bumping the claude_agent_sdk version, diff the SDK's default
-        # tool catalog against this list and add any new harness-only tools.
+        # MAINTENANCE NOTE (audit E/253, updated 2026-06-11): this is a
+        # hand-maintained DENYLIST — a future harness-only tool is silently
+        # EXPOSED until added here. Drift is now mechanically checkable: the
+        # CLI announces its tool catalog in the init SystemMessage;
+        #   .venv/bin/python scripts/dump-tool-catalog.py \
+        #       | diff docs/tool-catalog.txt -
+        # on every SDK bump (sdk-bump-checklist.md item 1). Alternatives were
+        # evaluated and rejected: tools={"type":"preset","preset":"claude_code"}
+        # maps to `--tools default` — identical to not passing tools at all, so
+        # it adds no protection; an explicit allowlist inverts the failure mode
+        # (new/renamed useful tools silently MISSING after a CLI bump).
         disallowed_tools=[
             "ExitPlanMode",           # plan-mode handshake — no UI yet
             "ScheduleWakeup",         # /loop dynamic mode — Claude Code only
@@ -2041,10 +2074,15 @@ def _strip_cli_slash_wrapper(text: str) -> str:
 # spec.md). The launching tool_use card and this record share the <tool-use-id>.
 # On history rebuild we parse it and stamp the card's terminal task_status so a
 # completed bg task shows ✅ DURABLY (survives reload — matches Claude Code),
-# instead of rendering the raw XML as a confusing user bubble. NOTE: this is the
-# ONLY reliable completion signal in muselab's flow — in practice the terminal
-# notification arrives as this user-text record, NOT as a typed
-# TaskNotificationMessage, so the in-turn / cross-turn dispatch never sees it.
+# instead of rendering the raw XML as a confusing user bubble.
+#
+# LIVE-PATH ROLE (updated 2026-06-11, Phase-0 probe on CLI 2.1.141 + SDK
+# 0.2.95): the live stream DOES deliver a typed TaskNotificationMessage
+# (out-of-band, after the turn's ResultMessage) — typed dispatch is the
+# PRIMARY live truth. This regex remains authoritative ONLY for JSONL history
+# rebuild (the transcript stores the XML record, never the typed message) and
+# as a live fallback for older CLIs; a fallback hit logs a
+# "[chat] task fallback" warning.
 _TASK_NOTIFICATION_RE = re.compile(
     r"<task-notification>(.*?)</task-notification>", re.DOTALL)
 
@@ -2074,15 +2112,18 @@ def _parse_task_notifications(text: str) -> list[dict]:
     return recs
 
 
-# A Bash run_in_background=true LAUNCH does NOT emit a typed TaskStartedMessage
-# (only the SDK's Agent-style tasks do). It surfaces solely as a tool_result body
-# of the form: "Command running in background with ID: <tid>. Output is being
-# written to: <file>. You will be notified when it completes. ...". muselab must
-# sniff this text to learn that a background task started — otherwise
-# inflight_tasks stays empty, the turn-end cross-turn watcher never spawns, and
-# the post-completion auto-continue never streams live (the card still flips ✅ on
-# reload because history rebuild parses the raw <task-notification> record
-# directly, masking the missing live path). See docs/background-tasks-spec.md.
+# FALLBACK launch sniff (updated 2026-06-11): on CLI 2.1.141 + SDK 0.2.95 a
+# Bash run_in_background=true launch DOES emit a typed TaskStartedMessage
+# (Phase-0 probe), which arrives BEFORE the tool_result — typed dispatch is the
+# primary truth and this sniff normally no-ops. It remains as a fallback for
+# older CLIs whose launches surface solely as a tool_result body of the form:
+# "Command running in background with ID: <tid>. Output is being written to:
+# <file>. ...". If the sniff ever wins (logs a "[chat] task fallback" warning),
+# the typed contract regressed — without the fallback, inflight_tasks would
+# stay empty, the turn-end cross-turn watcher would never spawn, and the
+# post-completion auto-continue would never stream live. NOTE: the English
+# wording below is CLI-version-coupled; that brittleness is exactly why typed
+# messages are now the primary path. See docs/background-tasks-spec.md.
 _BG_LAUNCH_RE = re.compile(
     r"Command running in background with ID:\s*([A-Za-z0-9._-]+)\."
     r"\s*Output is being written to:\s*(\S+?\.output)\b")
@@ -2103,11 +2144,13 @@ def _usermsg_task_notification_text(msg) -> str:
     """If `msg` is a UserMessage carrying a <task-notification>, return its
     textual content; else return "".
 
-    The CLI delivers a background task's terminal completion as a normal
-    UserMessage whose content is the <task-notification> XML (NOT a typed
-    TaskNotificationMessage — that shape only ever showed up to standalone
-    probe scripts, never in muselab's live turn/watcher stream). Content may
-    be a plain string or a list of content blocks; flatten both to text."""
+    Fallback-path helper (updated 2026-06-11): the typed
+    TaskNotificationMessage is the primary live completion signal on CLI
+    2.1.141 + SDK 0.2.95. Some CLI builds additionally/instead deliver the
+    terminal completion as a normal UserMessage whose content is the raw
+    <task-notification> XML; this helper lets the fallback branches consume
+    that shape. Content may be a plain string or a list of content blocks;
+    flatten both to text."""
     if not isinstance(msg, UserMessage):
         return ""
     content = getattr(msg, "content", None)
@@ -2872,16 +2915,26 @@ def export_session_markdown(sid: str) -> Response:
                     headers=headers)
 
 
-@router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
-async def delete_session_api(sid: str) -> dict:
-    await disconnect_client(sid)
-    # SDK delete first (removes CLI JSONL); then muselab sidecar.
+def purge_session_storage(sid: str) -> bool:
+    """Remove EVERY per-session artifact: SDK JSONL, muselab sidecar/index/
+    queue, attachments dir, and in-memory state. Returns True if any layer
+    existed (SDK transcript OR sidecar) — callers treat that as "the session
+    was real and is now gone".
+
+    Shared by the HTTP delete endpoint and the scheduler's reuse-mode task
+    cascade so both delete the same set of artifacts. Deliberately tolerant:
+    a session may exist in only ONE layer (SDK-only when the sidecar was
+    lost; sidecar-only when the session never streamed), and local cleanup
+    (attachments / usage / active-turn sidecar) runs regardless so nothing
+    is orphaned by a partial state."""
+    removed = False
     try:
         sdk_delete_session(sid, directory=str(ROOT))
+        removed = True
     except (FileNotFoundError, ValueError):
         pass   # JSONL never existed (session never streamed) — that's fine
-    if not sess.delete_session(sid):
-        raise HTTPException(404, "session not found")
+    if sess.delete_session(sid):
+        removed = True
     # Sweep per-session attachments dir (uploaded image full-res originals
     # persisted by upload-image → send pipeline). Without this, deleting
     # a session would orphan its image files on disk forever.
@@ -2898,7 +2951,65 @@ async def delete_session_api(sid: str) -> dict:
     _session_usage.pop(sid, None)
     _interrupted_at_startup.pop(sid, None)
     _delete_active_turn_sidecar(sid)
+    return removed
+
+
+@router.delete("/sessions/{sid}", dependencies=[Depends(require_token)])
+async def delete_session_api(sid: str) -> dict:
+    await disconnect_client(sid)
+    # 404 only when NEITHER layer existed. Previously the sidecar was
+    # authoritative: an SDK-only session (sidecar lost / never written) got
+    # its JSONL deleted and THEN returned 404 — the user saw a failure while
+    # the transcript was already gone, and local cleanup was skipped.
+    if not purge_session_storage(sid):
+        raise HTTPException(404, "session not found")
     return {"ok": True}
+
+
+class PurgeOldReq(BaseModel):
+    # Sessions whose last activity is older than `days` are deleted.
+    days: int = 7
+    # The caller's currently-open session — always exempt regardless of age,
+    # so a bulk-clear never yanks the tab the user is staring at.
+    keep_id: str = ""
+    # When True, count the victims and return WITHOUT deleting anything. The
+    # frontend uses this to show an exact "will delete N" in the confirm
+    # dialog — it can't count locally because its session list is only the
+    # most-recent paginated window (older sessions aren't loaded client-side).
+    dry_run: bool = False
+
+
+@router.post("/sessions/purge-old", dependencies=[Depends(require_token)])
+async def purge_old_sessions_api(req: PurgeOldReq | None = None) -> dict:
+    """Bulk-delete history sessions whose last activity is older than `days`
+    days (default 7). Pinned sessions and `keep_id` are always exempt — pin is
+    the user's explicit "keep this" signal, and deleting the currently-open
+    session out from under them is jarring. Reuses purge_session_storage so
+    every deleted session is cleaned to the same depth (SDK JSONL + sidecar +
+    index + queue + attachments + in-memory state) as the single DELETE.
+
+    The server is the source of truth for the victim set: it scans the FULL
+    session list (list_sessions), not the paginated recent window the frontend
+    holds. `dry_run=true` returns the count + ids without touching anything."""
+    days = max(1, int((req.days if req else 7) or 7))
+    keep_id = (req.keep_id if req else "") or ""
+    dry_run = bool(req.dry_run if req else False)
+    cutoff = time.time() - days * 86400
+    victims = [
+        s["id"] for s in sess.list_sessions()
+        if not s.get("pinned")
+        and s["id"] != keep_id
+        and float(s.get("updated_at") or 0) < cutoff
+    ]
+    if dry_run:
+        return {"ok": True, "dry_run": True, "count": len(victims),
+                "ids": victims, "days": days}
+    deleted: list[str] = []
+    for sid in victims:
+        await disconnect_client(sid)
+        if purge_session_storage(sid):
+            deleted.append(sid)
+    return {"ok": True, "deleted": len(deleted), "ids": deleted, "days": days}
 
 
 # --------------------------------------------------------------------------
@@ -2913,6 +3024,10 @@ async def delete_session_api(sid: str) -> dict:
 class QueueEnqueueReq(BaseModel):
     text: str = ""
     image_ids: str = ""
+    # Sender's permission mode at enqueue time. Persisted with the item so
+    # the headless drain replays the turn under the same mode instead of
+    # falling back to the server default (see _maybe_drain_queue).
+    permission: str = ""
 
 
 class QueuePauseReq(BaseModel):
@@ -2957,7 +3072,12 @@ def enqueue_api(sid: str, req: QueueEnqueueReq) -> dict:
     text = (req.text or "").strip()
     if not text and not (req.image_ids or "").strip():
         raise HTTPException(400, "empty message")
-    res = sess.enqueue_message(sid, text, req.image_ids or "")
+    # Validate at enqueue so a bad mode is a visible 400 NOW, not a silent
+    # headless failure when the drain replays the item later.
+    if (req.permission or "").strip():
+        _validate_permission(req.permission)
+    res = sess.enqueue_message(sid, text, req.image_ids or "",
+                               permission=req.permission or "")
     if not res.get("ok"):
         # queue_full → 409 so the FE can surface "队列已满（上限 10 条）".
         raise HTTPException(409, res.get("error", "enqueue failed"))
@@ -4395,6 +4515,46 @@ async def interrupt(session_id: str) -> dict:
     return {"ok": True, "interrupted": interrupted}
 
 
+@router.post("/sessions/{sid}/tasks/{task_id}/stop",
+             dependencies=[Depends(require_token)])
+async def stop_background_task(sid: str, task_id: str) -> dict:
+    """Stop a running background task via the SDK's native stop_task()
+    control request (client.py:450) — the user's only handle on a runaway
+    run_in_background task short of killing the whole turn.
+
+    SINGLE-READER SAFETY: stop_task only WRITES a control request; the
+    control RESPONSE is consumed by the SDK's internal control-protocol
+    reader (not receive_messages), so calling it from this HTTP coroutine
+    never races the turn pump / cross-turn watcher on the message stream —
+    same invariant as interrupt() above.
+
+    After the CLI acks, it emits a task_notification with status='stopped'
+    on the message stream, which flows through the normal settle paths
+    (_on_task_settled → card flip + unpin; no push — task settlement is
+    deliberately notification-free, see _on_task_settled), so this
+    endpoint needs no settlement logic of its own."""
+    async with _lock:
+        targets = [(k, c) for k, c in _clients.items() if k[0] == sid]
+    if not targets:
+        # No live client → the CLI that owned the task is gone; the task is
+        # dead-or-settled already. 409 (not 404) so the FE can distinguish
+        # "nothing to stop" from a bad route.
+        raise HTTPException(
+            status_code=409,
+            detail="no live client for session — task already settled?")
+    errors: list[str] = []
+    for k, c in targets:
+        try:
+            await c.stop_task(task_id)
+            return {"ok": True, "task_id": task_id}
+        except Exception as e:
+            errors.append(f"{k[0]}@{k[1]}: {type(e).__name__}: {e}")
+            sys.stderr.write(
+                f"[chat] stop_task failed sid={sid} task={task_id}: "
+                f"{errors[-1]}\n")
+    raise HTTPException(status_code=502, detail="; ".join(errors))
+
+
 async def _force_stop_after_grace(
     session_id: str,
     bc: "TurnBroadcast",
@@ -5143,6 +5303,10 @@ _IMAGE_ONLY_PLACEHOLDER = "(image)"
 _STREAM_TICKETS: dict[str, tuple[float, dict]] = {}
 _STREAM_TICKET_TTL_S = 60.0
 _STREAM_TICKETS_MAX = 64
+# stream_start is a SYNC route (runs in Starlette's threadpool) while the
+# redeeming GET /stream is async (event-loop thread) — mint and redeem touch
+# the dict from different threads, so all access goes through this lock.
+_STREAM_TICKETS_LOCK = threading.Lock()
 
 
 class StreamStartReq(BaseModel):
@@ -5158,20 +5322,24 @@ def stream_start(req: StreamStartReq) -> dict:
     """Mint a one-time ticket for GET /stream. Auth via header; the prompt
     travels in the POST body instead of the SSE URL."""
     import secrets as _secrets
+    # Reject malformed permission at mint time (400 with a clear message)
+    # instead of letting it fail deep inside SDK connect during the SSE.
+    permission = _validate_permission(req.permission)
     now = time.time()
-    # Sweep expired tickets (tiny dict; O(n) is fine).
-    for k in [k for k, (exp, _) in _STREAM_TICKETS.items() if exp < now]:
-        _STREAM_TICKETS.pop(k, None)
-    while len(_STREAM_TICKETS) >= _STREAM_TICKETS_MAX:
-        _STREAM_TICKETS.pop(next(iter(_STREAM_TICKETS)), None)
     ticket = _secrets.token_urlsafe(32)
-    _STREAM_TICKETS[ticket] = (now + _STREAM_TICKET_TTL_S, {
-        "prompt": req.prompt,
-        "session_id": req.session_id,
-        "model": req.model,
-        "permission": req.permission,
-        "image_ids": req.image_ids,
-    })
+    with _STREAM_TICKETS_LOCK:
+        # Sweep expired tickets (tiny dict; O(n) is fine).
+        for k in [k for k, (exp, _) in _STREAM_TICKETS.items() if exp < now]:
+            _STREAM_TICKETS.pop(k, None)
+        while len(_STREAM_TICKETS) >= _STREAM_TICKETS_MAX:
+            _STREAM_TICKETS.pop(next(iter(_STREAM_TICKETS)), None)
+        _STREAM_TICKETS[ticket] = (now + _STREAM_TICKET_TTL_S, {
+            "prompt": req.prompt,
+            "session_id": req.session_id,
+            "model": req.model,
+            "permission": permission,
+            "image_ids": req.image_ids,
+        })
     return {"ticket": ticket}
 
 
@@ -5190,7 +5358,8 @@ async def stream(
     # header-authed POST) and supplies the real params. Single-use: popped
     # on first redemption so a leaked URL from a log replay is inert.
     if ticket:
-        entry = _STREAM_TICKETS.pop(ticket, None)
+        with _STREAM_TICKETS_LOCK:
+            entry = _STREAM_TICKETS.pop(ticket, None)
         if entry is None or entry[0] < time.time():
             raise HTTPException(401, "invalid or expired stream ticket")
         params = entry[1]
@@ -5206,6 +5375,9 @@ async def stream(
             raise HTTPException(401, "bad token")
         if not session_id:
             raise HTTPException(422, "session_id required")
+        # Ticketed path already validated at mint; the legacy query-param
+        # path takes a raw external string — same gate.
+        permission = _validate_permission(permission)
     # TTL sweep of the in-memory attachment store on EVERY stream request
     # (not just when this turn carries image_ids). Without this, a user who
     # uploads then never uploads/sends again would leave a 10MB-class base64
@@ -5341,6 +5513,41 @@ def _settle_background_task(session_id: str, task_id: str) -> bool:
                 _sessions_with_inflight_tasks.pop(session_id, None)
         _bg_task_descriptions.pop(task_id, None)
     return settled
+
+
+def _on_task_settled(
+    session_id: str,
+    task_id: str,
+    *,
+    status: str | None = None,
+) -> bool:
+    """SINGLE settlement entry for a background task's terminal signal.
+
+    Every observer path (in-turn typed / in-turn XML fallback / cross-turn
+    watcher typed / cross-turn watcher XML fallback) funnels through here, so
+    settlement side-effects live in exactly one place: dedup + unpin via
+    _settle_background_task (returns False when the other path already won —
+    caller must then NOT surface the event).
+
+    Push history of this hook (it keeps flip-flopping; record BOTH rationales
+    so the next change is made knowingly):
+      - 2026-06-03 removed: "completion surfaces as a live continuation turn"
+      - 2026-06-12 reinstated, presence-gated: that rationale only holds when
+        someone is watching
+      - 2026-06-12 removed again (user decision, same day): a task settling is
+        not worth a buzz even when away — its OUTPUT generally feeds the next
+        turn; the turn-done push (chat.py _handle_result_message) is the one
+        notification the user wants, and queue-paused-on-error still pushes
+        because that one means "Muse is stuck waiting for YOU".
+    `status` stays in the signature: callers still report it, and it documents
+    the terminal kinds should the push ever come back.
+    """
+    settled = _settle_background_task(session_id, task_id)
+    if not settled:
+        return False
+    # NO push here — see docstring. `status` intentionally unused.
+    _ = status
+    return True
 
 
 def _render_continuation_message(msg, state: dict):
@@ -5493,14 +5700,26 @@ async def _watch_inflight_tasks(
         _remember_recent_turn(session_id, b)
 
     msg_iter = client.receive_messages().__aiter__()
+    # Status of the most recent settle. A USER-STOPPED task almost never
+    # produces an auto-continue reaction (the CLI treats the stop as user
+    # intent), so waiting the full _CONTINUATION_GRACE leaves the attached
+    # frontend spinning "streaming…" for 60 idle seconds after the card
+    # already flipped ⏹ (2026-06-11 footer complaint). Use a short grace
+    # for stopped settles; a reaction that somehow arrives later is not
+    # lost — it buffers in the SDK queue and the next turn's in-turn
+    # dispatch drains it.
+    last_settle_status: str | None = None
     try:
         async with asyncio.timeout(_TASK_WATCH_TIMEOUT):
             while True:
                 # Once every task has settled and we're only waiting on the
                 # auto-continue, cap the read so a task that produces no
                 # continuation can't pin the client for the full watch timeout.
-                read_to = (_CONTINUATION_GRACE
-                           if (not pending and cont is not None) else None)
+                read_to = None
+                if not pending and cont is not None:
+                    read_to = (_STOPPED_CONTINUATION_GRACE
+                               if last_settle_status == "stopped"
+                               else _CONTINUATION_GRACE)
                 try:
                     if read_to is not None:
                         msg = await asyncio.wait_for(
@@ -5514,24 +5733,93 @@ async def _watch_inflight_tasks(
                     # open continuation and stop — all tasks already settled.
                     break
 
-                notif_text = _usermsg_task_notification_text(msg)
-                notifs = _parse_task_notifications(notif_text) if notif_text else []
-                if notifs:
-                    # IDLE completion path: the user launched a bg task then
-                    # went quiet, so its terminal <task-notification> arrives
-                    # in the gap between turns (no live turn to catch it). Open
-                    # a continuation and publish task_notification per record
-                    # (the FE flips the launching card → ✅ AND, via the /active
-                    # belt, reconnects to stream the auto-continue that follows).
-                    # Gate each emit on _settle_background_task so a task the
-                    # in-turn dispatch already surfaced isn't double-fired here.
-                    # Suppress the raw XML by NOT falling through to
-                    # _render_continuation_message (this branch consumes it).
+                if isinstance(msg, TaskNotificationMessage):
+                    # PRIMARY typed path. Phase-0 probe (2026-06-11, CLI
+                    # 2.1.141 + SDK 0.2.95) confirmed the terminal
+                    # TaskNotificationMessage IS delivered typed, out-of-band
+                    # after the turn's ResultMessage — exactly what this
+                    # watcher drains. Gate on _settle_background_task so a
+                    # task the in-turn dispatch already surfaced isn't
+                    # double-fired here.
+                    tid = getattr(msg, "task_id", "") or ""
+                    won_typed = _on_task_settled(
+                        session_id, tid, status=getattr(msg, "status", None))
+                    last_settle_status = getattr(msg, "status", None)
+                    sys.stderr.write(
+                        f"[chat] task watcher: typed notification "
+                        f"sid={session_id[:8]} task={tid} "
+                        f"status={last_settle_status} won={won_typed}\n")
+                    pending.pop(tid, None)
+                    if won_typed:
+                        if cont is None:
+                            await _open_continuation()
+                        if cont is not None:
+                            cont.publish({"event": "task_notification",
+                                          "data": json.dumps({
+                                "task_id": tid,
+                                "tool_use_id": getattr(msg, "tool_use_id", None),
+                                "status": getattr(msg, "status", None),
+                                "summary": getattr(msg, "summary", None),
+                                "output_file": getattr(msg, "output_file", None),
+                                "usage": dict(getattr(msg, "usage", None) or {}),
+                            })})
+                elif isinstance(msg, TaskStartedMessage):
+                    # A task launched DURING the auto-continue reaction (the
+                    # model can run tools in that turn, including Bash
+                    # run_in_background). Register it exactly like the
+                    # in-turn dispatch would — pending + pin + description —
+                    # so THIS watcher keeps covering it after the
+                    # continuation closes. Without this, the launch was
+                    # invisible (no card, no pin, no watcher) and its
+                    # terminal notification buffered unread until the next
+                    # user turn (2026-06-11 sleep-300 bug).
+                    tid = getattr(msg, "task_id", "") or ""
+                    desc = getattr(msg, "description", None)
+                    if tid:
+                        pending[tid] = desc
+                        _sessions_with_inflight_tasks.setdefault(
+                            session_id, set()).add(tid)
+                        if desc:
+                            _bg_task_descriptions[tid] = desc
+                        sys.stderr.write(
+                            f"[chat] task watcher: typed start "
+                            f"sid={session_id[:8]} task={tid}\n")
+                    if cont is not None:
+                        cont.publish({"event": "task_started",
+                                      "data": json.dumps({
+                            "task_id": tid,
+                            "tool_use_id": getattr(msg, "tool_use_id", None),
+                            "description": desc,
+                            "task_type": getattr(msg, "task_type", None),
+                        })})
+                elif isinstance(msg, TaskProgressMessage):
+                    if cont is not None:
+                        cont.publish({"event": "task_progress",
+                                      "data": json.dumps({
+                            "task_id": getattr(msg, "task_id", "") or "",
+                            "tool_use_id": getattr(msg, "tool_use_id", None),
+                            "last_tool_name": getattr(
+                                msg, "last_tool_name", None),
+                            "usage": dict(getattr(msg, "usage", None) or {}),
+                        })})
+                elif (notifs := _parse_task_notifications(
+                        _usermsg_task_notification_text(msg))):
+                    # FALLBACK text path: terminal completion arrived as a
+                    # user-text <task-notification> XML record instead of the
+                    # typed message (older CLI, or a CLI regression). Warn so
+                    # we notice fallback traffic — the typed branch above is
+                    # the supported contract.
+                    sys.stderr.write(
+                        f"[chat] task fallback: watcher settled via "
+                        f"<task-notification> XML, typed message missed "
+                        f"sid={session_id}\n")
                     won = [n for n in notifs
-                           if _settle_background_task(
-                               session_id, n.get("task_id") or "")]
+                           if _on_task_settled(
+                               session_id, n.get("task_id") or "",
+                               status=n.get("status") or None)]
                     for n in notifs:
                         pending.pop(n.get("task_id") or "", None)
+                        last_settle_status = n.get("status") or None
                     if won and cont is None:
                         await _open_continuation()
                     for n in won:
@@ -5544,25 +5832,6 @@ async def _watch_inflight_tasks(
                                 "summary": n.get("summary") or None,
                                 "output_file": n.get("output_file") or None,
                             })})
-                elif isinstance(msg, TaskNotificationMessage):
-                    # Typed-message path — kept for a future SDK that delivers
-                    # TaskNotificationMessage directly. Dead in today's stream.
-                    tid = getattr(msg, "task_id", "") or ""
-                    if cont is None:
-                        await _open_continuation()
-                    status = getattr(msg, "status", None)
-                    if cont is not None:
-                        cont.publish({"event": "task_notification",
-                                      "data": json.dumps({
-                            "task_id": tid,
-                            "tool_use_id": getattr(msg, "tool_use_id", None),
-                            "status": status,
-                            "summary": getattr(msg, "summary", None),
-                            "output_file": getattr(msg, "output_file", None),
-                            "usage": dict(getattr(msg, "usage", None) or {}),
-                        })})
-                    _settle_background_task(session_id, tid)
-                    pending.pop(tid, None)
                 elif isinstance(msg, ResultMessage):
                     # End of the CLI's auto-continue reaction — close the
                     # continuation. If tasks remain in flight, keep reading for
@@ -5601,6 +5870,9 @@ async def _watch_inflight_tasks(
                 await _close_continuation()
             except Exception:
                 pass
+        sys.stderr.write(
+            f"[chat] task watcher exit sid={session_id[:8]} "
+            f"pending_left={sorted(pending)}\n")
         # Only clear the registry slot if it still points at us (a fresh
         # watcher may have replaced it after a handoff).
         if _task_watchers.get(session_id) is asyncio.current_task():
@@ -5645,6 +5917,9 @@ def _spawn_task_watcher(
     old = _task_watchers.get(session_id)
     if old is not None and not old.done():
         old.cancel()
+    sys.stderr.write(
+        f"[chat] task watcher spawned sid={session_id[:8]} "
+        f"pending={sorted(pending)}\n")
     _task_watchers[session_id] = asyncio.create_task(
         _watch_inflight_tasks(session_id, client, pending))
 
@@ -6176,25 +6451,31 @@ async def _start_turn(
             tool_use_id matches the prior ToolUseBlock; we look up its
             name from `tool_use_names` so the FE renderer (Bash terminal,
             Read gutter, …) can pick the right per-tool view."""
-            # PRIMARY background-task completion path. When the user keeps
-            # working while a bg task runs, its terminal <task-notification>
-            # arrives MID-TURN as a UserMessage (not a typed message, not a
-            # ToolResultBlock) inside this same turn's stream. Surface it live
-            # here: flip the launching card → ✅ and settle the task. The
-            # model's auto-continue reaction then streams as normal
-            # AssistantMessages later in this very turn — no waiting, no idle
-            # watcher needed. (The cross-turn watcher only covers the case
-            # where the user went idle after launching.)
+            # FALLBACK background-task completion path. The supported
+            # contract is the typed TaskNotificationMessage (handled by
+            # _handle_task_message — Phase-0 probe 2026-06-11 confirmed CLI
+            # 2.1.141 delivers it). Some CLI builds additionally/instead
+            # round-trip the terminal completion as a UserMessage whose
+            # content is the raw <task-notification> XML; consume it here so
+            # the card still flips and the bubble never renders raw XML.
+            # _settle_background_task dedups the two paths — whichever
+            # observes the terminal signal first wins, the loser no-ops.
             _notif_text = _usermsg_task_notification_text(msg)
             _notifs = _parse_task_notifications(_notif_text) if _notif_text else []
             if _notifs:
                 for n in _notifs:
                     tid = n.get("task_id") or ""
-                    # Dedup against the cross-turn watcher: only the path that
-                    # settles first surfaces the completion (sync check, no
-                    # await between gate and emit → no double-fire).
-                    if tid and not _settle_background_task(session_id, tid):
+                    # Dedup against the typed path / cross-turn watcher: only
+                    # the path that settles first surfaces the completion
+                    # (sync check, no await between gate and emit → no
+                    # double-fire).
+                    if tid and not _on_task_settled(
+                            session_id, tid, status=n.get("status") or None):
                         continue
+                    sys.stderr.write(
+                        f"[chat] task fallback: in-turn settle via "
+                        f"<task-notification> XML, typed message missed "
+                        f"sid={session_id} task={tid}\n")
                     inflight_tasks.pop(tid, None)
                     yield {"event": "task_notification", "data": json.dumps({
                         "task_id": tid,
@@ -6213,15 +6494,21 @@ async def _start_turn(
                         rendered = _render_tool_result(block, tool_name=tname)
                         yield {"event": "tool_result",
                                "data": json.dumps(rendered)}
-                        # Bash run_in_background=true launches carry no typed
-                        # TaskStartedMessage — only this tool_result text. Sniff
-                        # it so the task lands in inflight_tasks; otherwise the
-                        # turn-end watcher never spawns and the post-completion
-                        # auto-continue never streams live (see _parse_bg_launch).
+                        # FALLBACK launch detection. The supported contract is
+                        # the typed TaskStartedMessage (Phase-0 probe
+                        # 2026-06-11: CLI 2.1.141 emits it BEFORE this
+                        # tool_result, so `tid in inflight_tasks` already holds
+                        # and this sniff no-ops). Kept for older CLIs / a CLI
+                        # that changes ordering: without it the turn-end
+                        # watcher never spawns (see _parse_bg_launch).
                         launch = _parse_bg_launch(rendered.get("text") or "")
                         if launch and tu_id:
                             tid = launch["task_id"]
                             if tid and tid not in inflight_tasks:
+                                sys.stderr.write(
+                                    f"[chat] task fallback: bg launch detected "
+                                    f"via tool_result sniff, TaskStartedMessage "
+                                    f"missed sid={session_id} task={tid}\n")
                                 desc = bg_launch_desc.get(tu_id)
                                 inflight_tasks[tid] = {
                                     "tool_use_id": tu_id,
@@ -6297,6 +6584,9 @@ async def _start_turn(
                 })}
             elif isinstance(msg, TaskNotificationMessage):
                 tid = getattr(msg, "task_id", "") or ""
+                sys.stderr.write(
+                    f"[chat] in-turn typed notification sid={session_id[:8]} "
+                    f"task={tid} status={getattr(msg, 'status', None)}\n")
                 # Drop from the per-turn in-flight set so it isn't handed to the
                 # cross-turn watcher (it settled in-turn).
                 inflight_tasks.pop(tid, None)
@@ -6313,11 +6603,14 @@ async def _start_turn(
                 })}
                 # In-turn settle (the rare case where a background task finishes
                 # before this turn's ResultMessage). The card already flipped via
-                # the task_notification event above — here we just unpin. _settle
-                # dedups via _sessions_with_inflight_tasks so the in-turn and
-                # cross-turn paths never double-unpin the same task_id. No bell:
-                # an in-turn completion is already visible live in this stream.
-                _settle_background_task(session_id, tid)
+                # the task_notification event above — here we just unpin +
+                # notify. _on_task_settled dedups via
+                # _sessions_with_inflight_tasks so the in-turn and cross-turn
+                # paths never double-unpin the same task_id, and its push is
+                # presence-gated: a user watching this live stream never gets
+                # buzzed, a user away from every screen does (e.g. a queued
+                # turn running headless).
+                _on_task_settled(session_id, tid, status=status)
 
         async def _handle_rate_limit(msg):
             """SDK RateLimitEvent → record the window's RateLimitInfo and emit a
@@ -6566,8 +6859,16 @@ async def _start_turn(
                 from . import presence as _presence
                 if _presence.recently_active():
                     # User is at one of their devices — they'll see the
-                    # reply in-app. Skip the push fan-out entirely.
-                    pass
+                    # reply in-app. Skip the push fan-out entirely. Log it:
+                    # a silently-skipped push is indistinguishable from a
+                    # broken pipeline without this line (2026-06-12 lesson).
+                    # None-safe: see task-settled site — age can be None
+                    # even when recently_active() returned True.
+                    _age = _presence.last_seen_age()
+                    _age_s = f"{_age:.0f}s" if _age is not None else "?"
+                    sys.stderr.write(
+                        f"[push] turn-done skipped (presence "
+                        f"age={_age_s}) sid={session_id}\n")
                 else:
                     try:
                         from . import push as _push
@@ -6598,6 +6899,7 @@ async def _start_turn(
                             body=_body,
                             url=f"/?session={session_id}",
                             tag=f"turn-{session_id}",
+                            context=f"turn-done {session_id[:8]}",
                         )
                     except Exception as e:
                         sys.stderr.write(f"[chat] turn push failed: {e}\n")
@@ -6639,6 +6941,16 @@ async def _start_turn(
                     await asyncio.to_thread(_jc.clean_session, session_id)
                 except Exception as e:
                     sys.stderr.write(f"[chat] jsonl cleanup failed: {e}\n")
+            # SDK reports turn-level failures THROUGH ResultMessage, not as
+            # exceptions: max-turns / budget exceeded, permission denied,
+            # API errors all arrive as a normal ResultMessage with
+            # is_error=True (+ subtype / errors detail). Surface them in the
+            # done payload so the FE can render a failure state — previously
+            # these turns looked identical to successes in UI and history.
+            _is_error = bool(getattr(msg, "is_error", False))
+            _subtype = getattr(msg, "subtype", None)
+            _errors = getattr(msg, "errors", None) or []
+            _api_error_status = getattr(msg, "api_error_status", None)
             yield {"event": "done", "data": json.dumps({
                 "duration_ms": getattr(msg, "duration_ms", None),
                 "total_cost_usd": cost,
@@ -6648,6 +6960,10 @@ async def _start_turn(
                 # green-dot tab unread badge would be wrong for a user-
                 # cancelled turn — they clicked stop, they know).
                 "cancelled": was_cancelled,
+                "is_error": _is_error,
+                "result_subtype": _subtype,
+                "errors": [str(e) for e in _errors],
+                "api_error_status": _api_error_status,
                 # turn_usage: cumulative (ResultMessage.usage). FE should
                 # prefer session_usage.context_* for window display. Will be
                 # removed once FE is fully migrated.
@@ -6797,6 +7113,17 @@ async def _start_turn(
                     # must pause on these exactly like an exception-path error.
                     if isinstance(ev, dict) and ev.get("event") == "error":
                         turn_errored = True
+                    # SDK-level failures arrive as a NORMAL done event with
+                    # is_error=True (max turns / budget / permission denied /
+                    # API error — see _handle_result_message). Treat them as
+                    # errors too so the queue pauses instead of headlessly
+                    # cascading the next item onto a failing session.
+                    elif isinstance(ev, dict) and ev.get("event") == "done":
+                        try:
+                            if json.loads(ev.get("data") or "{}").get("is_error"):
+                                turn_errored = True
+                        except (ValueError, TypeError):
+                            pass
                     broadcast.publish(ev)
         except asyncio.TimeoutError:
             turn_errored = True
@@ -6868,6 +7195,13 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
         try:
             from . import presence as _presence
             if _presence.recently_active():
+                # None-safe: see task-settled site — age can be None
+                # even when recently_active() returned True.
+                _age = _presence.last_seen_age()
+                _age_s = f"{_age:.0f}s" if _age is not None else "?"
+                sys.stderr.write(
+                    f"[push] queue-paused skipped (presence "
+                    f"age={_age_s}) sid={session_id}\n")
                 return
             from . import push as _push
             sname = ""
@@ -6884,6 +7218,7 @@ def _notify_queue_paused_on_error(session_id: str) -> None:
                 body="队列已暂停（上一条出错），点开查看",
                 url=f"/?session={session_id}",
                 tag=f"queue-paused-{session_id}",
+                context=f"queue-paused {session_id[:8]}",
             )
         except Exception as e:
             sys.stderr.write(f"[chat] queue-paused push failed: {e}\n")
@@ -6910,10 +7245,22 @@ async def _maybe_drain_queue(session_id: str) -> None:
     item = sess.dequeue_message(session_id)
     if item is None:
         return
+    # Replay under the permission mode snapshotted at enqueue time. Items
+    # from before the snapshot existed (or enqueued without one) fail CLOSED
+    # to "default" — requiring tool approval is the safe direction; the old
+    # behavior (falling through to bypassPermissions) let queued messages
+    # skip approval the user's UI said was required.
+    perm = (item.get("permission") or "").strip() or "default"
+    if perm not in _VALID_PERMISSION_MODES:
+        # Headless context — can't 400. An unknown persisted value (pre-
+        # validation enqueue, hand-edited queue file) fails CLOSED to
+        # "default" rather than crashing the drain or reaching the SDK.
+        perm = "default"
     try:
         await _start_turn(
             session_id,
             item.get("text", ""),
+            permission=perm,
             image_ids=item.get("image_ids", ""),
         )
     except _TurnBusy:

@@ -45,16 +45,32 @@ self.addEventListener("push", (event) => {
   // multi-device (desktop SSE alive => phone push suppressed too).
   // Moving the decision client-side fixes that.
   event.waitUntil((async () => {
-    try {
-      const clients = await self.clients.matchAll({
-        type: "window",
-        includeUncontrolled: true,
-      });
-      const anyVisible = clients.some(c => c.visibilityState === "visible");
-      if (anyVisible) return;   // foreground client will render the reply
-    } catch (_) {
-      // matchAll failure (rare) — fall through and show, so we err on
-      // the side of NOT silently dropping notifications.
+    // `force` payloads (settings-page test push) skip the visibility
+    // check entirely — the user pressing "send test push" necessarily
+    // has a visible muselab window, and suppressing the test on that
+    // very device would make the diagnostic look broken.
+    if (!data.force) {
+      try {
+        const clients = await self.clients.matchAll({
+          type: "window",
+          includeUncontrolled: true,
+        });
+        const anyVisible = clients.some(c => c.visibilityState === "visible");
+        if (anyVisible) {
+          // Foreground client renders the reply itself — but it may not know
+          // about it yet (e.g. a scheduler run finishing in the background
+          // server-side). Tell every client to refresh unread/history state
+          // so the bell badge stays live instead of silently swallowing the
+          // event with no in-app trace.
+          for (const c of clients) {
+            try { c.postMessage({ type: "muselab/push-suppressed", url, tag }); } catch (_) {}
+          }
+          return;
+        }
+      } catch (_) {
+        // matchAll failure (rare) — fall through and show, so we err on
+        // the side of NOT silently dropping notifications.
+      }
     }
     return self.registration.showNotification(title, opts);
   })());
@@ -81,8 +97,18 @@ self.addEventListener("notificationclick", (event) => {
     }
     // If muselab is already open in a tab, focus it. focus() can't navigate,
     // so also postMessage the target session id and let the app open it.
+    // Match by origin + scope-path PREFIX on the parsed URL — the old
+    // `c.url.includes(scope)` substring test, with scope "/" expanding to
+    // "https://host/", matched EVERY same-origin window (e.g. a raw-file
+    // preview opened top-level) and could focus the wrong page.
+    const scopeUrl = new URL(self.registration.scope);
     for (const c of all) {
-      if (c.url.includes(self.registration.scope) && "focus" in c) {
+      let cu = null;
+      try { cu = new URL(c.url); } catch (_) { continue; }
+      const isApp = cu.origin === scopeUrl.origin
+        && cu.pathname.startsWith(scopeUrl.pathname)
+        && !cu.pathname.startsWith("/api/");
+      if (isApp && "focus" in c) {
         if (sessionId) {
           try { c.postMessage({ type: "muselab/open-session", id: sessionId }); } catch {}
         }

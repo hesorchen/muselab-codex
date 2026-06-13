@@ -487,16 +487,21 @@ def delete_task(tid: str) -> bool:
             return False
         mode = _effective_session_mode(t)
         sid = t.get("session_id")
-        if mode == "reuse" and sid:
-            try:
-                from . import sessions as sess
-                sess.delete_session(sid)
-            except Exception as e:
-                sys.stderr.write(
-                    f"[scheduler] delete_task({tid}): bound session {sid} "
-                    f"cleanup failed: {e}\n")
         _save_state()
-        return True
+    # Cascade OUTSIDE the lock — the purge touches disk (SDK JSONL, sidecar,
+    # attachments) and must not stall other scheduler state operations.
+    # purge_session_storage is the same full-cleanup path the HTTP session
+    # delete uses; the old sess.delete_session-only call left the SDK JSONL
+    # behind, so the "deleted" session could re-appear in the session list.
+    if mode == "reuse" and sid:
+        try:
+            from .chat import purge_session_storage
+            purge_session_storage(sid)
+        except Exception as e:
+            sys.stderr.write(
+                f"[scheduler] delete_task({tid}): bound session {sid} "
+                f"cleanup failed: {e}\n")
+    return True
 
 
 def list_history(limit: int = 50) -> list[dict]:
@@ -680,6 +685,21 @@ async def _execute_task(task: dict) -> None:
                         if isinstance(block, TextBlock):
                             reply_text += getattr(block, "text", "") or ""
                 elif isinstance(msg, ResultMessage):
+                    # The SDK reports turn-level failures (max turns, budget
+                    # exceeded, permission denied, API errors) THROUGH a
+                    # normal ResultMessage with is_error=True — not as an
+                    # exception. Without this check the run was recorded as
+                    # ok and the user saw a "success" entry with whatever
+                    # partial text had streamed.
+                    if getattr(msg, "is_error", False):
+                        _subtype = getattr(msg, "subtype", None) or "error"
+                        _errs = getattr(msg, "errors", None) or []
+                        _detail = "; ".join(str(e) for e in _errs)
+                        error = (f"SDK result error ({_subtype})"
+                                 + (f": {_detail}" if _detail else ""))
+                        sys.stderr.write(
+                            f"[scheduler] task {tid} ({task['name']}) "
+                            f"result is_error: {error}\n")
                     break
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
@@ -725,8 +745,16 @@ async def _execute_task(task: dict) -> None:
                 from . import presence as _presence
                 if _presence.recently_active():
                     # User is at their screen — UI badge + foreground vibrate
-                    # handle the notification. Don't double-buzz.
-                    pass
+                    # handle the notification. Don't double-buzz. Leave a
+                    # journal line so a "scheduler never pushes" report can
+                    # be told apart from an actual delivery failure.
+                    # None-safe: a device can flip to hidden between
+                    # recently_active() and this call (see chat.py sites).
+                    _age = _presence.last_seen_age()
+                    _age_s = f"{_age:.0f}s" if _age is not None else "?"
+                    sys.stderr.write(
+                        f"[push] sched skipped (presence "
+                        f"age={_age_s}) task={tid}\n")
                 else:
                     from . import push as _push
                     # Prefix with ⏰ so the notification banner is universally
@@ -748,7 +776,8 @@ async def _execute_task(task: dict) -> None:
                     # the scheduler fans out task notifications.
                     await asyncio.to_thread(
                         _push.send_to_all, title=title, body=body or "—",
-                        url="/", tag=f"task-{tid}")
+                        url="/", tag=f"task-{tid}",
+                        context=f"sched {tid}")
             except Exception as e:
                 sys.stderr.write(f"[scheduler] push notify failed for {tid}: {e}\n")
 

@@ -1157,6 +1157,14 @@ function portal() {
             // when a fresh window is spawned).
             const id = ev.data && ev.data.id;
             if (id) this._openSessionFromDeeplink(id);
+          } else if (t === "muselab/push-suppressed") {
+            // The SW swallowed a push because a window is visible — but
+            // the underlying event (scheduler run done, queue paused, …)
+            // still happened server-side. Refresh the unread badge and
+            // session list so the in-app state reflects it without
+            // waiting for the next heartbeat tick.
+            this.fetchSchedulerUnread();
+            this.refreshSessions();
           }
         });
       }
@@ -1642,24 +1650,57 @@ function portal() {
     // visibility-change to "visible" (so coming back into focus
     // re-arms the suppression before the next push could fire).
     _startPresence() {
+      // Stable per-device id — only used by the backend to keep one
+      // presence record per device (so the phone reporting "hidden"
+      // doesn't clobber the desktop's "visible"). Random UUID, no auth
+      // meaning. localStorage can throw in private-browsing modes;
+      // fall back to a per-page id (degrades to v1-ish behavior).
+      let deviceId = "";
+      try {
+        deviceId = localStorage.getItem("muselab_device_id") || "";
+        if (!deviceId) {
+          deviceId = (crypto.randomUUID && crypto.randomUUID())
+            || (Date.now().toString(36) + Math.random().toString(36).slice(2));
+          localStorage.setItem("muselab_device_id", deviceId);
+        }
+      } catch (_) {
+        deviceId = "ephemeral-" + Math.random().toString(36).slice(2);
+      }
+      const report = (visible) => {
+        try {
+          fetch("/api/presence", {
+            method: "POST",
+            headers: { ...this.hdr(), "Content-Type": "application/json" },
+            body: JSON.stringify({ device_id: deviceId, visible }),
+            // The hidden report races the browser freezing this page on
+            // background-switch; keepalive lets it complete after the
+            // page is gone (sendBeacon can't carry our auth header).
+            keepalive: !visible,
+          }).catch(() => {});   // silent — presence is best-effort
+        } catch (_) { /* ignore */ }
+      };
       const ping = () => {
         if (typeof document === "undefined") return;
         if (document.visibilityState !== "visible") return;
-        try {
-          fetch("/api/presence", { method: "POST", headers: this.hdr() })
-            .catch(() => {});   // silent — presence is best-effort
-        } catch (_) { /* ignore */ }
+        report(true);
       };
       // Fire once on init so we don't wait up to 15s for the first ping.
       ping();
       if (this._presenceTimer) clearInterval(this._presenceTimer);
       this._presenceTimer = setInterval(ping, 15_000);
-      // Tab returning to foreground → ping immediately. Without this, a
-      // user who just opened the laptop after a 5-minute lunch break
-      // might still get a phone push for a turn that finishes in the
-      // first 15s of being back.
       document.addEventListener("visibilitychange", async () => {
-        if (document.visibilityState !== "visible") return;
+        if (document.visibilityState !== "visible") {
+          // Page just hid → tell the backend IMMEDIATELY so the next
+          // turn-done push isn't swallowed by a still-warm heartbeat.
+          // (Pre-2026-06-12 the backend could only wait out the 30s
+          // grace window — any turn finishing inside it never pushed.)
+          report(false);
+          return;
+        }
+        // Tab returning to foreground → ping immediately. Without this, a
+        // user who just opened the laptop after a 5-minute lunch break
+        // might still get a phone push for a turn that finishes in the
+        // first 15s of being back.
         ping();                  // presence: re-arm push suppression
         this._pingHealth();      // health: refresh conn state immediately
         // Refresh the session list in case another device created/deleted
@@ -1669,6 +1710,10 @@ function portal() {
           await this.refreshSessions();
         } catch (_) {}
       });
+      // Belt-and-suspenders for navigations / tab close / iOS PWA kills
+      // where visibilitychange→hidden may not fire. Duplicate reports
+      // are harmless (last-writer-wins on the same device record).
+      window.addEventListener("pagehide", () => report(false));
     },
     async _pingHealth() {
       // Skip when tab is hidden — heartbeat purpose is "show user we're
@@ -3576,6 +3621,33 @@ function portal() {
       }
     },
 
+    // Stop a running background task via the SDK-native stop_task control
+    // request. No optimistic card flip here: the CLI acks the stop by
+    // emitting a task_notification with status='stopped' on the stream,
+    // which flows through the normal settle path (card → ⏹, unpin, toast)
+    // — single source of truth, no FE/BE state divergence.
+    async stopBackgroundTask(ts) {
+      if (!ts || !ts.task_id) return;
+      const zh = this.lang === "zh";
+      try {
+        const r = await fetch("/api/chat/sessions/" + this.currentId
+          + "/tasks/" + encodeURIComponent(ts.task_id) + "/stop",
+          { method: "POST", headers: this.hdr() });
+        if (r.ok) {
+          this.toast(zh ? "已请求停止任务" : "Stop requested", "info");
+        } else if (r.status === 409) {
+          // No live client — the task is dead-or-settled. Just inform; the
+          // poller's history-tail fallback reconciles a phantom ⏳ card
+          // within ~32s (no optimistic flip here either, same contract).
+          this.toast(zh ? "任务已不在运行" : "Task no longer running", "warn");
+        } else {
+          this.toast(zh ? "停止任务失败" : "Failed to stop task", "error");
+        }
+      } catch (e) {
+        this.toast(zh ? "停止任务失败" : "Failed to stop task", "error");
+      }
+    },
+
     async login() {
       this.loginErr = "";
       this.token = this.tokenInput.trim();
@@ -4496,7 +4568,11 @@ function portal() {
         const r = await fetch("/api/chat/sessions/" + sid + "/queue", {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
-          body: JSON.stringify({ text: item.text || "", image_ids }),
+          // Snapshot the CURRENT permission mode with the item — the server
+          // drain replays the turn under this mode (fixes queued messages
+          // bypassing tool approval the UI said was required).
+          body: JSON.stringify({ text: item.text || "", image_ids,
+                                 permission: this.permission || "" }),
         });
         if (r.status === 409) {
           this.toast(this.lang === "zh"
@@ -4650,14 +4726,54 @@ function portal() {
             && document.visibilityState !== "visible") return;
         // Not viewing this session, or already streaming → retry next tick.
         if (this.currentId !== sid || this.streaming) return;
-        // PRIMARY completion path: a run_in_background task's terminal status
-        // round-trips through the session JSONL as a <task-notification> record
-        // (NOT a typed TaskNotificationMessage, so the cross-turn watcher's
-        // continuation never opens in practice). The backend history rebuild
-        // stamps the launching card's terminal task_status from that record;
-        // here we poll the history tail and reconcile it onto the live running
-        // cards so the badge flips ✅ in-place without a manual reload — then
-        // the next tick's _bgHasRunningCard check self-stops the poller.
+        // PRIMARY completion path (since the 2026-06-11 typed-message
+        // alignment): the cross-turn watcher reliably receives the typed
+        // TaskNotificationMessage and opens a continuation broadcast, so
+        // /active — a cheap, tiny JSON probe — discovers it on the next
+        // tick and reconnects in continuation mode; the replayed
+        // task_notification flips the card and streams the auto-continue.
+        // (The browser has no persistent SSE channel in the turn gap — the
+        // per-turn EventSource closes on done — so SOME polling is the only
+        // discovery mechanism; this probe is the lightest one.)
+        let contFound = false;
+        try {
+          const r = await fetch("/api/chat/sessions/" + sid + "/active",
+                                 { headers: this.hdr() });
+          if (r.ok) {
+            const d = await r.json();
+            if (d.active && d.continuation && !this.streaming
+                && this.currentId === sid) {
+              // Dedup: /active surfaces a finished continuation from the
+              // server's _recent_turns for the full 60s TTL, so if ANOTHER
+              // bg task keeps this poller alive the same continuation would
+              // be re-reconnected every 8s → duplicate reaction bubbles. Key
+              // on the continuation's started_at (unique epoch per broadcast)
+              // and replay each one at most once. The normal single-task case
+              // self-stops on the card flip and never reaches a second tick,
+              // but this makes the multi-task case safe too.
+              this._consumedConts = this._consumedConts || {};
+              const ckey = sid + ":" + d.started_at;
+              if (!this._consumedConts[ckey]) {
+                this._consumedConts[ckey] = true;
+                contFound = true;
+                this.send({ reconnect: true, continuation: true,
+                             startedAt: d.started_at });
+              }
+            }
+          }
+        } catch (_e) {}
+        if (contFound) return;   // continuation replay will flip the card
+        // FALLBACK reconciliation, every 4th tick (~32s): pull the history
+        // tail and stamp terminal task_status onto still-running cards. This
+        // covers the cases the /active probe can't see — the watcher died
+        // (server restart), the continuation's 60s TTL expired before a
+        // hidden tab came back, or an older CLI that only round-trips the
+        // <task-notification> JSONL record. Demoted from every-tick PRIMARY
+        // (it fetches an 80-message tail vs /active's ~100 bytes) on
+        // 2026-06-11 when the typed-message path made the continuation
+        // broadcast reliable.
+        this._bgContTickN = (this._bgContTickN || 0) + 1;
+        if (this._bgContTickN % 4 !== 0) return;
         try {
           const hr = await fetch("/api/chat/sessions/" + sid + "?tail=80",
                                   { headers: this.hdr() });
@@ -4680,32 +4796,6 @@ function portal() {
                   m.task_status = Object.assign({}, m.task_status, settled[m.id]);
                 }
               });
-            }
-          }
-        } catch (_e) {}
-        // BELT: the cross-turn continuation broadcast (works if a future SDK
-        // delivers a typed TaskNotificationMessage). Harmless no-op otherwise.
-        try {
-          const r = await fetch("/api/chat/sessions/" + sid + "/active",
-                                 { headers: this.hdr() });
-          if (!r.ok) return;
-          const d = await r.json();
-          if (d.active && d.continuation && !this.streaming
-              && this.currentId === sid) {
-            // Dedup: /active surfaces a finished continuation from the
-            // server's _recent_turns for the full 60s TTL, so if ANOTHER
-            // bg task keeps this poller alive the same continuation would be
-            // re-reconnected every 8s → duplicate reaction bubbles. Key on
-            // the continuation's started_at (unique epoch per broadcast) and
-            // replay each one at most once. The normal single-task case
-            // self-stops on the card flip and never reaches a second tick,
-            // but this makes the multi-task case safe too.
-            this._consumedConts = this._consumedConts || {};
-            const ckey = sid + ":" + d.started_at;
-            if (!this._consumedConts[ckey]) {
-              this._consumedConts[ckey] = true;
-              this.send({ reconnect: true, continuation: true,
-                           startedAt: d.started_at });
             }
           }
         } catch (_e) {}
@@ -6969,6 +7059,90 @@ function portal() {
       this.openTabIds = this.openTabIds.filter(x => x !== sid);
       if (this.tabState[sid]) delete this.tabState[sid];
       this.savePrefs();
+    },
+
+    // One-click bulk clear of stale history (footer of the session picker).
+    // Deletes every session whose last activity is older than 7 days, EXCEPT
+    // pinned ones and the currently-open session.
+    //
+    // The victim count CANNOT be computed client-side: this.sessions is only
+    // the most-recent paginated window (?limit=100), so old sessions — the
+    // very ones we want to clear — aren't loaded here. We ask the server
+    // (which scans the full list) for the count via dry_run, show it in the
+    // confirm dialog, then issue the real delete. The server stays the single
+    // source of truth for the victim set; the same days/keep_id predicate runs
+    // both passes so the count the user approved matches what gets deleted.
+    async purgeOldSessions() {
+      const zh = this.lang === "zh";
+      const DAYS = 7;
+      const body = { days: DAYS, keep_id: this.currentId || "" };
+      // Close the picker popup first — its z-index (1500) sits ABOVE the global
+      // confirm modal, so leaving it open would bury the confirm dialog behind
+      // the session list. The popup has done its job once the action fires.
+      this.sessionPickerOpen = false;
+      // 1) Ask the server how many would be deleted (no mutation).
+      let preview;
+      try {
+        const r = await fetch("/api/chat/sessions/purge-old", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ ...body, dry_run: true }),
+        });
+        if (!r.ok) { this.errToast("purge-old", await r.text()); return; }
+        preview = await r.json();
+      } catch (e) {
+        this.errToast("purge-old", String((e && e.message) || e));
+        return;
+      }
+      const n = (preview && preview.count) || 0;
+      if (n === 0) {
+        this.toast(zh ? "没有 7 天前的会话可清理" : "No sessions older than 7 days", "info", 2500);
+        return;
+      }
+      // 2) Confirm with the server-authoritative count.
+      const ok = await this.confirm({
+        title: zh ? "清理历史会话" : "Clear old sessions",
+        body: zh
+          ? `将删除 ${n} 个 7 天前的会话，不可恢复。置顶会话和当前会话会保留。`
+          : `Delete ${n} session(s) older than 7 days? This cannot be undone. Pinned sessions and the current session are kept.`,
+        okText: zh ? `删除 ${n} 个` : `Delete ${n}`,
+        danger: true,
+      });
+      if (!ok) return;
+      // 3) Real delete.
+      let resp;
+      try {
+        const r = await fetch("/api/chat/sessions/purge-old", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!r.ok) { this.errToast("purge-old", await r.text()); return; }
+        resp = await r.json();
+      } catch (e) {
+        this.errToast("purge-old", String((e && e.message) || e));
+        return;
+      }
+      // Tear down any open tabs / live streams for the deleted ids — mirror
+      // deleteSessionById's per-tab cleanup so we don't leak EventSources or
+      // leave phantom tabs pointing at gone sessions. ids come back from the
+      // server (it knows exactly what it removed, including rows we never had
+      // loaded locally).
+      const deletedIds = new Set((resp && resp.ids) || []);
+      for (const sid of deletedIds) {
+        const st = this.tabState[sid];
+        if (st) {
+          if (st.es) { try { st.es.close(); } catch {} }
+          if (st._streamTimer) clearInterval(st._streamTimer);
+          delete this.tabState[sid];
+        }
+        this._clearSessionWarnFlags(sid);
+      }
+      this.openTabIds = (this.openTabIds || []).filter(id => !deletedIds.has(id));
+      await this.refreshSessions();
+      this.savePrefs();
+      const cleared = (resp && resp.deleted) || 0;
+      this.toast(zh ? `已清理 ${cleared} 个历史会话` : `Cleared ${cleared} session(s)`, "success", 2500);
     },
 
     // Right-click context menu on a tab (or a row in the session picker).
@@ -9332,7 +9506,11 @@ function portal() {
       const zh = this.lang === "zh";
       const name = await this.prompt({
         title: zh ? "新建文件" : "New file",
-        body: (zh ? "在 " : "Inside ") + `/${dirNode.path}`,
+        // Root has no meaningful path to show ("在 /" reads broken); a
+        // subdirectory prompt keeps the location line — the hover "+" can
+        // be clicked on any row, so WHICH dir matters there.
+        body: dirNode.path
+          ? (zh ? "在 " : "Inside ") + `/${dirNode.path}` : "",
         value: "new.md",
       });
       if (!name) return;
@@ -9357,8 +9535,12 @@ function portal() {
     async doNewDir(dirNode) {
       const zh = this.lang === "zh";
       const name = await this.prompt({
-        title: zh ? "新建子目录" : "New subdirectory",
-        body: (zh ? "在 " : "Inside ") + `/${dirNode.path}`,
+        title: dirNode.path
+          ? (zh ? "新建子目录" : "New subdirectory")
+          : (zh ? "新建目录" : "New folder"),
+        // Same rule as doNewFile: no location line at root.
+        body: dirNode.path
+          ? (zh ? "在 " : "Inside ") + `/${dirNode.path}` : "",
         value: "",
       });
       if (!name) return;
@@ -10096,6 +10278,13 @@ function portal() {
       this.csvData = null;
       this.previewError = null;
       this.previewMode = "loading";
+      // Late-response guard: every fetch below is awaited with no token, so
+      // rapid A→B clicks could let A's slower response land AFTER B's and
+      // overwrite the visible preview with the wrong file's content. Capture
+      // the target now; `_stale()` checks it after every await — a stale
+      // response is silently dropped (B's own open owns the pane).
+      const targetPath = n.path;
+      const _stale = () => this.selected !== targetPath;
       const ext = name.split(".").pop().toLowerCase();
       if (["md", "markdown"].includes(ext)) {
         // Stay in "loading" until content actually arrives — renderMd() flips
@@ -10103,14 +10292,16 @@ function portal() {
         // the empty-file placeholder (previewMode==='md' && !rawText) during
         // the in-flight fetch. Failures route through _previewFail().
         const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
+        if (_stale()) return;
         if (r.ok) {
-          this.rawText = await r.text();
+          const body = await r.text();
+          if (_stale()) return;
+          this.rawText = body;
           // For large markdown the synchronous markdown-it + sanitize pass can
           // block the main thread long enough to make the click feel frozen
           // ("点开即卡"). Paint the loading spinner first, then render on the
           // next animation frame. The `selected` guard aborts the deferred
           // render if the user switched tabs while it was pending.
-          const targetPath = n.path;
           const renderMd = () => {
             if (this.selected !== targetPath) return;   // switched away mid-defer
             this.renderedMd = this.mdRender(this.rawText);
@@ -10143,8 +10334,10 @@ function portal() {
         // evaluation; cells show the last-cached value.
         const r = await fetch("/api/files/xlsx?path=" + encodeURIComponent(n.path),
                               { headers: this.hdr() });
+        if (_stale()) return;
         if (r.ok) {
           const data = await r.json();
+          if (_stale()) return;
           this.previewMode = "xlsx";
           this.xlsxSheets = data.sheets || [];
           this.xlsxActive = (this.xlsxSheets[0] && this.xlsxSheets[0].name) || "";
@@ -10165,6 +10358,7 @@ function portal() {
         this.csvPath = n.path;
         this.csvOffset = 0;
         await this.csvLoadPage();
+        if (_stale()) return;
         if (this.csvData) {
           this.previewMode = "csv";
         } else {
@@ -10184,11 +10378,14 @@ function portal() {
         // that the archive-scoped /api/files/read can't reach.
         const readUrl = opts.readUrl || ("/api/files/read?path=" + encodeURIComponent(n.path));
         const r = await fetch(readUrl, { headers: this.hdr() });
+        if (_stale()) return;
         if (r.ok) {
           // Read body BEFORE flipping previewMode → text, otherwise the
           // empty-file placeholder (previewMode==='text' && !rawText) flashes
           // during the await on a non-empty file.
-          this.rawText = await r.text();
+          const body = await r.text();
+          if (_stale()) return;
+          this.rawText = body;
           this.previewMode = "text";
           this.previewLang = this.hljsLang(n.path);
           if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
@@ -10206,12 +10403,23 @@ function portal() {
     async csvLoadPage() {
       if (!this.csvPath || this.csvLoading) return;
       this.csvLoading = true;
+      // Snapshot the request identity — by the time the response lands the
+      // user may have opened a DIFFERENT csv (openFile resets csvPath) or
+      // paged again. Writing a stale response into csvData would show the
+      // old file / old offset's rows under the new header.
+      const reqPath = this.csvPath;
+      const reqOffset = this.csvOffset;
+      const _csvStale = () =>
+        this.csvPath !== reqPath || this.csvOffset !== reqOffset;
       try {
-        const url = `/api/files/csv?path=${encodeURIComponent(this.csvPath)}`
-                    + `&offset=${this.csvOffset}&limit=${this.csvLimit}`;
+        const url = `/api/files/csv?path=${encodeURIComponent(reqPath)}`
+                    + `&offset=${reqOffset}&limit=${this.csvLimit}`;
         const r = await fetch(url, { headers: this.hdr() });
+        if (_csvStale()) return;
         if (r.ok) {
-          this.csvData = await r.json();
+          const data = await r.json();
+          if (_csvStale()) return;
+          this.csvData = data;
         } else {
           this.csvData = null;
           this.toast(this.lang === "zh" ? "CSV 解析失败" : "CSV parse failed",
@@ -13289,6 +13497,13 @@ function portal() {
       // back — which is the contract `streamSid` was supposed to enforce
       // all along.
       const sendSid = this.currentId;
+      // Snapshot model/permission alongside sendSid — the attachment-upload
+      // awaits below can span a tab switch, after which this.model /
+      // this.permission belong to the NEWLY focused session. Without the
+      // snapshot, session A's send could fire under session B's model and
+      // permission mode (D4 audit).
+      const sendModel = this.model;
+      const sendPermission = this.permission;
       // Reconnect mode: skip user-input validation + user-msg push.
       // Used by _reconnectActiveTurn() when loadSession discovers an
       // in-flight background turn on the current session — we just want
@@ -13553,8 +13768,10 @@ function portal() {
       // streaming guard will refuse to evict it). When streamSid === currentId
       // (the common case) this is a harmless re-promote of the front entry.
       this._promoteResident(streamSid);
-      streamState.streamingModel = this.model;
-      this.streamingModel = this.model;   // 锁定 — pending bubble 用它，不跟着 dropdown
+      streamState.streamingModel = sendModel;
+      // 锁定 — pending bubble 用它，不跟着 dropdown。只在 streamSid 仍是当前
+      // tab 时写 root 状态，否则只污染后台 tab 的显示。
+      if (streamSid === this.currentId) this.streamingModel = sendModel;
       // Start the wall-clock NOW, at submit-time — not later in es.onopen.
       // The previous setup waited for the SSE handshake (which can take
       // 1-3s on slow networks / cold backends) before the counter began
@@ -13607,32 +13824,54 @@ function portal() {
       // one-time ticket, open the SSE with ONLY the ticket in the URL.
       // Keeps the user's prompt and the auth token out of access logs /
       // browser history (EventSource can't send headers or a body).
-      // Falls back to the legacy query-param URL if the ticket POST
-      // fails (old backend / transient error) so sending never breaks.
+      // Legacy query-param fallback ONLY when the endpoint doesn't exist
+      // (old backend → 404/405). A 5xx or network blip must NOT silently
+      // downgrade to putting the prompt + token back into the URL — retry
+      // the ticket once, then surface the failure instead.
       let url;
-      try {
+      const _mintTicket = async () => {
         const tr = await fetch("/api/chat/stream/start", {
           method: "POST",
           headers: Object.assign({ "Content-Type": "application/json" }, this.hdr()),
           body: JSON.stringify({
             prompt: text,
             session_id: streamSid,
-            model: this.model,
-            permission: this.permission,
+            model: sendModel,
+            permission: sendPermission,
             image_ids: attachIds.length ? attachIds.join(",") : "",
           }),
         });
-        if (!tr.ok) throw new Error("ticket " + tr.status);
-        const td = await tr.json();
-        url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
-      } catch (_) {
-        url = "/api/chat/stream"
-          + "?prompt=" + encodeURIComponent(text)
-          + "&session_id=" + encodeURIComponent(streamSid)
-          + "&model=" + encodeURIComponent(this.model)
-          + "&permission=" + encodeURIComponent(this.permission)
-          + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
-          + "&token=" + encodeURIComponent(this.token);
+        return tr;
+      };
+      try {
+        let tr = await _mintTicket();
+        if (tr.status === 404 || tr.status === 405) {
+          // Old backend without /stream/start — legacy URL is the contract.
+          url = "/api/chat/stream"
+            + "?prompt=" + encodeURIComponent(text)
+            + "&session_id=" + encodeURIComponent(streamSid)
+            + "&model=" + encodeURIComponent(sendModel)
+            + "&permission=" + encodeURIComponent(sendPermission)
+            + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
+            + "&token=" + encodeURIComponent(this.token);
+        } else {
+          if (!tr.ok) {
+            // Transient 5xx — one retry before giving up.
+            tr = await _mintTicket();
+          }
+          if (!tr.ok) throw new Error("ticket " + tr.status);
+          const td = await tr.json();
+          url = "/api/chat/stream?ticket=" + encodeURIComponent(td.ticket);
+        }
+      } catch (_e) {
+        // Could not mint a ticket (server error / network) — fail the send
+        // visibly rather than leaking prompt+token into the URL.
+        this._markDone(streamSid);
+        this.toast(this.lang === "zh"
+          ? "发送失败：无法建立流式连接，请重试"
+          : "Send failed: could not start the stream — please retry",
+          "error", 4000);
+        return;
       }
       const es = new EventSource(url);
       streamState.es = es; this.es = es;
@@ -13688,7 +13927,7 @@ function portal() {
       // tab is active).
       let curBubble = null;
       let acc = "";
-      const modelForBubble = this.model;
+      const modelForBubble = sendModel;
       // Scroll only if the active tab is the one receiving the stream;
       // otherwise we'd yank the user away from whatever they're reading.
       const _scrollIfActive = () => {
@@ -13821,7 +14060,15 @@ function portal() {
         if (!toolUseId) return;
         const msgs = streamState.messages;
         for (let k = msgs.length - 1; k >= 0; k--) {
-          if (msgs[k] && msgs[k].id === toolUseId) {
+          // role check is LOAD-BEARING: the tool_result bubble carries the
+          // SAME toolu_xxx id as its tool_use card and sits AFTER it, so a
+          // reverse scan on id alone hits the tool_result and stamps
+          // task_status where no template renders it. task_started slipped
+          // through only because the typed message arrives BEFORE the
+          // tool_result; every TERMINAL notification arrived after and was
+          // silently swallowed — the ⏳ card never flipped live (2026-06-11).
+          if (msgs[k] && msgs[k].id === toolUseId
+              && msgs[k].role === "tool_use") {
             const prev = (merge && msgs[k].task_status) ? msgs[k].task_status : {};
             msgs[k].task_status = Object.assign({}, prev, patch);
             return;
@@ -13965,6 +14212,24 @@ function portal() {
           summary: d.summary || "",
           output_file: d.output_file || "",
         });
+        // User-perceivable settle feedback (mirrors the server's
+        // _on_task_settled which handles the away-from-screen case via
+        // presence-gated Web Push; this branch covers the at-screen case):
+        //   - toast, so a completion is noticed even when the card has
+        //     scrolled far off-screen;
+        //   - green unread dot when the launching session isn't the tab
+        //     being viewed (same affordance as a turn finishing elsewhere).
+        const zh = this.lang === "zh";
+        const label = st === "failed"
+          ? (zh ? "后台任务失败" : "Background task failed")
+          : st === "stopped"
+            ? (zh ? "后台任务已停止" : "Background task stopped")
+            : (zh ? "后台任务已完成" : "Background task finished");
+        this.toast(label, st === "failed" ? "error" : "info");
+        if (streamSid !== this.currentId) {
+          const ts = this.tabState[streamSid];
+          if (ts && !ts.streaming) ts.unread = true;
+        }
         _scrollIfActive();
       });
       es.addEventListener("rate_limit", ev => {
@@ -14152,6 +14417,18 @@ function portal() {
             { label: this.t("ctx.window_warn_action"), onClick: () => this.runCompact(streamSid, { skipConfirm: true }) },
           );
         }
+        // SDK-level turn failure (max turns / budget / permission denied /
+        // API error) arrives as a NORMAL done event with is_error=true —
+        // previously rendered identically to success. Surface it.
+        if (d.is_error) {
+          const _detail = (Array.isArray(d.errors) && d.errors.length)
+            ? d.errors.join("; ")
+            : (d.result_subtype || "unknown");
+          this.toast(this.lang === "zh"
+            ? "本轮回复出错：" + _detail
+            : "Turn failed: " + _detail, "error", 6000);
+          if (curBubble) curBubble.error = _detail;
+        }
         // Pass the backend's `cancelled` flag through to _markDone so it
         // can skip the green-dot unread cue for user-cancelled turns.
         // The on-screen `done` handler runs only when the FE is still
@@ -14298,9 +14575,20 @@ function portal() {
         // bubble that never resolves.
         const delay = 800 * Math.pow(2, attempts - 1);
         setTimeout(async () => {
-          // User switched tabs / cancelled / page already navigated away?
-          // Don't surprise them by re-opening a stream they no longer want.
-          if (this.currentId !== streamSid) { _markDone(); _stopTimer(); this.streaming = false; return; }
+          // User switched to another tab mid-backoff. The ORIGIN tab's turn
+          // is still running on the server — don't _markDone() it (that
+          // abandons the transparent reconnect AND, via `this.streaming`,
+          // wrongly unlocks/locks the CURRENT tab's composer which belongs
+          // to a different session). Keep tabState[streamSid].streaming
+          // true; when the user switches back, loadSession's
+          // _checkActiveTurn(streamSid) re-attaches (or loads the finished
+          // reply from disk). Only the timer is stopped — it writes
+          // root-level streamElapsed which is now another tab's display.
+          if (this.currentId !== streamSid) {
+            _stopTimer();
+            streamState._reconnectAttempts = 0;
+            return;
+          }
           // streamState.streaming is still true from initial send(); use
           // it as the in-flight gate _checkActiveTurn checks internally.
           try {
@@ -15513,10 +15801,29 @@ function portal() {
         const r = await fetch("/api/push/vapid-public", { headers: this.hdr() });
         if (!r.ok) throw new Error("vapid fetch failed: " + r.status);
         const { public_key } = await r.json();
-        const sub = await reg.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: this._urlsafeB64ToBytes(public_key),
-        });
+        // Reuse an existing subscription when one is already registered —
+        // calling subscribe() again with a (different) key on Chrome throws
+        // InvalidStateError, breaking the "toggle on again" path. If the
+        // existing subscription was minted under a DIFFERENT VAPID key
+        // (server rotated), drop it first so the fresh subscribe succeeds.
+        let sub = await reg.pushManager.getSubscription();
+        if (sub) {
+          const wantKey = this._urlsafeB64ToBytes(public_key);
+          const haveKey = sub.options && sub.options.applicationServerKey
+            ? new Uint8Array(sub.options.applicationServerKey) : null;
+          const sameKey = haveKey && haveKey.length === wantKey.length
+            && haveKey.every((b, i) => b === wantKey[i]);
+          if (!sameKey) {
+            try { await sub.unsubscribe(); } catch (_) {}
+            sub = null;
+          }
+        }
+        if (!sub) {
+          sub = await reg.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: this._urlsafeB64ToBytes(public_key),
+          });
+        }
         const sr = await fetch("/api/push/subscribe", {
           method: "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
@@ -15528,9 +15835,55 @@ function portal() {
           "success", 2500);
         return true;
       } catch (e) {
+        let msg = (e.message || String(e));
+        // Chromium-family browsers (Chrome / Edge / most Android vendor
+        // browsers) register push through Google's FCM. When FCM is
+        // unreachable (mainland-China network without a proxy, or a ROM
+        // without Google services), subscribe() throws an AbortError with
+        // the opaque "Registration failed - push service error". Append
+        // an actionable explanation instead of leaving the raw string.
+        if (/push service error|registration failed/i.test(
+              msg + " " + (e.name || ""))) {
+          msg += this.lang === "zh"
+            ? "（此浏览器的推送依赖 Google FCM；当前网络连不上 FCM 时无法订阅——挂代理后重试，或改用 iOS PWA / 桌面浏览器）"
+            : " (this browser registers push via Google FCM; it is unreachable on your current network — retry behind a proxy, or use an iOS PWA / desktop browser)";
+        }
         this.toast((this.lang === "zh" ? "开启失败：" : "Push subscribe failed: ")
-          + (e.message || e), "error", 5000);
+          + msg, "error", 6000);
         return false;
+      }
+    },
+    async pushTest() {
+      // End-to-end self-check: backend fans a force-flagged payload out to
+      // every stored subscription (bypasses the presence gate; sw.js skips
+      // its visibility suppression on `force`). Surfaces the raw
+      // {sent, dropped, errors} so a zombie subscription or a push-service
+      // rejection is visible to the user in 10 seconds instead of a
+      // server-side debugging session (2026-06-12).
+      try {
+        const r = await fetch("/api/push/test",
+          { method: "POST", headers: this.hdr() });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const d = await r.json();
+        const errs = (d.errors || []).length;
+        const zh = this.lang === "zh";
+        if (!d.sent && !errs) {
+          this.toast(zh
+            ? "没有任何已订阅设备——先打开上面的通知开关"
+            : "No subscribed devices — enable the switch above first",
+            "warn", 4000);
+          return;
+        }
+        this.toast((zh
+          ? `测试推送已发：${d.sent} 成功`
+            + (d.dropped ? `，清除 ${d.dropped} 条失效订阅` : "")
+          : `Test push sent: ${d.sent} ok`
+            + (d.dropped ? `, ${d.dropped} dead dropped` : ""))
+          + (errs ? (zh ? `，${errs} 个错误` : `, ${errs} errors`) : ""),
+          errs ? "warn" : "success", 4000);
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "测试推送失败：" : "Test push failed: ")
+          + (e.message || e), "error", 4000);
       }
     },
     async pushUnsubscribe() {
@@ -15581,15 +15934,16 @@ function portal() {
     },
     async openSchedTaskSession(t) {
       // Jump straight to the muselab session bound to this scheduled
-      // task. Use openTab — NOT activateTab — because the bound session
-      // may not be in openTabIds yet (user hasn't manually opened it).
-      // activateTab only switches currentId; without push to openTabIds
-      // the tab strip wouldn't show this session and the user would see
-      // messages with no visible tab label.
+      // task. Route through the deeplink helper — NOT a bare openTab —
+      // because an old bound session may sit outside the windowed
+      // `sessions` list (and a since-deleted one shouldn't open at all):
+      // the helper force-pulls it by id and keeps the phantom-tab guard,
+      // while a direct openTab(sid) would mint a ghost tab with no name
+      // and no messages.
       this.closeScheduler();
       const sid = (t && t.session_id) || t;
       if (!sid) return;
-      await this.openTab(sid);
+      await this._openSessionFromDeeplink(sid);
     },
     fmtSchedTime(ts) {
       if (!ts) return "—";
