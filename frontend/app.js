@@ -8006,10 +8006,45 @@ function portal() {
         st._fetchingOlder = false;
       }
     },
+    // Per-message placeholder height (px) for content-visibility's
+    // contain-intrinsic-size. A flat `auto 200px` (styles.css) made the
+    // scrollbar jump every time a tall bubble (long text / code block) first
+    // entered the viewport on scroll-up: the browser laid it out at 200px,
+    // then snapped to its real height and scroll-anchoring yanked the
+    // viewport — the "一卡一卡" stutter. A content-derived estimate keeps the
+    // placeholder close to reality so the correction is sub-pixel. The `auto`
+    // keyword stays, so once a bubble has rendered once the browser uses its
+    // remembered real size and this estimate no longer matters. Pure (no
+    // mutation of m) — safe to call from the x-for :style bind.
+    estIntrinsicH(m) {
+      const t = (m && m.text) || "";
+      if (!t) return 88;
+      const CPL = 56; // approx chars per rendered line at chat-bubble width
+      let lines = 0;
+      const parts = t.split("\n");
+      for (let i = 0; i < parts.length; i++) {
+        lines += Math.max(1, Math.ceil(parts[i].length / CPL));
+      }
+      // Fenced code blocks render in a padded mono block — add a bit per pair.
+      const fences = (t.match(/```/g) || []).length;
+      const h = 44 + lines * 23 + ((fences >> 1) * 26);
+      // Clamp so a pathological estimate can't itself become a big jump.
+      return Math.max(64, Math.min(h, 4000));
+    },
     async loadEarlierMessages(sid) {
       sid = sid || this.currentId;
       if (!sid) return;
       const st = this._ensureTabState(sid);
+      // Re-entrancy guard. The mdRender pass below now yields to the browser
+      // between chunks (so a 50-message batch doesn't freeze the main thread
+      // in one long task). That await window lets a second click / rapid
+      // double-tap re-enter before the first prepend lands — two concurrent
+      // renders would unshift out of order (the older batch could end up
+      // BELOW the newer one). Serialize: ignore re-entry until the in-flight
+      // page finishes.
+      if (st._loadingEarlier) return;
+      st._loadingEarlier = true;
+      try {
       // Stash empty but server holds older history → page a window in first.
       if ((!st._earlierMessages || !st._earlierMessages.length)
           && st._loadedOffset > 0) {
@@ -8025,12 +8060,25 @@ function portal() {
       // immediately preceding what's currently shown — "closest in time").
       const batchSize = this._isMobileLayout() ? 20 : this.LOAD_MORE_BATCH;
       const batch = st._earlierMessages.splice(-batchSize);
-      // Now do the deferred mdRender pass on this batch only.
-      batch.forEach(m => {
-        if (m.role === "assistant" && m.text && !m.html) {
-          m.html = this.mdRender(m.text);
+      // Deferred mdRender pass on this batch only — chunked so a full 50-item
+      // batch parses across several frames instead of one blocking long task
+      // (marked + DOMPurify + KaTeX per message froze the click for ~hundreds
+      // of ms on long histories). The bubbles aren't in the DOM yet (prepend
+      // happens after), so yielding here just spreads CPU, no visible reflow.
+      const RENDER_CHUNK = 8;
+      for (let j = 0; j < batch.length; j += RENDER_CHUNK) {
+        const end = Math.min(j + RENDER_CHUNK, batch.length);
+        for (let k = j; k < end; k++) {
+          const m = batch[k];
+          if (m.role === "assistant" && m.text && !m.html) {
+            m.html = this.mdRender(m.text);
+          }
         }
-      });
+        if (end < batch.length) {
+          await new Promise(r => (typeof requestAnimationFrame !== "undefined"
+            ? requestAnimationFrame(() => r()) : setTimeout(r, 0)));
+        }
+      }
       const isCurrent = sid === this.currentId;
       // Capture scroll geometry BEFORE the DOM grows so we can restore the
       // user's visible-content offset after Alpine re-renders.
@@ -8054,6 +8102,9 @@ function portal() {
           const newEls = this._leadingMsgEls(batch.length);
           this.highlightCode(".chat-body", newEls.length ? newEls : null);
         });
+      }
+      } finally {
+        st._loadingEarlier = false;
       }
     },
     // Evict the oldest rendered messages back to the lazy stash so a long

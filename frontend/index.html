@@ -1536,7 +1536,8 @@
           <div class="msg-pane" x-show="tid === currentId">
           <template x-for="(m, i) in paneMessages(tid)" :key="m._k || m.uuid || ('m-' + i)">
             <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden')"
-                 :data-uuid="m.uuid || ''">
+                 :data-uuid="m.uuid || ''"
+                 :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
               <!-- compact-summary pill -->
               <template x-if="m._is_compact_summary">
                 <div class="compact-summary-pill">
