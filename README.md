@@ -103,6 +103,6 @@ Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How
 
 ## Status
 
-v1.0 — first stable release.
+v1.1 — first stable enhancement release.
 
 [MIT](LICENSE)

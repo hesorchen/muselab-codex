@@ -304,6 +304,6 @@ def build_server_for_session(session_id: str):
 
     return create_sdk_mcp_server(
         name="muselab",
-        version="1.0.0",
+        version="1.1.0",
         tools=[handler],
     )

@@ -283,7 +283,7 @@ async def _backfill_turn_counts() -> None:
         sys.stderr.write(f"[muselab] backfill sentinel write failed: {e}\n")
 
 
-app = FastAPI(title="muselab", version="1.0.0", lifespan=_lifespan)
+app = FastAPI(title="muselab", version="1.1.0", lifespan=_lifespan)
 
 # Gzip every response ≥1KB. The frontend ships ~1.2MB of uncompressed text
 # assets (app.js / index.html / styles.css) plus JSON-heavy API responses
