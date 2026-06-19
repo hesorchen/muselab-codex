@@ -966,7 +966,7 @@ async def _build_and_connect_client(
         # CLI announces its tool catalog in the init SystemMessage;
         #   .venv/bin/python scripts/dump-tool-catalog.py \
         #       | diff docs/tool-catalog.txt -
-        # on every SDK bump (sdk-bump-checklist.md item 1). Alternatives were
+        # on every SDK bump. Alternatives were
         # evaluated and rejected: tools={"type":"preset","preset":"claude_code"}
         # maps to `--tools default` — identical to not passing tools at all, so
         # it adds no protection; an explicit allowlist inverts the failure mode

@@ -1,4 +1,4 @@
-"""Lock the A-level 'SDK-as-truth' delegations (docs/sdk-bump-checklist.md).
+"""Lock the SDK-as-truth delegations.
 
 muselab used to hand-roll two things the SDK already exposes — the CLI
 projects-dir path encoding and the effort literal set. Both silently drifted on

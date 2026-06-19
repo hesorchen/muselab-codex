@@ -2,10 +2,10 @@
 """Dump the bundled CLI's live built-in tool catalog, one name per line.
 
 The CLI announces its full tool list in the `init` SystemMessage of every
-session — that IS the programmatic catalog (the sdk-bump-checklist used to
-claim none exists). This probe spins up a throwaway 1-turn session in /tmp,
-captures that list, filters MCP tools (muselab-injected, not CLI-bundled),
-and prints it sorted — ready to diff against docs/tool-catalog.txt:
+session — that IS the programmatic catalog. This probe spins up a throwaway
+1-turn session in /tmp, captures that list, filters MCP tools
+(muselab-injected, not CLI-bundled), and prints it sorted — ready to diff
+against docs/tool-catalog.txt:
 
     .venv/bin/python scripts/dump-tool-catalog.py | diff docs/tool-catalog.txt -
 
