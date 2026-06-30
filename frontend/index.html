@@ -2854,9 +2854,9 @@
                         transform="rotate(-90 10 10)"/>
               </svg>
             </button>
-            <!-- Subscription quota badge. Claude uses SDK rate_limit events;
-                 Codex Gateway uses local Codex session-log snapshots. Hidden
-                 for other third-party / API-key providers. -->
+            <!-- Subscription quota badge. Claude uses SDK rate_limit events.
+                 Codex Gateway has no authoritative provider quota feed here,
+                 so it is hidden like other third-party / API-key providers. -->
             <span class="chat-toolbar-rl"
                   x-show="currentQuotaBadge()"
                   :class="{ warn: currentQuotaBadge() && currentQuotaBadge().warn && !currentQuotaBadge().crit,
@@ -3735,10 +3735,9 @@
           </template>
         </div>
 
-        <!-- Cost dashboard — aggregated per-turn $ usage across all
-             sessions. Loads lazily when the user navigates to this
-             section (loadCostDashboard called on menu click + on first
-             desktop open via openSettings). -->
+        <!-- Cost dashboard — aggregated per-turn usage across all sessions.
+             Loads lazily when the user navigates to this section; Codex quota
+             refresh is intentionally tied to that user action. -->
         <div class="settings-section" data-page="cost"
              x-show="settings.activePage === 'cost'">
           <div class="settings-section-title">

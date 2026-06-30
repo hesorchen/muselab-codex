@@ -7,6 +7,7 @@ import asyncio
 import re
 import sys
 import shutil
+import subprocess
 import tempfile
 import time
 import urllib.parse
@@ -3461,6 +3462,8 @@ def _codex_rate_limits_from_payload(payload: dict, source: Path, ts: str | None)
     return {
         "ok": True,
         "source": "codex-session-log",
+        "source_scope": "codex_cli_session_log",
+        "provider_authoritative": False,
         "source_file": str(source),
         "updated_at": updated_at,
         "timestamp": ts,
@@ -3518,13 +3521,54 @@ def _latest_codex_rate_limits() -> dict:
             "updated_at": 0}
 
 
+def _refresh_codex_rate_limits() -> dict:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "codex-quota-refresh.py"
+    timeout = max(5, env_int("MUSELAB_CODEX_QUOTA_TIMEOUT", 25, min_value=5))
+    if not script.exists():
+        return {"ok": False, "reason": "codex_quota_script_missing"}
+    try:
+        proc = subprocess.run(
+            [sys.executable, str(script), "--timeout", str(timeout)],
+            cwd=str(ROOT or Path.home()),
+            text=True,
+            capture_output=True,
+            timeout=timeout + 5,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "reason": "codex_quota_script_timeout"}
+    except OSError as e:
+        return {"ok": False, "reason": f"codex_quota_script_start_failed: {e}"}
+    try:
+        payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        return {
+            "ok": False,
+            "reason": "codex_quota_script_bad_output",
+            "returncode": proc.returncode,
+            "stderr_tail": proc.stderr[-800:],
+        }
+    if not payload.get("ok") and proc.returncode != 0:
+        payload.setdefault("returncode", proc.returncode)
+        payload.setdefault("stderr_tail", proc.stderr[-800:])
+    return payload
+
+
 @router.get("/codex-rate-limit", dependencies=[Depends(require_token)])
-def codex_rate_limit() -> dict:
-    """Latest Codex subscription quota snapshot from local Codex session logs.
+def codex_rate_limit(refresh: bool = Query(default=False)) -> dict:
+    """Latest Codex CLI quota snapshot from local Codex session logs.
 
     This is intentionally a read-only local-state bridge. It does not read
-    Codex OAuth credentials and it does not call OpenAI-native APIs.
+    Codex OAuth credentials and it does not call OpenAI-native APIs. It is not
+    authoritative provider telemetry for Codex Gateway traffic.
     """
+    if refresh:
+        refreshed = _refresh_codex_rate_limits()
+        if refreshed.get("ok"):
+            return refreshed
+        fallback = _latest_codex_rate_limits()
+        fallback["refresh"] = refreshed
+        return fallback
     return _latest_codex_rate_limits()
 
 

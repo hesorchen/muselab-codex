@@ -4430,7 +4430,6 @@ function portal() {
       } catch {}
       await this.fetchMcp();
       await this.fetchRateLimit();
-      await this.fetchCodexRateLimit();
       try {
         const r = await fetch("/api/chat/providers", { headers: this.hdr() });
         if (r.ok) {
@@ -4443,9 +4442,10 @@ function portal() {
       } catch {}
     },
 
-    async fetchCodexRateLimit() {
+    async fetchCodexRateLimit(opts = {}) {
       try {
-        const r = await fetch("/api/chat/codex-rate-limit", {
+        const qs = opts.refresh ? "?refresh=1" : "";
+        const r = await fetch(`/api/chat/codex-rate-limit${qs}`, {
           headers: this.hdr(),
           cache: "no-store",
         });
@@ -4456,8 +4456,11 @@ function portal() {
             windows: d.windows || {},
             updated_at: d.updated_at || 0,
             ok: !!d.ok,
+            provider_authoritative: !!d.provider_authoritative,
           };
-          this.codexBadge = this.limitBadgeFromWindows(this.codexLimit.windows);
+          this.codexBadge = this.codexLimit.provider_authoritative
+            ? this.limitBadgeFromWindows(this.codexLimit.windows)
+            : null;
         }
       } catch {}
     },
@@ -4530,22 +4533,14 @@ function portal() {
     },
 
     currentQuotaBadge() {
-      if (this._isCodexModel(this.model)) return this.codexBadge;
+      if (this._isCodexModel(this.model)) return null;
       if (this._isClaudeModel(this.model)) return this.rlBadge;
       return null;
     },
 
     currentQuotaText() {
       if (this._isCodexModel(this.model)) {
-        const rows = this.codexLimitRows();
-        if (!rows.length) return "";
-        return rows.map(w => {
-          const tag = this.rateLimitWindowLabel(w.rate_limit_type) || w.key;
-          const rem = (w.remaining_percent !== null && w.remaining_percent !== undefined)
-            ? Math.round(w.remaining_percent) + "%"
-            : this.t("rl.ok");
-          return `${tag} ${rem}`;
-        }).join(" · ");
+        return "";
       }
       const b = this.currentQuotaBadge();
       return b ? b.text : "";
@@ -4582,19 +4577,7 @@ function portal() {
     // old inline :title expression so both paths stay in sync.
     rlBadgeDesc() {
       if (this._isCodexModel(this.model)) {
-        const rows = this.codexLimitRows();
-        if (!rows.length) return "";
-        return rows.map(w => {
-          const tag = this.rateLimitWindowLabel(w.rate_limit_type) || w.key;
-          const rem = (w.remaining_percent !== null && w.remaining_percent !== undefined)
-            ? `${this.t("set.cost.remaining")} ${w.remaining_percent}%`
-            : this.t("rl.ok");
-          const used = (w.used_percent !== null && w.used_percent !== undefined)
-            ? ` · ${this.t("set.cost.used")} ${w.used_percent}%`
-            : "";
-          const reset = this.rateLimitResetText(w.resets_at);
-          return `${tag} ${rem}${used}${reset ? " · " + this.t("rl.resets", { t: reset }) : ""}`;
-        }).join("\n");
+        return "";
       }
       const b = this.currentQuotaBadge();
       if (!b) return "";
@@ -8643,7 +8626,7 @@ function portal() {
       }
       // Take from the END of the earlier stash (those are the messages
       // immediately preceding what's currently shown — "closest in time").
-      const batchSize = this._isMobileLayout() ? 20 : this.LOAD_MORE_BATCH;
+      const batchSize = this._isMobileLayout() ? 10 : this.LOAD_MORE_BATCH;
       const batch = st._earlierMessages.splice(-batchSize);
       // Deferred mdRender pass on this batch only — chunked so a full 50-item
       // batch parses across several frames instead of one blocking long task
@@ -8822,14 +8805,11 @@ function portal() {
       // user drill in; selecting a row shows that section + a Back button.
       this.settings.activePage = this.isWideScreen ? "provider" : null;
       this.settings.show = true;
-      // Load MCP + Skill + Cost dashboard in parallel — non-fatal if any fails.
-      // Cost is loaded eagerly so desktop users see data without having to
-      // click "refresh" (mobile users hit it via the menu item's @click anyway).
+      // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
+      // stays lazy because Codex quota refresh intentionally runs a CLI probe.
       this.refreshMcpList();
       this.refreshSkillList();
-      this.loadCostDashboard();
       this.loadClaudeAuthStatus();
-      this.fetchCodexRateLimit();
     },
 
     // ===== Claude Auth methods =====
@@ -9037,7 +9017,7 @@ function portal() {
       if (this.cost.loading) return;
       if (this.cost.data && !force) return;
       this.cost.loading = true;
-      this.fetchCodexRateLimit();
+      this.fetchCodexRateLimit({ refresh: true });
       try {
         // Browser timezone offset is -getTimezoneOffset (JS reports east as
         // negative, server expects east-positive minutes).
@@ -11553,17 +11533,18 @@ function portal() {
       }
       return out;
     },
-    // Walk the FIRST `n` `.msg` element children of the chat body — the
-    // bubbles just prepended by a "Load earlier" / jump-into-history batch
+    // Walk the FIRST `n` `.msg` element children of the visible message pane —
+    // the bubbles just prepended by a "Load earlier" / jump-into-history batch
     // (unshift puts them at the front). Stops as soon as it has n, so it's
-    // O(n) regardless of how much history is already rendered. The
-    // load-earlier-wrap is the chat body's first child but isn't a `.msg`,
-    // so it's skipped naturally.
+    // O(n) regardless of how much history is already rendered.
     _leadingMsgEls(n) {
       const body = this.$refs.chatBody;
       if (!body || n <= 0) return [];
       const out = [];
-      let node = body.firstElementChild;
+      const panes = Array.from(body.querySelectorAll(".msg-pane"))
+        .filter(p => getComputedStyle(p).display !== "none");
+      const root = panes[0] || body;
+      let node = root.firstElementChild;
       while (node && out.length < n) {
         if (node.classList && node.classList.contains("msg")) out.push(node);
         node = node.nextElementSibling;
