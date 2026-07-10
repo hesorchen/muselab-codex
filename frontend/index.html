@@ -3040,7 +3040,15 @@
                   <span class="image-gen-status" x-text="imageGenStatusLabel(job.status)"></span>
                   <span x-text="job.provider || job.model || 'imagegen'"></span>
                 </div>
-                <span class="image-gen-job-time" x-text="fmtHM((job.updated_at || job.created_at) * 1000)"></span>
+                <div class="image-gen-job-actions">
+                  <button class="btn-ghost sm" type="button"
+                          @click="copyImageGenPrompt(job)"
+                          x-text="t('image_gen.copy_prompt')"></button>
+                  <button class="btn-ghost sm" type="button"
+                          @click="reuseImageGenPrompt(job)"
+                          x-text="t('image_gen.reuse_prompt')"></button>
+                  <span class="image-gen-job-time" x-text="fmtHM((job.updated_at || job.created_at) * 1000)"></span>
+                </div>
               </div>
               <div class="image-gen-job-prompt" x-text="job.prompt"></div>
               <div class="settings-hint warn" x-show="job.error" x-text="job.error"></div>

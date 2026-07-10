@@ -92,3 +92,15 @@ def test_i18n_zh_en_key_parity():
         f"Add the missing translations or `t()` will leak raw keys to "
         f"users on the side that's missing them."
     )
+
+
+def test_image_generation_history_prompt_actions_are_wired():
+    """History prompt actions need both Alpine handlers and template wiring."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert "copyImageGenPrompt(job)" in app
+    assert "reuseImageGenPrompt(job)" in app
+    assert '@click="copyImageGenPrompt(job)"' in index
+    assert '@click="reuseImageGenPrompt(job)"' in index
+    assert 'x-ref="imageGenPrompt"' in index

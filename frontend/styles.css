@@ -4334,6 +4334,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .image-gen-job-head {
   justify-content: space-between;
   min-width: 0;
+  flex-wrap: wrap;
+}
+.image-gen-job-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
 }
 .image-gen-job-title {
   min-width: 0;

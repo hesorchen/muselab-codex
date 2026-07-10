@@ -3148,6 +3148,24 @@ function portal() {
       if (status === "failed") return zh ? "失败" : "Failed";
       return status || "";
     },
+    copyImageGenPrompt(job) {
+      const text = ((job && job.prompt) || "").trim();
+      if (!text) return;
+      navigator.clipboard?.writeText(text).then(
+        () => this.toast(this.t("toast.copied"), "success", 1500),
+        () => this.errToast("copy", this.lang === "zh" ? "需要 HTTPS" : "HTTPS required")
+      );
+    },
+    reuseImageGenPrompt(job) {
+      const text = ((job && job.prompt) || "").trim();
+      if (!text) return;
+      this.imageGen.prompt = text;
+      this.$nextTick(() => {
+        const ta = this.$refs.imageGenPrompt;
+        if (ta) ta.focus();
+      });
+      this.toast(this.t("image_gen.prompt_reused"), "success", 1200);
+    },
 
     // Alias for use in inline x-html (shorter name reads better in markup).
     renderMd(text) { return this.mdRender(text); },
