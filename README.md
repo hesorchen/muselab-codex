@@ -1,119 +1,178 @@
-<h1 align="center">muselab</h1>
+<h1 align="center">muselab-codex</h1>
 
 <p align="center">
-  <a href="https://github.com/hesorchen/muselab/actions/workflows/ci.yml"><img src="https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/hesorchen/muselab-codex/actions/workflows/ci.yml"><img src="https://github.com/hesorchen/muselab-codex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="docs/quickstart_zh.md"><img src="https://img.shields.io/badge/deploy-self--hosted-orange.svg" alt="Self-hosted"></a>
-  <a href="https://github.com/hesorchen/muselab/pkgs/container/muselab"><img src="https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker" alt="Container"></a>
-  <a href="https://deepwiki.com/hesorchen/muselab"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
   <a href="README_en.md"><img src="https://img.shields.io/badge/lang-English-red" alt="English"></a>
 </p>
 
-<p align="center"><strong>muselab 是一个基于 Claude Agent SDK 构建的自托管 AI 个人工作台</strong></p>
+<p align="center"><strong>基于 <code>codex app-server</code> 的自托管 AI 工作台</strong></p>
 
-<p align="center"><em>Muse 来自希腊神话中的缪斯女神，象征灵感、艺术与知识。</em></p>
+<p align="center"><em>让 Codex 在浏览器里持续理解一个真实的本地工作区。</em></p>
 
 <table align="center">
 <tr>
-<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-desktop.png" width="360"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100" alt="移动端文件区"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100" alt="移动端预览区"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100" alt="移动端对话区"></td>
+<td align="center"><img src="promo/media/screenshot-desktop.png" width="360" alt="桌面端工作台"></td>
 </tr>
 <tr>
-<td align="center">移动端 · 文件区</td>
-<td align="center">移动端 · 预览区</td>
-<td align="center">移动端 · 对话区</td>
-<td align="center">桌面端 · 黑夜主题 + HTML 渲染效果</td>
+<td align="center">移动端 · 文件</td>
+<td align="center">移动端 · 预览</td>
+<td align="center">移动端 · 对话</td>
+<td align="center">桌面端 · 三栏工作台</td>
 </tr>
 </table>
 
-<p align="center"><sub>点击任意图片放大查看</sub></p>
+<p align="center"><sub>点击图片可查看原图；muselab-codex 与 muselab 保持一致的三栏工作台体验。</sub></p>
+
+muselab-codex 把本机已登录的 Codex 变成一个适合长期使用的文件与对话工作台：资料留在本地，Codex 持续理解真实工作区，浏览器提供文件管理、内容预览、多会话、流式交互和移动端访问。
+
+```text
+Browser → FastAPI HTTP／SSE → codex app-server Unix WebSocket → Codex
+```
+
+项目只有一套 agent runtime。muselab-codex 不维护第二套模型循环，也不把 Codex 降级为普通聊天接口。
+
+muselab-codex 会监督一个本地 Unix socket listener。需要从终端进入同一套实时 thread
+状态时，在「设置 → 关于」复制 `codex resume --remote unix:///.../app-server.sock`；
+普通 `codex` 命令仍会创建独立 runtime。
 
 ## 核心特性
 
-| | |
+| 能力 | 说明 |
 |---|---|
-| **复用已有订阅额度** | Claude 走 OAuth 复用 Pro / Max；GPT 通过本地 Codex Gateway 复用 Codex / GPT Plus / Pro|
-| **完整的用户上下文** | 不断累积的个人档案，越用越懂你，产生 context 复利 |
-| **领先的 Agent Harness** | 基于 Claude Agent SDK 构建，具备工具调用、Skills、MCP 扩展等 Agent 能力|
-| **灵活切换的基座模型** | Claude / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE / Codex Gateway 等 9 类模型提供方一键切换 |
-| **跨领域交叉分析** | 家庭信息 ✖️ 职业规划 ✖️ 健康档案 ✖️ 财务数据 ，Muse 给出跨领域洞察 |
-| **原生渲染能力** | HTML 页面、Markdown 文档即写即渲染，无需插件 |
-| **移动端 PWA** | 获得接近原生 App 的体验，电脑手机多端同步会话，出门在外手机接着聊 |
+| **Codex 原生 Agent Harness** | thread、turn、工具、审批、sandbox、Skills、MCP 和账户限额均由 `codex app-server` 管理 |
+| **可持续的本地上下文** | `MUSELAB_ROOT` 是长期工作区；`AGENTS.md`、Memory 和工作区文件共同形成可检查、可维护的上下文 |
+| **完整文件工作台** | 文件树、全文搜索、上传、编辑、回收站，以及 Markdown、代码、图片、PDF、CSV、XLSX、HTML 预览 |
+| **多会话工作流** | 流式回复、历史回放、消息队列、fork、compact、子 agent 会话和多标签页并行 |
+| **原生扩展能力** | 浏览器直接展示和管理 Codex Skills、MCP server、OAuth 状态、审批和结构化用户提问 |
+| **计划任务与终端** | 保存 prompt 定时执行；后台终端进程可查询、输入和终止 |
+| **自托管与移动端** | 默认仅监听本机，支持 systemd、launchd、Docker、PWA、HTTPS 反向代理和 Web Push |
+| **国产 Responses Provider** | 已验证 MiniMax M2.7、Qwen 3.7 Plus、MiMo V2.5 Pro，通过 Codex 原生 `model_providers` 接入 |
 
 ## 快速开始
 
-**一行命令安装**（Linux + macOS + WSL2）：
+### 一行安装
+
+支持 Linux、macOS 和启用了 systemd 的 WSL2：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab-codex/main/scripts/quick-install.sh | bash
 ```
 
-**手动安装**：
+安装器会克隆仓库、检查 `uv`／Node.js／Codex CLI、验证 `codex login`、创建私有 `.env`，并注册用户级服务。
+
+### 手动安装
 
 ```bash
-git clone https://github.com/hesorchen/muselab && cd muselab
-bash scripts/install-linux.sh    # 或 install-macos.sh
+git clone https://github.com/hesorchen/muselab-codex
+cd muselab-codex
+codex login
+bash scripts/install-linux.sh        # macOS 使用 install-macos.sh
 ```
 
-**安装后验证**：
+### 安装后验证
 
-1. 浏览器打开 `http://localhost:8765`
-2. 粘贴 `MUSELAB_TOKEN` 登录
-3. 配置至少一种模型
-4. 发送 `你好` 确认 Muse 正常响应
+1. 浏览器打开 `http://127.0.0.1:8765`；
+2. 输入安装器生成的 `MUSELAB_TOKEN`；
+3. 新建会话并发送“你好”；
+4. 让 Codex 读取或生成一个工作区文件，确认工具链路正常。
 
-出问题？运行 `bash scripts/doctor.sh`，逐层诊断并给出修复建议。
+出问题？运行 `bash scripts/doctor.sh` 逐层诊断，或查看[排错文档](docs/troubleshooting_zh.md)。健康接口中 `runtime.ready: true` 表示 FastAPI 与 Codex app-server 均已就绪。
 
-> **Windows 用户：** 请通过 WSL2 安装（参见 [快速入门](docs/quickstart_zh.md#windows-用户走-wsl2)）。
->
-> **无人值守**（CI / Docker / 录 demo）：`MUSELAB_NONINTERACTIVE=1 bash ...`
+> **Windows 用户：** 请通过启用了 systemd 的 WSL2 安装，详见[快速入门](docs/quickstart_zh.md#windowswsl2)。
 
 ## 会话实践
 
-> 「这是我今年的体检报告，你帮我和去年那份对比一下，把指标变化做成一页 HTML 趋势报告。」
+> “扫描这个目录，说明 Markdown、PDF 和表格之间的关系，再把结论整理成一份新的 Markdown 概览。”
 
-Muse 在 `health/` 里找到两份 PDF，读取文件，提取指标，写出带图表的单文件 HTML——预览区直接渲染。你接着说：
+Muse 会在同一个 Codex thread 中读取真实文件、使用终端工具、按需请求审批，并把结果写回工作区。你可以继续让它生成单文件 HTML 报告，在中间预览区直接查看；长对话接近上下文上限时，可使用 Codex 原生 compact 压缩当前 thread 的上下文后继续工作。
 
-> 「再结合 `money/` 里的保单，看看这些变化指标有没有保障缺口。」
+这里没有预先切块或应用自建的 RAG 索引。所有文件变更都可见、可编辑、可备份。
 
-两个领域的档案在同一个会话里交叉分析，提供具体指导。
+## 为什么是 Codex-native？
 
-🌐 更多场景演示见 [muselab 介绍页](https://hesorchen.github.io/muselab/promo/)。
-
-## 为什么不是现有方案？
-
-| 方案 | 局限 | muselab 怎么做 |
+| 方案 | 常见局限 | muselab-codex 的选择 |
 |---|---|---|
-| ChatGPT / Claude.ai | 文件临时上传、记忆内容黑盒 | 归档文件常驻本地，白盒记忆机制 |
-| Claude Code | 生在终端、为代码而生 | 同一套 Agent Harness，面向生活，电脑手机多端可用 |
-| RAG 文档问答 | 切块 + 检索，跨文档语义有损，适合海量文档 | 保存资料文档，完整文件理解，零语义损耗 |
-
-完整对比（Open WebUI / LobeChat / AnythingLLM / claudecodeui 等）见[同类对比](docs/comparison_zh.md)。
+| 普通网页聊天 | 文件临时上传，工具与上下文由应用重新实现 | 直接使用本地工作区和 Codex 原生工具循环 |
+| 独立终端会话 | 适合命令行，但缺少文件预览、移动端和多标签工作区 | 浏览器与终端可接入同一个 app-server runtime |
+| 应用自建 Agent 层 | thread、审批、Skills、MCP 容易与上游语义分叉 | 由 Codex 管理权威状态，应用只做界面与协议适配 |
 
 ## 实用细节
 
-- **现代文件树** —— 现代化的文件操作，拖拽上传、模糊搜索、重命名、回收站
-- **多模式多主题** —— 亮色 / 暗色 / 护眼，自选主题色
-- **中英双语** —— 一键切换，不刷新页面
-- **消息队列** —— Muse 思考时继续发送消息，消息队列依次执行，不错过每一个灵感
-- **定时任务** —— 创建夜晚定时任务，早上醒来查看结果
+- **三栏工作台** —— 文件树、内容预览和对话区协同工作，Markdown、代码、图片、PDF、CSV、XLSX、HTML 可直接预览。
+- **多会话多标签** —— 新会话即时打开，支持历史回放、重命名、fork、compact 和消息队列。
+- **中英双语与多主题** —— 页面语言即时切换，适配亮色、暗色、护眼主题和移动端 PWA。
+- **同一原生 runtime** —— 在“设置 → 关于”复制 remote 命令，即可从 Codex CLI 进入同一套实时 thread 状态。
+- **可观测运行状态** —— 健康检查、账户用量、上下文用量、工具过程、审批与 MCP 提问均直接呈现在浏览器中。
+
+## Codex 原生架构
+
+| muselab-codex 负责 | Codex app-server 负责 |
+|---|---|
+| 浏览器 UI、PWA、令牌鉴权 | thread、turn 与 transcript |
+| HTTP／SSE 适配与进程监督 | 模型调用、流式事件与工具循环 |
+| 安全的工作区文件 API | sandbox、审批与用户提问 |
+| 附件落盘和数值型用量 sidecar | Skills、MCP、Memory 与配置优先级 |
+| systemd／launchd／Docker 集成 | 登录态、账户限额和原生历史 |
+
+这个边界是项目的维护原则：只要 Codex 已经定义了权威语义，muselab-codex 就适配它，而不在应用层复制一套实现。
+
+## 国产模型
+
+当前只内置经过真实 Responses API 与工具调用验证的 Provider：
+
+| Provider | 模型 | 环境变量 | Web Search |
+|---|---|---|---|
+| MiniMax | `minimax-m2.7` | `MINIMAX_API_KEY` | 为兼容性关闭 |
+| Qwen | `qwen3.7-plus` | `DASHSCOPE_API_KEY` | 为兼容性关闭 |
+| Xiaomi MiMo | `mimo-v2.5-pro` | `XIAOMI_MIMO_API_KEY` | 为兼容性关闭 |
+
+把密钥放入服务进程可继承的私有环境，重启服务，然后在“设置 → 模型”中启用。网页不会读取、显示或提交密钥；开关只通过 app-server 写入 Codex `model_providers` 配置。详见[配置参考](docs/configuration_zh.md)。
+
+## 本地开发
+
+要求 Python 3.12+、[`uv`](https://docs.astral.sh/uv/)、Node.js 和已登录的 Codex CLI。当前协议测试基线为 `codex-cli 0.144.1`。
+
+```bash
+git clone https://github.com/hesorchen/muselab-codex
+cd muselab-codex
+uv sync
+cp .env.example .env
+# 编辑 .env：至少设置 MUSELAB_TOKEN 和 MUSELAB_ROOT
+uv run python -m backend.main
+```
+
+质量门禁：
+
+```bash
+uv run pytest tests/
+uv run ruff check backend/ tests/
+bash scripts/lint.sh
+node --check frontend/app.js
+```
 
 ## 文档
 
-**[📚 完整文档索引](docs/README_zh.md)**
+**[📚 完整中文文档索引](docs/README_zh.md)** · **[English documentation](docs/README.md)**
 
-- **上手：** [快速入门](docs/quickstart_zh.md) · [Linux 安装](docs/install-linux_zh.md) · [macOS 安装](docs/install-macos_zh.md) · [升级](docs/upgrade_zh.md)
-- **使用：** [定制 CLAUDE.md](docs/personalize-claude-md_zh.md) · [Skills](docs/skills_zh.md) · [手机端 PWA](docs/mobile_zh.md) · [定时任务](docs/scheduler_zh.md)
-- **模型：** [Providers](docs/providers_zh.md) · [Codex Gateway](docs/codex-gateway_zh.md) · [接入新 provider](docs/add-provider_zh.md) · [模型路由](docs/routing_zh.md)
-- **内部机制：** [架构](docs/architecture_zh.md) · [会话](docs/backend-sessions_zh.md) · [Files API](docs/backend-files_zh.md) · [安全模型](docs/backend-security_zh.md) · [前端](docs/frontend_zh.md) · [基础设施](docs/infrastructure_zh.md)
-- **参考：** [配置](docs/configuration_zh.md) · [数据与备份](docs/data-and-backup_zh.md) · [排错](docs/troubleshooting_zh.md) · [词汇表](docs/glossary_zh.md)
-- **概念：** [同类对比](docs/comparison_zh.md) · [九位缪斯](docs/muses_zh.md)
-- **项目：** [安全](SECURITY.md) · [贡献指南](CONTRIBUTING.md) · [第三方授权](THIRD_PARTY_LICENSES.md)
+- **上手：** [快速入门](docs/quickstart_zh.md) · [Linux](docs/install-linux_zh.md) · [macOS](docs/install-macos_zh.md) · [升级](docs/upgrade_zh.md)
+- **配置：** [环境与 Provider](docs/configuration_zh.md) · [Skills](docs/skills_zh.md) · [定时任务](docs/scheduler_zh.md) · [移动端](docs/mobile_zh.md)
+- **原理：** [架构](docs/architecture_zh.md) · [基础设施](docs/infrastructure_zh.md) · [原生实现规格](docs/specs/)
+- **运维：** [排错](docs/troubleshooting_zh.md) · [数据与备份](docs/data-and-backup_zh.md) · [安全策略](SECURITY.md)
+- **项目：** [贡献指南](CONTRIBUTING.md) · [第三方授权](THIRD_PARTY_LICENSES.md)
 
-## 状态
+## 安全提示
 
-v1.1 — 首个稳定增强版本。
+持有 `MUSELAB_TOKEN` 的人可以操作 `MUSELAB_ROOT` 内的文件，并驱动 Codex 执行获准的工具。默认保持 `MUSELAB_HOST=127.0.0.1`；远程访问时使用 HTTPS 和额外访问控制，不要把 `.env`、`CODEX_HOME` 或真实工作区提交到仓库或镜像。
+
+## 项目状态
+
+当前版本为 `0.1.0a1`。核心 Codex Native 路径已经可用，协议兼容基线仍会随 Codex CLI 演进。升级前请查看[升级说明](docs/upgrade_zh.md)。
+
+本仓库从 muselab 的历史基线独立演进，保留 MIT 许可证，但不是 GitHub Fork。
 
 [MIT](LICENSE)

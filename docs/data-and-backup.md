@@ -1,53 +1,50 @@
 # Data & backup
 
-> [简体中文](data-and-backup_zh.md)
+> [简体中文](data-and-backup_zh.md) · [← Documentation index](README.md)
 
-muselab keeps no database — all state is plain files in three places:
+muselab-codex has no application database. Its current native state lives in
+three places:
 
-1. the **archive** (`MUSELAB_ROOT`) — your own files,
-2. the **repo** — config and session metadata,
-3. **`~/.claude/`** — the Claude CLI's transcripts and login.
-
-To migrate a muselab install to a new machine, copy the three "must back up"
-sets below. Everything else regenerates on its own.
+1. the workspace selected by `MUSELAB_ROOT`;
+2. deployment configuration such as the service `.env`;
+3. Codex CLI state under `$CODEX_HOME` (normally `~/.codex`).
 
 ## What to back up
 
 | Path | Contains | Why it matters |
 |---|---|---|
-| `$MUSELAB_ROOT/` | Your archive — every file you put there | This *is* your data |
-| `$MUSELAB_ROOT/.muselab/scheduler.json` | Scheduled tasks + run history | Lose it = recreate every schedule |
-| `<repo>/.env` | All config **including secrets** (token + provider keys) | Holds credentials — back up securely, never commit |
-| `<repo>/sessions/` | Session index, per-message sidecars (cost, model badge, uploaded attachments), pending queues | muselab-only metadata, not in the CLI transcript |
-| `<repo>/mcp.json` | MCP server configuration | Only if you configured MCP |
-| `<repo>/provider_overrides.json` | Edits to built-in providers + any custom providers | Only if you customized providers |
-| `~/.claude/projects/<cwd-key>/*.jsonl` | **The actual conversation transcripts** | The real chat history — owned by the CLI |
-| `~/.claude/.credentials.json` | Claude Pro/Max OAuth login | Skip and you just re-run `claude login` |
+| `$MUSELAB_ROOT/` | Your files and muselab-codex workspace state | This is the user-owned workspace |
+| `$MUSELAB_ROOT/.muselab-codex/attachments/threads/` | Files attached to materialized Codex threads | Required for attachment previews and the local paths stored in transcripts |
+| `$MUSELAB_ROOT/.muselab-codex/usage/` | Sanitized per-thread numeric token-usage snapshots | Keeps the context meter populated after a backend restart |
+| `$MUSELAB_ROOT/.muselab-codex/scheduler.json` | Scheduled tasks, run history, and unread state | Restores automation |
+| `$MUSELAB_ROOT/.muselab/` | VAPID private key and push subscriptions | Keeps existing device notifications valid |
+| `$MUSELAB_ROOT/.muselab-dustbin/` | Trash payloads and manifests | Restores files that were not permanently deleted |
+| The active service `.env` | `MUSELAB_ROOT`, token, port, and other deployment settings | Contains secrets; store it privately and never commit it |
+| `$CODEX_HOME/` | Codex configuration, authentication state, and Codex-managed thread/rollout data | Codex is the transcript source of truth |
 
-> `.env` and `~/.claude/.credentials.json` contain secrets. Back them up to a
-> private location; do not put them in a git repo or shared drive.
+Back up `$CODEX_HOME` only to a private encrypted location. It may contain
+authentication material. If you intentionally omit authentication state, sign
+in to Codex again after restoring.
 
-## What you don't need to back up
+The application does not use a separate session database or provider-routing
+file. Codex remains the source of truth for threads and configuration.
 
-These are regenerated automatically:
+## What can be discarded
 
 | Path | Note |
 |---|---|
-| `$MUSELAB_ROOT/.muselab/vapid.json` | Web-push keypair — regenerates, but deleting it forces every device to re-subscribe |
-| `$MUSELAB_ROOT/.muselab/push_subs.json` | Push subscriptions — devices re-subscribe on their own |
-| `$MUSELAB_ROOT/.muselab-dustbin/` | Soft-delete trash, auto-purged after `MUSELAB_TRASH_TTL_DAYS` |
-| `/tmp/muselab-vendor-cli-config-*` | Ephemeral isolated CLI config for third-party providers |
-| `<repo>/.venv/`, caches, logs | Rebuilt by `uv sync` / at runtime |
+| `$MUSELAB_ROOT/.muselab-codex/attachments/staged/` | Unsent uploads; safe to remove while the service is stopped |
+| `<repo>/.venv/`, caches, and logs | Recreated by `uv sync` or at runtime |
+| Temporary app-server schema directories | Generated from the pinned Codex CLI when needed |
 
-## Restore on a new machine
+## Restore outline
 
-1. Install muselab normally (see [Quick start](quickstart.md)).
+1. Install the same supported Codex CLI and muselab-codex revision.
 2. Stop the service.
-3. Restore `$MUSELAB_ROOT/` (including its `.muselab/scheduler.json`),
-   the repo's `.env` / `sessions/` / `mcp.json` / `provider_overrides.json`,
-   and `~/.claude/`.
-4. Make sure `MUSELAB_ROOT` in the restored `.env` points at the archive's new
-   location.
-5. Start the service. Sessions, schedules, and history come back as they were.
+3. Restore `$MUSELAB_ROOT`, the active service `.env`, and `$CODEX_HOME`.
+4. Check that `MUSELAB_ROOT`, `HOME`, and optional `CODEX_HOME` point to the restored locations.
+5. Confirm `codex login status`, then start muselab-codex.
+6. Open a recent thread and verify both its transcript and one attachment.
+7. Check scheduled tasks and send a test notification to verify VAPID state.
 
-A quick health check after restore: `bash scripts/doctor.sh`.
+Use the matching service and upgrade instructions when restoring an instance.

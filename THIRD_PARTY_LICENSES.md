@@ -44,34 +44,6 @@ step** and runs offline after install.
   endorse" clause applies; muselab does not use the highlight.js name
   for endorsement.
 
-## Skills — bundled under `skills/`
-
-These are SKILL.md instruction files (plain text, no compiled code)
-shipped with muselab to give Muse out-of-the-box capabilities.
-The first seven are muselab-native; the four below are community-authored
-and included here with attribution.
-
-| Skill | Author / Repo | License | Upstream |
-|---|---|---|---|
-| `citation-formatter` | muselab contributors | MIT | this repo |
-| `code-reviewer` | muselab contributors | MIT | this repo |
-| `markdown-formatter` | muselab contributors | MIT | this repo |
-| `mermaid-helper` | muselab contributors | MIT | this repo |
-| `summary-distiller` | muselab contributors | MIT | this repo |
-| `task-decomposer` | muselab contributors | MIT | this repo |
-| `web-search` | muselab contributors | MIT | this repo |
-| `pptx` | tfriedel / claude-office-skills | not specified† | <https://github.com/tfriedel/claude-office-skills> |
-| `csv-analyzer` | coffeefuelbump | not specified† | <https://github.com/coffeefuelbump/csv-data-summarizer-claude-skill> |
-| `translate` | feiskyer | MIT | <https://github.com/feiskyer/claude-code-settings> |
-| `meeting-notes` | claude-office-skills contributors | MIT | <https://github.com/claude-office-skills/skills> |
-
-† These repositories do not include an explicit `LICENSE` file at the
-time of inclusion (2026-05-23). The SKILL.md files are plain natural-
-language instructions with no executable code. If you are a copyright
-holder of either upstream repository and wish to add a license, please
-open an issue at the upstream URL above. muselab will update attribution
-accordingly.
-
 ## Backend — Python dependencies (from `pyproject.toml`)
 
 These are not vendored — they are installed via `uv` / `pip` at install
@@ -80,7 +52,6 @@ floor muselab pins.
 
 | Package | License | Upstream |
 |---|---|---|
-| `claude-agent-sdk` (≥ 0.2.82) | MIT | <https://github.com/anthropics/claude-agent-sdk-python> |
 | `fastapi` (≥ 0.136) | MIT | <https://github.com/tiangolo/fastapi> |
 | `uvicorn[standard]` (≥ 0.47) | BSD 3-Clause | <https://github.com/encode/uvicorn> |
 | `python-dotenv` (≥ 1.2) | BSD 3-Clause | <https://github.com/theskumar/python-dotenv> |
@@ -111,8 +82,8 @@ not this project.
 
 | Component | Role | Where it comes from |
 |---|---|---|
-| Claude Code CLI (`claude`) | Drives the agent loop muselab dispatches against | Anthropic, installed by the user (`npm install -g @anthropic-ai/claude-code`) |
-| Node.js | Runtime for the CLI above | <https://nodejs.org/> |
+| Codex CLI (`codex`) | Runs the app-server agent loop | OpenAI, installed by the user (`npm install -g @openai/codex`) |
+| Node.js | Runtime for the Codex CLI | <https://nodejs.org/> |
 | Python 3.12+ | muselab itself runs on it | <https://www.python.org/> |
 | `uv` | Python tooling, used by installer | <https://github.com/astral-sh/uv> (Apache 2.0 / MIT) |
 

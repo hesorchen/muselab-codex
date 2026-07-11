@@ -1,6 +1,6 @@
 # 手机端（PWA）
 
-> [English](mobile.md)
+> [English](mobile.md) · [← 文档索引](README_zh.md)
 
 muselab 自带 Web App Manifest 和 apple-touch-icon。部署到用户自己的服务器后，可将其添加到手机主屏幕，启动体验接近原生应用。
 
@@ -23,7 +23,9 @@ Android Chrome 地址栏会主动提示「安装」。
 
 ## Web Push 推送通知
 
-在**设置 → 通知**中启用。后端暴露 `/api/push/{vapid-public,subscribe,unsubscribe}` 接口，VAPID 密钥通过 `.env` 注入；订阅信息按设备存储于浏览器本地。即使浏览器标签页已关闭，长时任务完成后也会向设备推送通知。
+在**设置 → 通知**中启用。后端暴露 `/api/push/{vapid-public,subscribe,unsubscribe,test}` 接口。首次启动时会生成 VAPID 密钥，并把密钥和设备订阅分别保存到 `<workspace>/.muselab/vapid.json` 与 `push_subs.json`。设置页可以发送端到端测试通知；当前版本尚未把计划任务完成事件自动连接到 Web Push。
+
+`vapid.json` 含私钥，必须纳入私密备份。若删除或重新生成，所有设备都需要重新订阅。
 
 ### iOS 限制
 

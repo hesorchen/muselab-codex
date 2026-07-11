@@ -2697,7 +2697,7 @@ pre.text {
   font-weight: 500;
 }
 
-/* ====== Tab strip (VS Code Claude-style multi-session) ====== */
+/* ====== Editor-style multi-session tab strip ====== */
 /* Two-row layout: list (overflow-x: auto, fills available width) + actions
    (flex-shrink: 0, pinned right). Replaces the old single-container .chat-tabs
    where the + and history buttons would scroll out of view when too many tabs
@@ -3625,6 +3625,7 @@ pre.has-copy-btn .code-copy-btn.copied {
 
 .tool {
   display: flex; gap: var(--sp-2); align-items: baseline;
+  flex-wrap: wrap;
   background: var(--c-tool-bg); color: var(--c-tool-fg);
   border-left: 2px solid var(--c-tool-fg);
   padding: 5px 12px; border-radius: 0 var(--r-md) var(--r-md) 0;
@@ -3632,6 +3633,16 @@ pre.has-copy-btn .code-copy-btn.copied {
 }
 .tool-name { font-weight: var(--fw-semibold); }
 .tool-arg { color: var(--c-fg-2); word-break: break-all; }
+.tool-input-details { width: 100%; color: var(--c-fg-2); }
+.tool-input-details summary {
+  cursor: pointer; user-select: none; color: var(--c-accent-fg);
+}
+.tool-input-details pre {
+  max-height: 360px; margin: var(--sp-2) 0 0; padding: var(--sp-2);
+  overflow: auto; white-space: pre; color: var(--c-fg-1);
+  background: var(--c-bg-0); border: 1px solid var(--c-border);
+  border-radius: var(--r-sm); font: inherit;
+}
 
 .tool-result {
   background: var(--c-bg-2); border-left: 2px solid var(--c-fg-4);
@@ -4025,7 +4036,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 
 /* ==========================================================================
-   ask_user_question — Muse asks the user with structured options (mcp tool)
+   ask_user_question — native app-server structured user input
    ========================================================================== */
 .ask-question {
   background: var(--c-bg-1);
@@ -4042,6 +4053,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   font-size: var(--fs-sm);
 }
 .ask-title { font-weight: var(--fw-semibold); color: var(--c-fg-0); }
+.ask-server {
+  color: var(--c-fg-2); font-family: var(--font-mono); font-size: var(--fs-xs);
+}
+.ask-prompt {
+  color: var(--c-fg-1); font-size: var(--fs-sm); line-height: 1.5;
+  margin: -2px 0 var(--sp-3);
+}
 .ask-submitted-tag {
   margin-left: auto;
   padding: 1px 8px; border-radius: var(--r-full);
@@ -4171,6 +4189,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   outline: none;
   border-color: var(--c-accent);
   box-shadow: 0 0 0 3px var(--c-accent-soft);
+}
+.ask-other-textarea[type="password"] {
+  min-height: auto;
+  resize: none;
 }
 .ask-other-actions {
   display: flex; gap: var(--sp-2); justify-content: flex-end;
@@ -4733,7 +4755,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .ctx-meter.warn .ctx-meter-label { color: var(--c-warn); }
 .ctx-meter.danger .ctx-meter-label { color: var(--c-danger); font-weight: var(--fw-semibold); }
 /* Context breakdown popup — anchored top-right of viewport, fixed so it
-   floats over any pane. Shows SDK get_context_usage() per-category data. */
+   floats over any pane. Shows app-server token-usage category data. */
 .ctx-breakdown-pop {
   position: fixed; top: 56px; right: 12px;
   width: 340px; max-width: calc(100vw - 24px);
@@ -5254,7 +5276,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin-right: var(--sp-1);
 }
 
-/* CLAUDE.md context chip */
+/* AGENTS.md context chip */
 .ctx-chip {
   display: inline-flex; align-items: center; gap: var(--sp-1);
   padding: 2px 8px; border-radius: var(--r-full);
@@ -5494,6 +5516,14 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   white-space: pre-wrap; word-break: break-word;
   max-height: 120px; overflow-y: auto;
 }
+.perm-url {
+  display: block;
+  margin-top: var(--sp-2);
+  color: var(--c-accent-fg);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  overflow-wrap: anywhere;
+}
 .perm-actions {
   display: flex; gap: var(--sp-2); justify-content: flex-end;
   flex-wrap: wrap;
@@ -5540,7 +5570,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   margin-top: 2px; padding: 0 4px;
   font-family: var(--font-mono);
   letter-spacing: 0.2px;
-  /* Long unmapped model ids (e.g. "claude-haiku-4-5-20251001") would
+  /* Long unmapped model ids would
      otherwise stretch under the bubble — clip them. Hover the badge
      to see the full id via the :title attribute. */
   max-width: 220px;
@@ -5578,7 +5608,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 .jump-bottom:hover { background: var(--c-accent-hover); transform: scale(1.05); }
 .jump-bottom svg { width: 18px; height: 18px; }
 
-/* VSCode-Claude style bottom input area:
+/* Editor-style bottom input area:
      row 1: pending attachments (when any)
      row 2: textarea (full width)
      row 3: chat-toolbar — every control compactly stacked here */
@@ -5687,7 +5717,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
    anything actionable. Also removed the .mcp-source-* pill colors that
    went with the source chip — chip itself was deleted from the cards
    on the same UX feedback pass.) */
-/* Disabled MCP cards: dim body to telegraph "this won't run this turn"
+/* Disabled MCP/Skill cards: dim body to telegraph "this won't run this turn"
    while keeping the name readable so the user still knows what's there. */
 .skill-card.is-disabled .skill-card-desc { opacity: 0.5; }
 .skill-card.is-disabled .skill-card-icon { opacity: 0.5; }
@@ -6439,6 +6469,10 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 }
 .settings-input-wrap { display: flex; align-items: center; gap: var(--sp-2); }
 .settings-input-wrap .settings-input { flex: 1; }
+.settings-command {
+  min-width: 0; overflow-wrap: anywhere; color: var(--c-fg-1);
+  font-family: var(--font-mono); font-size: var(--fs-xs);
+}
 
 .settings-badge {
   font-size: var(--fs-xs); padding: 0 8px; height: 22px;
@@ -6660,10 +6694,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   flex: 1;
 }
 .skill-card-actions {
-  display: flex; justify-content: flex-end;
+  display: flex; justify-content: flex-end; gap: 6px;
   margin-top: 2px;
 }
-.skill-card-try {
+.skill-card-try,
+.skill-card-toggle {
   font-size: var(--fs-xs);
   padding: 4px 12px;
   background: transparent;
@@ -6674,10 +6709,16 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   transition: color var(--t-fast), border-color var(--t-fast),
               background var(--t-fast);
 }
-.skill-card-try:hover {
+.skill-card-try:hover,
+.skill-card-toggle:hover {
   color: var(--c-accent);
   border-color: var(--c-accent);
   background: var(--c-accent-soft);
+}
+.skill-card-try:disabled,
+.skill-card-toggle:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 /* Chat-input Skills drawer — opens on 🧩 button click. Reuses
@@ -8196,129 +8237,6 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   }
 }
 
-/* ============================================================
-   Claude Auth — first-class OAuth provider card in Settings.
-   Styled to feel "different from API-key rows" — bigger, with
-   identity panel when connected, single CTA when not.
-   ============================================================ */
-.claude-auth-card {
-  background: var(--c-bg-2);
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-lg);
-  padding: 16px 18px;
-  margin-bottom: 14px;
-}
-.claude-auth-head {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--sp-3);
-  margin-bottom: 10px;
-}
-.claude-auth-title-wrap { flex: 1; min-width: 0; }
-.claude-auth-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--c-fg-0);
-}
-.claude-auth-subtitle {
-  font-size: var(--fs-sm);
-  color: var(--c-fg-3);
-  margin-top: 3px;
-  line-height: 1.45;
-}
-.claude-auth-connected {
-  margin-top: var(--sp-1);
-}
-.claude-auth-field {
-  display: flex;
-  align-items: baseline;
-  gap: 10px;
-  padding: 6px 0;
-  font-size: var(--fs-base);
-}
-.claude-auth-label {
-  flex: 0 0 90px;
-  color: var(--c-fg-3);
-}
-.claude-auth-value {
-  color: var(--c-fg-0);
-  font-weight: 500;
-  word-break: break-all;
-}
-.claude-auth-actions {
-  display: flex;
-  gap: var(--sp-2);
-  margin-top: var(--sp-3);
-  padding-top: 12px;
-  border-top: 1px dashed var(--c-border);
-}
-.claude-auth-disconnected {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-}
-.claude-auth-cli-warn {
-  font-size: var(--fs-sm);
-  color: var(--warn, #c97a00);
-  background: rgba(217, 119, 6, 0.08);
-  border: 1px solid rgba(217, 119, 6, 0.25);
-  border-radius: var(--r-md);
-  padding: 8px 10px;
-}
-.claude-auth-cli-warn code {
-  display: inline-block;
-  margin-top: var(--sp-1);
-  font-family: monospace;
-  font-size: var(--fs-sm);
-  background: rgba(0,0,0,0.05);
-  padding: 2px 6px;
-  border-radius: var(--r-sm);
-}
-
-/* Connect modal */
-.claude-auth-modal { max-width: 540px; }
-.claude-auth-step {
-  margin-bottom: 14px;
-}
-.claude-auth-step-text {
-  font-size: var(--fs-base);
-  color: var(--c-fg-0);
-  margin-bottom: 6px;
-}
-.claude-auth-cmd-row {
-  display: flex;
-  gap: var(--sp-2);
-  align-items: center;
-}
-.claude-auth-cmd {
-  flex: 1;
-  font-family: monospace;
-  font-size: var(--fs-base);
-  background: var(--bg-code, #0f172a);
-  color: #e2e8f0;
-  padding: 8px 12px;
-  border-radius: var(--r-md);
-  word-break: break-all;
-}
-.claude-auth-waiting {
-  display: flex;
-  align-items: center;
-  gap: var(--sp-2);
-  margin-top: 14px;
-  padding: 10px 12px;
-  background: rgba(59, 130, 246, 0.08);
-  border: 1px solid rgba(59, 130, 246, 0.25);
-  border-radius: var(--r-md);
-  font-size: var(--fs-base);
-  color: var(--c-fg-3);
-}
-.claude-auth-tip {
-  margin-top: 10px;
-  font-size: var(--fs-sm);
-  color: var(--c-fg-3);
-  line-height: 1.5;
-  font-style: italic;
-}
 .spinner-sm {
   display: inline-block;
   width: 14px;
@@ -9062,33 +8980,6 @@ html[data-theme="eyecare"] .task-log-line.task-updated .task-log-icon { backgrou
 /* (muse-cell visual properties moved to the canonical .muse-cell rule
    higher up in this file — the token-namespace fix made this duplicate
    block redundant. Kept here only as a historical note.) */
-
-/* ---- Claude Auth card ---- */
-.claude-auth-card {
-  background: var(--c-bg-1);
-  border-color: var(--c-border);
-}
-.claude-auth-title { color: var(--c-fg-1); }
-.claude-auth-subtitle { color: var(--c-fg-3); }
-.claude-auth-label { color: var(--c-fg-3); }
-.claude-auth-value { color: var(--c-fg-1); }
-.claude-auth-actions { border-top-color: var(--c-border); }
-.claude-auth-cmd { background: var(--c-bg-3); color: var(--c-fg-1); }
-html[data-theme="light"] .claude-auth-cmd,
-html[data-theme="eyecare"] .claude-auth-cmd {
-  background: var(--c-bg-4); color: var(--c-fg-0);
-}
-.claude-auth-waiting {
-  background: var(--c-accent-soft);
-  border-color: var(--c-accent);
-  color: var(--c-fg-2);
-}
-.claude-auth-tip { color: var(--c-fg-3); }
-.claude-auth-cli-warn {
-  color: var(--c-warn);
-  background: rgba(217, 119, 6, 0.10);
-  border-color: rgba(217, 119, 6, 0.30);
-}
 
 /* ---- MCP enhanced bubble ---- */
 .mcp-server-label { color: var(--c-fg-1); }

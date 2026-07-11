@@ -1,110 +1,126 @@
 # 配置参考
 
-> [English](configuration.md)
+> [English](configuration.md) · [← 文档索引](README_zh.md)
 
-所有设置都在仓库的 `.env` 文件里。安装器会创建它；你可以手动编辑，或在应用内的 **设置** 面板里改大部分值（设置面板会热更新 `.env` *并同时* 更新运行中的进程 —— 无需重启）。手动改 `.env` **需要** 重启，因为进程只在启动时读一次文件。
+muselab-codex 把配置分成三层，每层只有一个权威来源：
 
-起始模板见 `.env.example`。
+| 层 | 权威来源 | 示例 |
+|---|---|---|
+| 部署与工作区 | 仓库 `.env`／进程环境 | host、port、token、`MUSELAB_ROOT` |
+| Codex 用户配置 | `CODEX_HOME` | 登录态、`config.toml`、Memory、用户 Skills、MCP |
+| 工作区配置 | `MUSELAB_ROOT` | `AGENTS.md`、`.codex/`、工作区 Skills |
 
-## 鉴权
+网页设置不会成为第四套配置系统。模型、Skills 和 MCP 的变更通过 app-server 写回 Codex 原生配置。
 
-muselab 是单用户的。一个 token 保护整个 Web UI 和每一次 API 调用。
+## 应用环境变量
 
-- token 是 `.env` 里的 `MUSELAB_TOKEN`。用 `grep MUSELAB_TOKEN .env` 找它。
-- 浏览器以 `X-Auth-Token` header 发送（缓存在 `localStorage["muselab_token"]`）；链接也接受 `?token=` 查询参数。
-- 至少 16 个字符 —— 否则后端拒绝启动。安装器用 `openssl rand -hex 32` 生成随机 token。
+| 变量 | 必需 | 默认值 | 说明 |
+|---|:---:|---|---|
+| `MUSELAB_TOKEN` | 是 | 无 | 至少 16 字符；保护所有有意义的 HTTP／SSE 操作 |
+| `MUSELAB_ROOT` | 是 | 无 | 已存在且由当前用户拥有的绝对工作区路径 |
+| `MUSELAB_HOST` | 否 | `127.0.0.1` | Web 监听地址；除非有受控网络边界，否则不要改为 `0.0.0.0` |
+| `MUSELAB_PORT` | 否 | `8765` | Web 监听端口，非法值会回退并限制为正整数 |
+| `CODEX_BIN` | 否 | 自动查找 `codex` | 指定 Codex CLI 绝对路径或命令名 |
+| `MUSELAB_CODEX_HISTORY_READ_TIMEOUT_SECONDS` | 否 | `8` | 读取大型 thread 历史的客户端超时 |
+| `MUSELAB_CODEX_COMPACT_TIMEOUT_SECONDS` | 否 | `600` | compact 摘要 turn 的最长等待时间 |
+| `MUSELAB_VAPID_SUBJECT` | 否 | `mailto:noreply@muselab.dev` | Web Push VAPID subject，必须是 `mailto:` 地址 |
 
-## 核心设置
+最小 `.env`：
 
-| 变量 | 作用 | 默认 | 必填 |
+```dotenv
+MUSELAB_TOKEN=replace-with-a-long-random-token
+MUSELAB_ROOT=/absolute/path/to/workspace
+MUSELAB_PORT=8765
+MUSELAB_HOST=127.0.0.1
+```
+
+`.env` 含 token 和可能的 Provider key，权限应限制为当前用户，且不能提交到 Git。
+
+## `MUSELAB_ROOT`
+
+后端启动时会解析并校验工作区：
+
+- 路径必须存在；
+- 不能省略并回退到整个 `$HOME`；
+- 拒绝 `/`、`/etc`、`/root`、`/home`、`/var`、`/usr`、`/boot` 等危险根目录；
+- 文件 API 会再次阻止路径穿越、符号链接逃逸和敏感文件访问。
+
+推荐为 muselab-codex 使用一个明确的子目录，而不是把整个 home 目录暴露给文件工作台。
+
+## `AGENTS.md` 与上下文
+
+Codex 原生 instruction 文件是工作区根目录的 `AGENTS.md`。可以用 `scripts/intake.sh` 创建模板；项目内 `.codex/` 可承载工作区 Codex 配置和 Skills。
+
+上下文优先级、Memory 加载和 instruction 合并规则最终以 Codex 为准。muselab-codex 只在设置和上下文界面显示来源是否存在，不把文件内容复制进应用数据库。
+
+## `CODEX_HOME`
+
+未显式设置时通常是 `~/.codex`，其中可能包含：
+
+- `config.toml` 和模型 Provider 配置；
+- Codex 登录凭证；
+- 用户级 Skills、Memory 和 MCP 设置；
+- Codex 管理的 thread／rollout 数据。
+
+它必须可由服务用户读写。Docker 使用时应挂载为私有持久卷，不要复制进镜像。
+
+## Codex 原生 Provider
+
+应用内置三项经过真实 Responses API 和工具调用验证的配置：
+
+| ID | 模型 | Base URL | 环境变量 |
 |---|---|---|---|
-| `MUSELAB_TOKEN` | Web UI / API 鉴权 token | 随机（安装器生成） | **是** —— ≥16 字符 |
-| `MUSELAB_ROOT` | 归档目录的绝对路径（原生部署） | —— | **是**（原生部署） |
-| `MUSELAB_HOST` | uvicorn 绑定的网络接口 | `127.0.0.1` | 否 |
-| `MUSELAB_PORT` | 监听端口 | `8765` | 否 |
-| `MUSELAB_MODEL` | 新会话的默认模型 id | 未设置 | 否 —— **建议留空**，让 UI 自动选你配的第一个 provider |
+| `minimax` | `minimax-m2.7` | `https://api.minimaxi.com/v1` | `MINIMAX_API_KEY` |
+| `qwen` | `qwen3.7-plus` | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `DASHSCOPE_API_KEY` |
+| `mimo` | `mimo-v2.5-pro` | `https://api.xiaomimimo.com/v1` | `XIAOMI_MIMO_API_KEY` |
 
-> `MUSELAB_ROOT` 不能是裸系统路径（`/`、`/etc`、`/home`、`/var` 等）；后端会拒绝，避免把整块磁盘交给 agent。
+启用流程：
 
-## Provider 密钥
+1. 把 key 放进服务进程可继承的私有环境；
+2. 重启服务，让 app-server 继承变量；
+3. 打开“设置 → 模型”；
+4. 打开对应开关；
+5. 在新会话的模型菜单中选择模型。
 
-至少配一个。Anthropic 走 `claude login`（Pro/Max OAuth），无需密钥。其余都是 API key。这些也能在设置面板里配。
+开关通过 `config/value/write` 写入 Codex `model_providers.<id>`，使用 `wire_api = "responses"`。网页只看到环境变量名和启用状态，不读取 key 值。
 
-| Provider | API-key 环境变量 | 默认 base URL | base URL 覆盖 |
-|---|---|---|---|
-| Anthropic（Claude） | `ANTHROPIC_API_KEY`（或 `claude login`） | api.anthropic.com | —— |
-| DeepSeek | `DEEPSEEK_API_KEY` | api.deepseek.com/anthropic | `DEEPSEEK_BASE_URL` |
-| 智谱 GLM | `ZHIPUAI_API_KEY` | open.bigmodel.cn/api/anthropic | `ZHIPUAI_BASE_URL` |
-| MiniMax（国内） | `MINIMAX_API_KEY` | api.minimaxi.com/anthropic | `MINIMAX_BASE_URL` |
-| MiniMax（国际） | `MINIMAX_INTL_API_KEY` | api.minimax.io/anthropic | —— |
-| Kimi / Moonshot | `MOONSHOT_API_KEY` | api.moonshot.cn/anthropic | `MOONSHOT_BASE_URL` |
-| Qwen / DashScope | `DASHSCOPE_API_KEY` | dashscope.aliyuncs.com/apps/anthropic | `DASHSCOPE_BASE_URL` |
-| 小米 MiMo | `XIAOMI_MIMO_API_KEY` | api.xiaomimimo.com/anthropic | `XIAOMI_MIMO_BASE_URL` |
-| 百度 ERNIE（千帆） | `QIANFAN_API_KEY` | qianfan.baidubce.com/anthropic | `QIANFAN_BASE_URL` |
-| Codex Gateway | `CODEX_GATEWAY_API_KEY` | 127.0.0.1:8317 | `CODEX_GATEWAY_BASE_URL` |
+为兼容性，这三项 Provider 的 thread 配置会关闭 Codex Web Search；文件、终端、Skills 和 MCP 等本地工具仍由 Codex 原生执行。
 
-注意：
-- **MiniMax 国内与国际用不同的密钥。** `minimaxi.com` 的 key 在 `minimax.io` 上会 401，反之亦然 —— 配与你账户匹配的那个。
-- **Qwen** 国内与国际端点共用 `DASHSCOPE_API_KEY`；国际变体在 UI 里按模型选择。
-- 你自己在设置里添加的 provider，密钥名为 `MUSELAB_PROVIDER_<SLUG>_API_KEY`。
-- **Codex Gateway** 是本地 Anthropic 兼容 sidecar。这里的 token 只用于 gateway；muselab 不保存 Codex OAuth 凭据。
-- **生图** 与聊天 provider 分离。默认 `MUSELAB_IMAGE_PROVIDER=auto`：如果配置了
-  `OPENAI_IMAGE_API_KEY`（或复用 `OPENAI_API_KEY`）就走 OpenAI Image API。本机
-  Codex `$imagegen` 必须显式 opt-in：仅在可信 localhost 实例上设置
-  `MUSELAB_IMAGE_PROVIDER=codex_imagegen` 与 `CODEX_IMAGEGEN_ENABLED=true`。如果你的
-  本地网关暴露 OpenAI-compatible image endpoint，可把 `OPENAI_IMAGE_BASE_URL` 指向
-  对应 `/v1`，并使用 `openai` provider。
+## 设置界面能修改什么
 
-接入列表之外的 Anthropic 兼容端点，见 [add-provider_zh.md](add-provider_zh.md)。
+| 设置 | 持久化位置 |
+|---|---|
+| 模型 Provider 开关 | Codex `config.toml` 的 `model_providers` |
+| Skills 启用状态 | app-server `skills/config/write` |
+| MCP server | app-server MCP 配置接口 |
+| 会话模型、审批策略、effort | Codex thread／turn 参数 |
+| 主题、布局和部分 UI 偏好 | 浏览器本地存储 |
 
-## 可选调优
+网页不会修改 `MUSELAB_ROOT`、监听地址、主 token 或 Provider key。部署级配置需要编辑私有环境并重启。
 
-全部可选；未设置时用合理默认。
+## Docker 配置
 
-| 变量 | 作用 | 默认 |
-|---|---|---|
-| `MUSELAB_PROMPT_CACHE_TTL` | Claude prompt 缓存 TTL（`1h` / `5m` / 空=CLI 默认） | `1h` |
-| `MUSELAB_BUDGET_USD` | 月度软预算 —— 仅 UI 角标提示，不硬性中断 | `0`（关闭） |
-| `MUSELAB_MAX_UPLOAD_MB` | 单次上传大小上限（MiB） | `100` |
-| `MUSELAB_IMAGE_PROVIDER` | Composer 生图后端（`auto`、`openai`、`codex_imagegen`） | `auto` |
-| `OPENAI_IMAGE_API_KEY` | Composer GPT Image 工具使用的 API key | 未设置 |
-| `OPENAI_IMAGE_BASE_URL` | 生图使用的 OpenAI-compatible `/v1` base URL | `https://api.openai.com/v1` |
-| `MUSELAB_IMAGE_GENERATION_TIMEOUT` | 生图超时时间（秒） | `180` |
-| `CODEX_IMAGEGEN_ENABLED` | `MUSELAB_IMAGE_PROVIDER=codex_imagegen` 或 `auto` 无图片 API key 时，是否允许本机 Codex `$imagegen` | `false` |
-| `CODEX_IMAGEGEN_TIMEOUT_SECONDS` | 本机 Codex 生图超时时间（秒） | `300` |
-| `MUSELAB_MAX_TURNS` | 每会话最大回合数（0 = 不限） | `0` |
-| `MUSELAB_THINKING_BUDGET` | 扩展思考 token 预算（0 = 关） | `10000` |
-| `MUSELAB_CLIENT_POOL_CAP` | 保活的 SDK client 池大小 | `3` |
-| `MUSELAB_DISABLED_PROVIDERS` | 要隐藏的 provider 模型 id（逗号分隔） | 空 |
-| `MUSELAB_DISABLE_SKILLS` | 关闭内置 skills（`1`/`true`） | 关 |
-| `MUSELAB_PRUNE_EMPTY_SESSIONS` | 自动删除无消息的空会话（`true`） | `false` |
-| `MUSELAB_TRASH_TTL_DAYS` | 软删除文件在 `.muselab-dustbin/` 保留天数（0 = 永久） | `30` |
-| `MUSELAB_VAPID_SUBJECT` | Web-push VAPID `sub` 声明（一个 `mailto:`） | `mailto:noreply@muselab.dev` |
-| `MUSELAB_DEFAULT_PERMISSION` | 默认权限模式 | `bypassPermissions` |
+`docker-compose.yml` 会把宿主 `.env` 注入容器，并覆盖容器内：
 
-> VAPID **密钥** 不是环境变量 —— 它们在磁盘上生成于 `<archive>/.muselab/vapid.json`。只有上面的 subject 可配置。
+```text
+MUSELAB_ROOT=/data
+CODEX_HOME=/home/muse/.codex
+```
 
-## 仅 Docker
+需要挂载：
 
-由 `docker-compose.yml` 读取，后端**不读**：
+- `ARCHIVE_DIR` → `/data`；
+- 宿主 `CODEX_HOME` → `/home/muse/.codex`。
 
-| 变量 | 作用 | 默认 |
-|---|---|---|
-| `ARCHIVE_DIR` | 挂载到容器 `/data` 的宿主机目录 | `./data` |
-| `CLAUDE_HOME` | 宿主机 `~/.claude`（OAuth 凭证）路径 | `${HOME}/.claude` |
-| `MUSELAB_BIND` | 发布端口绑定的宿主机接口 | `127.0.0.1` |
+容器默认端口映射只绑定 `127.0.0.1`。Docker 中的登录态和配置卷同样属于敏感数据。
 
-## 仅安装期
+## 变更后何时生效
 
-由安装脚本读取，运行中的后端**不读**：
-
-| 变量 | 作用 | 默认 |
-|---|---|---|
-| `MUSELAB_NONINTERACTIVE` | 全取默认值，跳过所有交互 | `0` |
-| `MUSELAB_LOCALE` | intake 引导 + 预置 `CLAUDE.md` 的语言 | 自动（`LANG`） |
-
-运行中的后端从 `LANG` / `LC_ALL` 判断语言，而非 `MUSELAB_LOCALE`。
-
-## 把 muselab 暴露到 localhost 之外
-
-`MUSELAB_HOST`（以及 Docker 的 `MUSELAB_BIND`）默认 `127.0.0.1` 是一道安全底线：公网与你的归档之间唯一的屏障就是那个 token。若把任一项设为 `0.0.0.0`，请在前面架一层带 HTTPS 的反向代理 —— 见 [手机端 / HTTPS](mobile_zh.md) 与 `scripts/setup-https.sh`。
+| 变更 | 是否重启 |
+|---|:---:|
+| 修改 `.env`、Provider key、`CODEX_BIN` | 是 |
+| 网页启停原生 Provider | 通常无需重启；新 thread 生效 |
+| 修改 `AGENTS.md` | 后续 Codex thread／turn 按原生规则加载 |
+| 增删 Skill | 重新打开 Skills 抽屉强制刷新 |
+| 修改 MCP | 通过设置页刷新或重载 |
+| 修改前端静态文件 | 开发模式刷新；受管理服务重启后强刷浏览器 |

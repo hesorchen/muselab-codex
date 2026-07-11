@@ -1,7 +1,7 @@
 {
   "name": "muselab",
   "short_name": "muselab",
-  "description": "Meet Muse — your local Claude Code workspace",
+  "description": "Meet Muse — your local Codex workspace",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",

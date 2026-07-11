@@ -16,12 +16,12 @@ assignees: ''
 
 ## Does this fit muselab's scope?
 
-muselab is "personal archive + Claude Agent SDK" — single-user, ~40k lines,
-no build step. Please confirm the feature aligns:
+muselab-codex is a single-user Codex-native workspace with no frontend build
+step. Please confirm the feature aligns:
 
 - [ ] Helps a solo user work with their own files
 - [ ] Doesn't require a build step / framework / heavy deps
 - [ ] Doesn't duplicate what LobeChat / OpenWebUI / AnythingLLM already own
-- [ ] If it needs a new SDK capability, that capability exists today
+- [ ] If it needs a runtime capability, Codex app-server supports it today
 
-## SDK / vendor dependencies (if any)
+## Codex app-server dependency (if any)

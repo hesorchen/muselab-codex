@@ -24,6 +24,12 @@ def push_mod(app_module):
 
 # ====== VAPID key generation / persistence ======
 
+def test_init_does_not_eagerly_generate_vapid(push_mod, temp_root):
+    push_mod.init()
+
+    assert push_mod._vapid is None
+    assert not (temp_root / ".muselab" / "vapid.json").exists()
+
 def test_vapid_generated_and_persisted(push_mod, temp_root):
     """First call generates a P-256 keypair, writes vapid.json, and returns
     a urlsafe-base64 public key. The on-disk file holds the private PEM in

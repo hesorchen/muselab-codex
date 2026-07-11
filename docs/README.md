@@ -1,60 +1,45 @@
-# muselab docs
+# muselab-codex documentation
 
-> [简体中文](README_zh.md) · [← back to project README](../README_en.md)
+> [简体中文](README_zh.md) · [← Back to project README](../README_en.md)
 
-## Install & run
+muselab-codex is a single-user, self-hosted workspace built around `codex app-server`. The documentation follows the path from installation to daily use, architecture, and operations. New users should begin with [Quick start](quickstart.md).
 
-- [Quick start](quickstart.md) — prerequisites, Docker, dev mode, per-OS notes
-- [Install on Linux](install-linux.md)
-- [Install on macOS](install-macos.md)
-- [Upgrading](upgrade.md) — bump the SDK + CLI without losing data
+## Install and upgrade
 
-## Use
+- [Quick start](quickstart.md) — supported run modes, first login, health checks, and WSL2 notes
+- [Linux installation](install-linux.md) — systemd user service, logs, linger, and uninstall
+- [macOS installation](install-macos.md) — launchd agent, PATH, logs, and uninstall
+- [Upgrade](upgrade.md) — update code and dependencies, check the Codex CLI baseline, verify, and roll back
 
-- [Personalize your CLAUDE.md](personalize-claude-md.md) — teach Muse about you
-- [Skills](skills.md) — what ships out of the box, and how to add your own
-- [Mobile (PWA)](mobile.md) — install to home screen, push notifications, HTTPS
-- [Scheduled tasks](scheduler.md) — run a saved prompt on a cadence
+## Use and configure
 
-## Models
+- [Configuration](configuration.md) — `.env`, `CODEX_HOME`, `AGENTS.md`, providers, and security boundaries
+- [Skills](skills.md) — native discovery, enablement, scopes, and custom Skills
+- [Scheduler](scheduler.md) — saved prompts, execution history, time zones, and unattended risk
+- [Mobile PWA](mobile.md) — home-screen installation, HTTPS, notifications, and multi-device use
+- [The nine Muses](muses.md) — product naming and conversation-entry concepts
 
-- [Providers](providers.md) — the built-in catalog (Claude, DeepSeek, GLM,
-  MiniMax, Kimi, Qwen, Xiaomi MiMo, Baidu ERNIE, Codex Gateway)
-- [Codex Gateway](codex-gateway.md) — connect a local Codex-backed Anthropic-compatible sidecar
-- [Add a provider](add-provider.md) — wire any Anthropic-compatible endpoint
-- [Model routing & the chat loop](routing.md) — how a model is chosen, pooled,
-  and billed to the right account
+## Architecture and implementation
 
-## Architecture & internals
+- [Architecture](architecture.md) — ownership boundaries, request flow, event routing, persistence, and security
+- [Infrastructure](infrastructure.md) — systemd, launchd, Docker, health checks, CI, and release gates
+- [Native implementation specs](specs/) — protocol choices and verification records for each implementation stage
+- [Tool catalog snapshot](tool-catalog.txt) — a development reference for observed tool-event shapes
 
-Source-linked deep dives — start at [Architecture](architecture.md) for the map.
+## Operations
 
-- [Architecture](architecture.md) — directory map + how a request flows
-- [Session internals](backend-sessions.md) — index, sidecars, queue, fork,
-  restart recovery
-- [Files API](backend-files.md) — every `/api/files/*` endpoint + `safe_resolve`
-- [Security model](backend-security.md) — auth, billing isolation, honest
-  limitations
-- [Frontend internals](frontend.md) — no-build SPA, rendering pipeline, SSE
-  client, service worker
-- [MCP architecture](mcp-architecture.md) — connector strategy and the
-  three-layer model
-- [Infrastructure](infrastructure.md) — scripts, services, Docker, tests, CI/CD
+- [Troubleshooting](troubleshooting.md) — doctor, logs, models, browser cache, MCP, and file permissions
+- [Data and backup](data-and-backup.md) — workspace, `.env`, `CODEX_HOME`, restore drills, and disposable state
+- [Security policy](../SECURITY.md) — threat model, deployment baseline, and vulnerability reporting
 
-## Reference
+## Project collaboration
 
-- [Configuration](configuration.md) — every `.env` variable + defaults
-- [Data & backup](data-and-backup.md) — what to back up, how to restore
-- [Troubleshooting](troubleshooting.md) — common failures and fixes
-- [Glossary](glossary.md) — muselab's terms of art, defined once
-
-## Concepts
-
-- [How it compares](comparison.md) — muselab vs other self-hosted AI workspaces
-- [The nine Muses](muses.md) — the lore behind the name
-
-## Project
-
-- [Security policy](../SECURITY.md)
 - [Contributing](../CONTRIBUTING.md)
+- [Development constraints](../AGENTS.md)
 - [Third-party licenses](../THIRD_PARTY_LICENSES.md)
+
+## Documentation conventions
+
+- Current behavior is defined by code, tests, and `codex app-server` responses. Specs record implementation decisions; they do not override runtime facts.
+- User-facing documents are maintained in both English and Chinese.
+- Examples use neutral paths and placeholder data. Real tokens, API keys, `CODEX_HOME`, and workspace contents must never enter public artifacts.

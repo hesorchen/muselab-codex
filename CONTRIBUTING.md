@@ -1,89 +1,65 @@
-# Contributing to muselab
+# Contributing to muselab-codex
 
-Thank you for considering a contribution. muselab is intentionally small
-(no npm, no build step) to keep the codebase fully readable.
+muselab-codex is a Codex-native, self-hosted AI workspace under active development. Read [AGENTS.md](AGENTS.md) and [Architecture](docs/architecture.md) before changing the agent-runtime path.
 
-## Quick start (dev loop)
+## Development setup
 
 ```bash
-git clone https://github.com/hesorchen/muselab && cd muselab
-uv sync                                   # install Python deps
-cp .env.example .env                      # then fill MUSELAB_TOKEN + MUSELAB_ROOT
-uv run uvicorn backend.main:app --reload  # dev server on :8765
-uv run pytest tests/                      # all tests should pass
+git clone https://github.com/hesorchen/muselab-codex
+cd muselab-codex
+uv sync
+uv run pytest tests/test_codex_app_server.py
 ```
 
-The frontend is plain HTML + Alpine.js v3 (vendored). No build step —
-edit `frontend/*.html|js|css`, hard-refresh the browser.
+The frontend remains plain HTML, Alpine.js, and CSS with no build step.
 
-## What is welcome
+## Welcome changes
 
-- **Bug fixes** with a regression test
-- **New providers** that have an Anthropic-compatible Messages endpoint
-  (a single `CATALOG` entry in `backend/endpoints.py`, see [docs/add-provider.md](docs/add-provider.md))
-- **MCP / skill presets** under `mcp.json.example` / `skills/`
-- **UI translations** (see the `zh` / `en` key tables in `frontend/i18n/index.js`)
-- **Documentation improvements** — clearer install instructions, personalization guidance, or FAQ entries
-- **Visual / UX polish** — please open an issue first describing the problem
+- Codex app-server process, protocol, and lifecycle fixes with offline tests.
+- Native thread, turn, streaming, tool, approval, Skills, and MCP integration.
+- File-management, preview, PWA, authentication, and accessibility fixes.
+- English and Chinese documentation updates that describe implemented behavior.
 
-## What will likely be declined
+## Changes that will be declined
 
-- Adding a build step (webpack / vite / etc.) — this would eliminate the "clone and run" property
-- Generic AI chat UI features that fall outside muselab's "personal archive
-  assistant" scope (e.g. plugin marketplace, document RAG over crawled content)
-- Provider integrations that require an OpenAI-only protocol (muselab routes
-  through the Claude Agent SDK, which expects Anthropic-compatible endpoints)
-- Anything that requires real personal data to test (all tests must work with
-  a throwaway archive directory)
+- Any compatibility runtime or provider that bypasses Codex app-server.
+- A second model runtime, a direct model API, or a protocol-conversion gateway.
+- Experimental app-server APIs without a requirement, fallback, and protocol test.
+- A frontend bundler, transpiler, or required npm build step.
+- Document RAG or pre-indexing over the user's workspace.
+- Tests that read a contributor's real files or require real personal data.
+
+## Protocol changes
+
+The initial baseline is `codex-cli 0.144.1` with stable app-server APIs over stdio. When changing the baseline:
+
+1. generate version-matched stable JSON Schema;
+2. record the CLI version and v2 schema SHA-256;
+3. update offline contract fixtures;
+4. run an opt-in live check in a temporary workspace;
+5. update both architecture documents when behavior changes.
+
+Do not commit the complete generated schema tree by default.
 
 ## Pull request checklist
 
-- [ ] `uv run pytest tests/` passes
-- [ ] `uv run ruff check backend/ tests/` passes (CI blocks merge on lint failures)
-- [ ] `bash scripts/lint.sh` passes (encoding / class-collision + personal-data leak scan)
-- [ ] Backend changes: added or updated a test in `tests/`
-- [ ] Frontend visual changes: described in the PR with a before/after note
-      (visual regression tests are not yet in place)
-- [ ] `mcp.json.example` / skills / install scripts: if adding a runtime
-      dependency (npx, uvx), install scripts must detect it and emit a warning
-- [ ] No secrets in code, commits, or test fixtures
-- [ ] No additions to `sessions/` or `.env` (those are gitignored and must
-      remain so)
+- [ ] `uv run pytest tests/` passes, or a known teardown limitation is documented accurately.
+- [ ] `uv run ruff check backend/ tests/` passes.
+- [ ] `bash scripts/lint.sh` passes.
+- [ ] `node --check frontend/app.js` passes when frontend code changes.
+- [ ] Backend behavior has deterministic offline tests.
+- [ ] Live Codex tests are explicit, ephemeral, and use a temporary workspace.
+- [ ] User-facing strings exist in both English and Chinese.
+- [ ] No secrets, personal data, prompts, file contents, or home-directory names appear in tracked artifacts or logs.
+- [ ] No additions to `.env`, `sessions/`, or Codex authentication state.
 
 ## Code style
 
-- Python: PEP 8, no formatter enforced. Prefer clarity over cleverness.
-- Type hints on public functions; not required everywhere.
-- JavaScript: no transpiler — write the dialect that Alpine v3 and modern
-  browsers understand. Match the semicolon style of neighbouring code.
-- CSS: per-component sections with a comment header (see `frontend/styles.css`).
-  Use CSS variables (`--c-*`, `--sp-*`) for theming; do not hardcode colors.
+- Python: PEP 8, type hints on public functions, no broad formatter churn.
+- JavaScript: modern-browser syntax that runs directly, matching neighboring style.
+- CSS: component sections and existing CSS variables; do not hardcode theme colors.
+- Disk writes: explicit UTF-8 and atomic writes for user-visible application state.
 
-## Keeping personal data out (leak scan)
+## Security reports
 
-`scripts/lint.sh` runs a personal-data leak scan over tracked files
-(constitution P6 — no real personal data in shipped artifacts):
-
-- **Generic PII** (phone / national-ID patterns) — always on, runs in CI.
-- **Maintainer identity** — your OS login and home-dir name are derived at
-  runtime (nothing private is stored in the script), so a stray `/home/<you>/`
-  path or username is caught automatically.
-- **Optional private blacklist** — for names a regex can't know (real name,
-  employer, target companies), create `scripts/.leak-blacklist` (gitignored,
-  one literal per line) or point `MUSELAB_LEAK_BLACKLIST` at a file outside the
-  repo. The scan hard-fails if that blacklist ever becomes git-tracked.
-
-## Filing an issue
-
-- **Bug**: include browser and OS, what you did, what happened, and what
-  you expected. For server-side issues, attach sanitized logs from
-  `journalctl --user -u muselab -n 50` (Linux) or `tail $LOG_DIR/stderr.log`.
-- **Feature request**: describe the user problem first, then the proposed
-  solution. If the feature requires a new SDK capability, note which one.
-- **Provider not working**: use the `Test` button in Settings → Provider
-  Keys first; then paste a sanitized excerpt of the vendor response.
-
-## Security
-
-For potential security issues (authentication bypass, RCE, path traversal),
-please follow [SECURITY.md](SECURITY.md) — do not open a public issue.
+Follow [SECURITY.md](SECURITY.md). Do not open a public issue for an exploitable authentication, file-access, sandbox, or credential bug.

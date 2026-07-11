@@ -1,134 +1,136 @@
-# 在 Linux 上安装 muselab
+# Linux／WSL2 安装
 
-> [English](install-linux.md)
+> [English](install-linux.md) · [← 文档索引](README_zh.md)
 
-桌面 / 个人服务器 Linux 一键安装。作为**用户级 systemd 服务**运行——
-无需 root，无系统级配置，容易撤销。
+Linux 安装器把 muselab-codex 注册为当前用户的 systemd 服务。不要用 root 或 `sudo bash scripts/install-linux.sh` 运行。
 
-## 环境要求
+## 前置条件
 
-- 带 `systemd` 的 Linux（Ubuntu 18.04+ / Debian 10+ / Fedora 30+ / Arch / …）
-- `uv`（[安装文档](https://docs.astral.sh/uv/getting-started/installation/)）：
-  ```bash
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  ```
-- （需要 Anthropic 模型时）`claude` CLI 登录过一次：
-  ```bash
-  claude login
-  ```
-  多数非 Claude provider（DeepSeek / GLM / MiniMax / Kimi / Qwen / 小米 MiMo / 百度千帆（ERNIE））只需 API key——稍后在 Settings UI 内填即可，无需 CLI。Codex Gateway 需要本地 sidecar 和本地 token，见 [Codex Gateway](codex-gateway_zh.md)。
+- 普通用户 shell；
+- 可用的 `systemctl --user`；
+- `uv`、Node.js／npm、Git；
+- 已完成 `codex login`；
+- 当前用户可读写的工作区目录。
+
+验证：
+
+```bash
+systemctl --user is-system-running
+uv --version
+npm --version
+codex login status
+```
+
+安装器会在缺少 Codex CLI 时安装 `scripts/versions.env` 固定的版本，但不会替你完成交互式登录。
 
 ## 安装
 
 ```bash
-git clone https://github.com/hesorchen/muselab && cd muselab
+git clone https://github.com/hesorchen/muselab-codex
+cd muselab-codex
 bash scripts/install-linux.sh
 ```
 
-脚本会：
+流程如下：
 
-1. 校验 `uv` 和 `systemctl` 可用
-2. 执行 `uv sync` 安装 Python 依赖
-3. **询问你**的 archive 目录（Muse 可读写的文件夹），默认 `~/muselab-archive`
-4. 生成 `.env`（含随机 `MUSELAB_TOKEN` 和 `MUSELAB_HOST=127.0.0.1`）
-5. 写入 `~/.config/systemd/user/muselab.service` 并执行 `systemctl --user enable --now`
+1. 拒绝 root，并检查 systemd、`uv` 和 npm；
+2. 安装或验证固定版本 Codex CLI；
+3. 检查 `codex login status`；
+4. 执行 `uv sync --frozen`；
+5. 首次运行时创建工作区和随机 token 的 `.env`；
+6. 根据模板生成 `~/.config/systemd/user/muselab.service`；
+7. `enable --now` 启动服务。
 
-如果 `.env` 已存在，脚本会保留不动（可安全重跑）。
+已有 `.env` 不会被覆盖。需要修改工作区或端口时，先手工编辑，再重启服务。
 
-## 验证
+## 服务单元
+
+服务执行：
+
+```text
+WorkingDirectory=<repository>
+EnvironmentFile=<repository>/.env
+ExecStart=<uv> run python -m backend.main
+```
+
+它使用 `Restart=on-failure`，并设置进程数、文件描述符和内存上限。日志进入用户 journal。
+
+常用命令：
 
 ```bash
 systemctl --user status muselab
-xdg-open http://localhost:8765      # 或直接在浏览器打开
-grep MUSELAB_TOKEN .env              # 登录时粘贴 token
+systemctl --user restart muselab
+systemctl --user stop muselab
+journalctl --user -u muselab -n 100
+journalctl --user -u muselab -f
 ```
 
-## 重启后会自动启动吗？
-
-默认情况下，user systemd 服务在你登出时会停止（重启后未登录也不会启动）。
-执行一次 lingering 就能让 muselab 在机器开机时常驻：
+若短时间连续失败达到 systemd 限制：
 
 ```bash
-sudo loginctl enable-linger $USER
+systemctl --user reset-failed muselab
+systemctl --user start muselab
 ```
 
-验证：`loginctl show-user $USER | grep Linger` → `Linger=yes`。
+## 注销后保持运行
 
-## 常用命令
+部分服务器在用户退出登录后会停止用户服务。检查：
 
 ```bash
-systemctl --user status   muselab     # 查看状态
-systemctl --user restart  muselab     # 重启
-systemctl --user stop     muselab     # 停止（不取消自启）
-systemctl --user disable  muselab     # 取消自启（保留 unit 文件）
-journalctl --user -u muselab -f       # tail 日志
-journalctl --user -u muselab -n 200   # 最近 200 行
-
-bash scripts/doctor.sh                # 重新校验安装并探测服务
-bash scripts/intake.sh                # 重做 profile intake / 更新 CLAUDE.md
+loginctl show-user "$USER" -p Linger
 ```
 
-## 重做 intake / 刷新档案
-
-installer 的 7 问 intake 可以随时重跑：
+需要时启用：
 
 ```bash
-bash scripts/intake.sh
+sudo loginctl enable-linger "$USER"
 ```
 
-生活变化（换工作 / 搬家 / 新增家庭成员）后或安装时跳过了 intake 时很有用。
-现有 `CLAUDE.md` 会在覆盖前备份到 `CLAUDE.md.bak`。
+这一步需要系统管理员权限，但安装器和应用本身仍应以普通用户运行。
 
-## 校验安装 / 调试异常
+## WSL2
+
+若 `systemctl --user` 不可用，在 WSL 内创建或修改 `/etc/wsl.conf`：
+
+```ini
+[boot]
+systemd=true
+```
+
+然后从 Windows PowerShell 执行：
+
+```powershell
+wsl --shutdown
+```
+
+重新打开 WSL，确认 systemd 用户实例正常后再安装。
+
+## 安装后检查
 
 ```bash
 bash scripts/doctor.sh
+curl http://127.0.0.1:8765/api/health
 ```
 
-逐项检查 uv / claude CLI / `.env` / 服务状态 / HTTP / token / provider key，阻塞性失败时返回非零。
+再打开浏览器，输入 `.env` 里的 token，创建 thread 并执行一次文件读取。不要把 token 粘贴到 issue 或日志中。
 
-## VPS 上跑 muselab 时如何从笔记本访问
+## 更新与迁移
 
-默认仅绑定 `127.0.0.1:8765`——**有意为之**。即使防火墙开了，你的 VPS 上的 8765
-端口对笔记本浏览器**不可达**。三种实际可用的方式：
-
-### A. SSH tunnel（推荐——零额外配置）
-
-在**笔记本**上：
+代码或配置更新后：
 
 ```bash
-ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
+bash scripts/upgrade.sh
+systemctl --user restart muselab
+bash scripts/doctor.sh
 ```
 
-保持终端不关。然后在笔记本浏览器访问 `http://localhost:8765` 就能命中 VPS 上的
-muselab。不开防火墙、不暴露认证、零额外组件。
+从旧 muselab 只迁移最小部署设置和已验证 Provider key 时：
 
-### B. Tailscale / WireGuard（适合「常驻」远程）
+```bash
+bash scripts/migrate-native-provider-keys.sh /path/to/old/.env
+```
 
-把 VPS 和笔记本加入同一个 Tailscale 网络，访问
-`http://<vps-tailscale-ip>:8765`。tunnel 端到端加密，由 Tailscale 提供认证，
-所以绑定 127.0.0.1 没问题。
-
-### C. 绑定到 LAN（仅在你完全信任网络时） — 见下文
-
-## 暴露到 LAN（可选）
-
-默认仅绑定 `127.0.0.1`——你自己的浏览器。让同一 WiFi 的手机 / 平板能连：
-
-1. 编辑 `.env`：
-   ```
-   MUSELAB_HOST=0.0.0.0
-   ```
-2. 开防火墙：
-   ```bash
-   sudo ufw allow 8765/tcp        # Ubuntu / Debian
-   sudo firewall-cmd --add-port=8765/tcp --permanent && sudo firewall-cmd --reload  # Fedora / RHEL
-   ```
-3. 重启：`systemctl --user restart muselab`
-4. 在同 WiFi 的设备上访问：`http://<machine-ip>:8765`
-
-⚠ 网络里任何拿到 token 的人都对 `MUSELAB_ROOT` 有 shell 级访问权限。
-不可信网络上请在前面加 HTTPS + nginx basic-auth。
+脚本不显示密钥，也不会迁移旧模型路由。
 
 ## 卸载
 
@@ -136,14 +138,8 @@ muselab。不开防火墙、不暴露认证、零额外组件。
 bash scripts/uninstall-linux.sh
 ```
 
-停止服务并删除 unit 文件。`.env`、`sessions/`、archive 目录**不会**被动。
-彻底删除请直接删除仓库。
+卸载脚本移除用户服务，但应保留工作区、`.env` 和 Codex 数据。执行前仍建议按[数据与备份](data-and-backup_zh.md)完成备份。
 
-## 排错
+## 远程访问
 
-| 现象 | 排查 |
-|------|------|
-| `service failed to start` | `journalctl --user -u muselab -n 50`——通常是 `.env` 缺值或端口冲突 |
-| 端口被占 | `lsof -iTCP:8765 -sTCP:LISTEN` → 杀进程或改 `MUSELAB_PORT` |
-| Anthropic 模型 401 | `~/.claude/.credentials.json` 缺失——执行一次 `claude login` |
-| 登出后服务停止 | 开启 lingering（见[重启后会自动启动吗？](#重启后会自动启动吗)）|
+服务默认只监听回环地址。VPS 上可运行 `scripts/setup-https.sh` 配置 Caddy；仍应增加额外访问控制，并确保上游 8765 端口不对公网开放。详见[安全策略](../SECURITY.md)。

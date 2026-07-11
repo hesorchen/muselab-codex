@@ -1,4 +1,4 @@
-# Dependabot keeps claude-agent-sdk + other Python deps current.
+# Dependabot keeps the Python runtime dependencies current.
 # Weekly cadence: enough to track upstream releases without PR noise.
 # Group all SDK-adjacent deps so one PR == one upgrade to review.
 version: 2
@@ -10,10 +10,6 @@ updates:
       day: "monday"
     open-pull-requests-limit: 5
     groups:
-      claude-sdk:
-        patterns:
-          - "claude-agent-sdk"
-          - "anthropic*"
       framework:
         patterns:
           - "fastapi"

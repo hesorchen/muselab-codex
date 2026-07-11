@@ -1,6 +1,6 @@
 # 九位缪斯
 
-> [English](muses.md)
+> [English](muses.md) · [← 文档索引](README_zh.md)
 
 muselab 命名源自希腊神话中的**九位缪斯**——艺术与学问的守护女神。**Muse** 是运行于其中的 AI 人格；**muselab** 是承载她的工作坊。
 

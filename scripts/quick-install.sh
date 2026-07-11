@@ -7,7 +7,7 @@
 # What it does:
 #   1. Detects OS (Linux + WSL / macOS — other platforms refuse)
 #   2. Installs `uv` (the only Python prerequisite) if missing
-#   3. Clones https://github.com/hesorchen/muselab → ~/muselab
+#   3. Clones https://github.com/hesorchen/muselab-codex → ~/muselab-codex
 #      (or prompts for a different dir; refuses to clobber an existing
 #      checkout without consent)
 #   4. Hands off to scripts/install-{linux,macos}.sh — those scripts know
@@ -26,8 +26,8 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/hesorchen/muselab"
-DEFAULT_DEST="$HOME/muselab"
+REPO_URL="https://github.com/hesorchen/muselab-codex"
+DEFAULT_DEST="$HOME/muselab-codex"
 
 bold() { printf "\033[1m%s\033[0m\n" "$*"; }
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
@@ -56,7 +56,7 @@ ask_tty() {
   echo "${ans:-$def}"
 }
 
-bold "muselab — one-line bootstrap"
+bold "muselab-codex — one-line bootstrap"
 if [[ "$NONINT" == "1" ]]; then
   echo "  Mode: non-interactive (all defaults, no prompts)"
 fi
@@ -148,14 +148,14 @@ fi
 
 # ----- 5. Pick clone destination ---------------------------------------------
 echo
-bold "Where to install muselab?"
+bold "Where to install muselab-codex?"
 DEST="$(ask_tty "Clone destination" "$DEFAULT_DEST")"
 # Expand ~ manually since `read` doesn't.
 DEST="${DEST/#\~/$HOME}"
 
 if [[ -d "$DEST" ]]; then
   if [[ -d "$DEST/.git" ]] && [[ -f "$DEST/scripts/install-linux.sh" ]]; then
-    warn "$DEST already looks like a muselab checkout."
+    warn "$DEST already looks like a muselab-codex checkout."
     # In non-interactive mode, re-running should be idempotent → default "y".
     # Interactive default stays "n" since the user might have meant a fresh dir.
     DEFAULT_REUSE="n"

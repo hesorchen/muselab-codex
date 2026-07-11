@@ -1,48 +1,46 @@
 # 数据与备份
 
-> [English](data-and-backup.md)
+> [English](data-and-backup.md) · [← 文档索引](README_zh.md)
 
-muselab 没有数据库 —— 所有状态都是分布在三处的纯文件：
+muselab-codex 不使用应用数据库。当前原生运行时的状态分布在三处：
 
-1. **归档**（`MUSELAB_ROOT`）—— 你自己的文件，
-2. **仓库** —— 配置与会话元数据，
-3. **`~/.claude/`** —— Claude CLI 的对话记录与登录凭证。
+1. `MUSELAB_ROOT` 指向的 workspace；
+2. service `.env` 等部署配置；
+3. `$CODEX_HOME`（通常是 `~/.codex`）下的 Codex CLI 状态。
 
-要把一个 muselab 实例迁到新机器，复制下面三组"必须备份"即可。其余的会自行重建。
-
-## 需要备份的
+## 需要备份的内容
 
 | 路径 | 内容 | 为何重要 |
 |---|---|---|
-| `$MUSELAB_ROOT/` | 你的归档 —— 你放进去的每个文件 | 这就是你的数据 |
-| `$MUSELAB_ROOT/.muselab/scheduler.json` | 定时任务 + 运行历史 | 丢了就得重建所有定时任务 |
-| `<repo>/.env` | 全部配置**含密钥**（token + provider key） | 含凭证 —— 安全备份，切勿提交 |
-| `<repo>/sessions/` | 会话索引、每条消息的 sidecar（成本、模型标识、上传附件）、待发队列 | muselab 专属元数据，不在 CLI 记录里 |
-| `<repo>/mcp.json` | MCP server 配置 | 仅当你配了 MCP |
-| `<repo>/provider_overrides.json` | 对内置 provider 的修改 + 自定义 provider | 仅当你定制过 provider |
-| `~/.claude/projects/<cwd-key>/*.jsonl` | **实际的对话记录** | 真正的聊天历史 —— 归 CLI 所有 |
-| `~/.claude/.credentials.json` | Claude Pro/Max OAuth 登录 | 不备份就重新跑一次 `claude login` |
+| `$MUSELAB_ROOT/` | 你的文件和 muselab-codex workspace 状态 | 这是用户拥有的工作目录 |
+| `$MUSELAB_ROOT/.muselab-codex/attachments/threads/` | 已写入 Codex thread 的附件文件 | 恢复附件预览和 transcript 中本地路径所必需 |
+| `$MUSELAB_ROOT/.muselab-codex/usage/` | 每个 thread 的脱敏数字 token-usage 快照 | 后端重启后继续显示 context meter 所必需 |
+| `$MUSELAB_ROOT/.muselab-codex/scheduler.json` | 计划任务、运行历史和未读数 | 恢复自动任务所必需 |
+| `$MUSELAB_ROOT/.muselab/` | VAPID 私钥和设备推送订阅 | 保持现有设备通知有效 |
+| `$MUSELAB_ROOT/.muselab-dustbin/` | 文件回收站内容与 manifest | 恢复尚未永久删除的文件 |
+| 当前 service 使用的 `.env` | `MUSELAB_ROOT`、token、端口和其他部署设置 | 含密钥；只能私密保存，不能提交 |
+| `$CODEX_HOME/` | Codex 配置、登录状态和 Codex 管理的 thread／rollout 数据 | Codex 是 transcript 的真相源 |
 
-> `.env` 和 `~/.claude/.credentials.json` 含密钥。备份到私密位置；不要放进 git 仓库或共享盘。
+`$CODEX_HOME` 可能含登录凭证，只能备份到私密、加密的位置。如果你有意不备份登录状态，恢复后重新登录 Codex 即可。
 
-## 不需要备份的
+应用不使用独立会话数据库或 Provider 路由文件。thread 和配置都以 Codex 为唯一真相源。
 
-这些会自动重建：
+## 可以丢弃的内容
 
 | 路径 | 说明 |
 |---|---|
-| `$MUSELAB_ROOT/.muselab/vapid.json` | Web-push 密钥对 —— 会重建，但删掉会强制所有设备重新订阅 |
-| `$MUSELAB_ROOT/.muselab/push_subs.json` | 推送订阅 —— 设备会自行重新订阅 |
-| `$MUSELAB_ROOT/.muselab-dustbin/` | 软删除回收站，超过 `MUSELAB_TRASH_TTL_DAYS` 自动清理 |
-| `/tmp/muselab-vendor-cli-config-*` | 第三方 provider 的临时隔离 CLI 配置 |
-| `<repo>/.venv/`、缓存、日志 | 由 `uv sync` / 运行时重建 |
+| `$MUSELAB_ROOT/.muselab-codex/attachments/staged/` | 尚未发送的上传文件；服务停止时可以安全删除 |
+| `<repo>/.venv/`、缓存和日志 | 由 `uv sync` 或运行时重新生成 |
+| 临时 app-server schema 目录 | 需要时根据固定版本的 Codex CLI 重新生成 |
 
-## 在新机器上恢复
+## 恢复步骤
 
-1. 正常安装 muselab（见 [快速入门](quickstart_zh.md)）。
-2. 停掉服务。
-3. 恢复 `$MUSELAB_ROOT/`（含其 `.muselab/scheduler.json`）、仓库的 `.env` / `sessions/` / `mcp.json` / `provider_overrides.json`，以及 `~/.claude/`。
-4. 确认恢复后的 `.env` 里 `MUSELAB_ROOT` 指向归档的新位置。
-5. 启动服务。会话、定时任务、历史都会原样回来。
+1. 安装相同的受支持 Codex CLI 和 muselab-codex 版本。
+2. 停止服务。
+3. 恢复 `$MUSELAB_ROOT`、当前 service 使用的 `.env` 和 `$CODEX_HOME`。
+4. 检查 `MUSELAB_ROOT`、`HOME` 与可选的 `CODEX_HOME` 是否指向恢复后的目录。
+5. 确认 `codex login status`，然后启动 muselab-codex。
+6. 打开一个近期 thread，分别验证 transcript 和一个附件。
+7. 检查计划任务与推送订阅；发送测试通知验证 VAPID 恢复。
 
-恢复后快速自检：`bash scripts/doctor.sh`。
+恢复实例时，请使用对应的服务管理与升级说明。

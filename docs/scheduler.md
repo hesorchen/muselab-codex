@@ -1,6 +1,6 @@
 # Scheduled tasks
 
-> [简体中文](scheduler_zh.md)
+> [简体中文](scheduler_zh.md) · [← Documentation index](README.md)
 
 muselab can run a saved prompt on a schedule — a lightweight cron that
 lives inside the backend's asyncio loop, no external scheduler needed.
@@ -14,15 +14,14 @@ otherwise re-type on a fixed cadence.
 
 ## How it works
 
-- Tasks persist in `<archive>/.muselab/scheduler.json` alongside
+- Tasks persist in `<workspace>/.muselab-codex/scheduler.json` alongside
   muselab's other sidecar metadata, so they survive a restart.
-- On startup the next fire time is recomputed. If the process was down
-  through a fire window, the missed run is caught up (staggered to avoid
-  a thundering herd when several tasks were missed).
+- On startup the next future fire time is recomputed. Runs missed while the
+  service was stopped are not replayed.
 - A finished run increments an **unread** counter shown as a bell badge;
   opening the drawer acknowledges it back to zero.
-- If Web Push is configured, a long run also sends a push notification on
-  completion, even with the tab closed (see [Mobile](mobile.md)).
+- Completion is recorded in history and increments the unread count. Automatic
+  Web Push delivery for scheduler completion is not wired in the current version.
 
 ## Schedule kinds
 
@@ -46,7 +45,7 @@ the server's local timezone.
 
 ## API
 
-All endpoints require the bearer token.
+All endpoints use the same `X-Auth-Token` authentication as the other APIs.
 
 | Method & path | Purpose |
 |---|---|
@@ -63,8 +62,7 @@ All endpoints require the bearer token.
 
 ## Security note
 
-Scheduled runs execute **unattended** with the agent's full permission
-set — there is no human present to approve a tool call. Treat a scheduled
-prompt with the same caution as an unattended cron job: be deliberate
-about prompts that fetch external content (a web page, an inbox), since
-injected instructions in that content would run without confirmation.
+Scheduled runs are unattended and use Codex's `default` approval policy. A
+task that requires an approval or structured answer may fail or time out when
+no browser is present. Schedule only bounded prompts that do not depend on
+human judgment, and do not let untrusted external content control later tools.

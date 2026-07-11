@@ -1,133 +1,122 @@
 # Architecture
 
-> [简体中文](architecture_zh.md)
+> [简体中文](architecture_zh.md) · [← Documentation index](README.md)
 
-```mermaid
-flowchart TB
-  subgraph Browser["Browser · ~27k LOC vanilla HTML + Alpine.js + CSS"]
-    F[📁 files] --- P[📄 preview + tabs] --- C[💬 chat + multi-model]
-  end
-  Browser ==>|HTTP / SSE| BE
-  subgraph BE["Backend · FastAPI ~14k LOC"]
-    A["/api/files/*<br/>safe-resolve · read/write/grep"]
-    B["/api/chat/*<br/>ClaudeSDKClient pool<br/>per (session, model, effort)"]
-  end
-  BE ==> SDK[Claude Agent SDK<br/>spawns claude CLI subprocess]
-  SDK -->|claude-* models| CL[Claude<br/>Pro / Max OAuth]
-  SDK -->|env override per request| V[Anthropic-compatible endpoints]
-  V --> DS[DeepSeek]
-  V --> GL[Zhipu GLM]
-  V --> MM[MiniMax]
-  V --> KM[Kimi]
-  V --> QW[Qwen]
-  V --> XM[Xiaomi MiMo]
-  V --> QF[Baidu Qianfan (ERNIE)]
-  V --> CG[GPT / Codex Gateway<br/>Codex / GPT OAuth]
+muselab-codex is a local web workspace for `codex app-server`. Its architecture preserves native Codex thread, tool, and permission semantics while adding a browser, file workspace, and long-running service boundary.
 
-  class CL,CG subscriptionOauth
-  classDef subscriptionOauth fill:#FFF3CD,stroke:#D97706,stroke-width:2px,color:#111827
+```text
+┌─────────────┐     HTTP/SSE + token     ┌─────────────────┐
+│ Browser/PWA │ ───────────────────────→ │ FastAPI backend │
+└─────────────┘                          └────────┬────────┘
+                                                │ Unix WebSocket
+                                                ▼
+                                       ┌──────────────────┐
+                                       │ codex app-server │
+                                       └────────┬─────────┘
+                                                ▼
+                                              Codex
 ```
 
-## Key design decisions
+## Ownership boundary
 
-- **SDK over raw API.** Claude Agent SDK (same engine as Claude Code), so MCP / Skills / Subagents / plan mode / `CLAUDE.md` auto-load behave uniformly across providers. New providers: see [add-provider.md](add-provider.md).
+| Domain | Authority | muselab-codex role |
+|---|---|---|
+| Threads, turns, transcripts | Codex app-server | Map them to HTTP resources and browser views |
+| Models and reasoning controls | Codex configuration and thread state | Display the catalog and submit per-thread choices |
+| Tools, sandbox, approvals | Codex app-server | Surface requests and return the user's decision |
+| Skills, MCP, Memory | Codex app-server and `CODEX_HOME` | Provide controls without recreating discovery rules |
+| File browsing and previews | FastAPI and browser | Safely operate below `MUSELAB_ROOT` |
+| Login and remote access | Deployment environment | Provide single-user token authentication |
+| Attachment and usage UI metadata | FastAPI sidecars | Store only what browser recovery needs |
 
-- **Per-session `env=` override.** Third-party providers are wired by setting `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + an isolated `CLAUDE_CONFIG_DIR` ([`backend/endpoints.py:L851`](../backend/endpoints.py#L851)). The last one blocks the CLI from silently falling back to Pro OAuth and routing third-party traffic through your Anthropic account — the full mechanism is in [Model routing § env injection](routing.md#3-third-party-env-injection).
+When Codex already owns a capability, the backend adapts the protocol rather than copying its semantics. This avoids two transcripts, two tool loops, or competing configuration precedence rules.
 
-- **No build step.** Edit `frontend/`, refresh the browser. Vetted third-party libs live in `vendor/` (licenses in [THIRD_PARTY_LICENSES.md](../THIRD_PARTY_LICENSES.md)); installation never touches npm.
+## Process lifecycle
 
-- **Client cache keyed by `(session_id, model, effort)`** ([`backend/chat.py:L303`](../backend/chat.py#L303)). Switching model or reasoning effort lands on its own pooled client; each assistant message stores its own `model` field so badges stay accurate after reload. Pool cap, LRU rules: [Model routing § client pool](routing.md#2-the-client-pool).
+One `CodexRuntime` supervises one `codex app-server --listen unix://PATH` child
+and connects to it over a compression-free Unix WebSocket with application
+keepalive disabled (kernel socket closure remains the liveness signal):
 
-- **Whole-file as the unit of input.** `MUSELAB_ROOT` is a directory you own; the root-level `CLAUDE.md` auto-loads on every conversation. The assistant reaches files via Read / Grep / Edit on demand — no pre-embedding.
+1. create a private socket directory and start the listener;
+2. send `initialize` and validate its response;
+3. send the `initialized` notification;
+4. start the single event reader, scheduler, and peripheral services;
+5. accept HTTP and streaming requests;
+6. close turns, terminal processes, scheduler, event routing, and app-server in order.
 
-## Directory map
+The Unix listener can also serve `codex --remote unix://PATH`, so the browser
+and terminal share one in-memory thread store. Plain `codex` sessions are still
+separate by design.
 
-Two roots matter at runtime: the **repo** (code + per-install state) and the
-**archive** (`MUSELAB_ROOT`, your own files). They are deliberately separate so
-you can back up or move your data without touching the install.
+The tested protocol baseline is `codex-cli 0.144.1`. A baseline upgrade requires matching generated schemas, updated offline fixtures, and an explicit live-login check.
 
+## One message end to end
+
+```text
+POST /api/chat/stream/start
+  → validate token, thread, model, and attachments
+  → thread/resume when required
+  → subscribe to thread events
+  → turn/start
+  → return a one-use stream ticket
+
+GET /api/chat/stream?ticket=…
+  → replay buffered events for the active turn
+  → stream text, tool, approval, usage, and completion events over SSE
+  → drain the queued message after completion
 ```
-muselab/                      # repo root
-├── backend/                  # FastAPI app (~14k LOC)
-│   ├── main.py               # app factory, uvicorn entry, route mounting
-│   ├── auth.py               # X-Auth-Token guard (header or ?token=)
-│   ├── chat.py               # /api/chat/* — SDK client pool, SSE turn loop
-│   ├── endpoints.py          # provider catalog + per-request env wiring
-│   ├── files.py              # /api/files/* — safe-resolve read/write/grep
-│   ├── sessions.py           # session index + sidecar + queue (repo/sessions/)
-│   ├── scheduler.py          # asyncio cron loop → <archive>/.muselab/scheduler.json
-│   ├── push.py               # Web Push / VAPID → <archive>/.muselab/
-│   ├── api_settings.py       # /api/settings — hot-rewrites .env + os.environ
-│   └── prompts.py            # system-prompt assembly
-├── frontend/                 # vanilla HTML + Alpine.js + CSS (~27k LOC, no build)
-│   ├── index.html  app.js  styles.css
-│   ├── i18n/                 # EN/ZH UI strings
-│   └── vendor/               # vetted third-party libs (see THIRD_PARTY_LICENSES.md)
-├── scripts/                  # install / upgrade / uninstall / doctor / https
-├── skills/                   # bundled Claude skills
-├── docs/                     # this folder
-├── .env                      # ← per-install config + secrets (gitignored)
-└── sessions/                 # ← session metadata, sidecars, queues (gitignored)
 
-$MUSELAB_ROOT/                # the archive — YOUR files, never inside the repo
-├── CLAUDE.md                 # auto-loads every conversation
-├── health/ work/ money/ …    # whatever subdirs you create
-└── .muselab/                 # scheduler.json · vapid.json · push_subs.json
+The stream ticket keeps the primary token out of long-lived SSE URLs. Browser channels that cannot set custom headers use constrained query credentials together with access-log redaction and a restrictive `Referrer-Policy`.
+
+## Single-reader event routing
+
+App-server notifications share one stream. If every SSE connection called `next_notification()` directly, concurrent threads would consume each other's events.
+
+`CodexEventRouter` is therefore the only reader. It extracts `threadId`, fans events out to thread subscriptions, supports connection-scoped terminal events, and closes old subscriptions when the runtime generation changes.
+
+## Threads, turns, and browser tabs
+
+- The Codex thread ID is the session key; Codex-native history is the transcript source of truth.
+- Multiple browser tabs hold independent message, stream, and scroll state.
+- One thread can have one active turn; additional user messages enter the application queue.
+- Fork uses native thread branching. Compact rewrites the active context of the same thread and records a compaction boundary in its transcript.
+- After an app-server restart, persisted threads are resumed once per runtime generation before a new turn starts.
+
+## Persistence layout
+
+```text
+MUSELAB_ROOT/
+├── AGENTS.md
+├── .codex/
+├── .muselab-codex/
+│   ├── attachments/{staged,threads/}
+│   └── usage/<thread-id>.json
+└── user files
+
+CODEX_HOME/              # normally ~/.codex
+├── config.toml
+├── skills/
+└── login, Memory, and native thread history
 ```
 
-The actual conversation transcripts are owned by the Claude CLI, not muselab:
-they live under `~/.claude/projects/<cwd-key>/<session-id>.jsonl`. muselab's
-`sessions/` only holds the metadata layered on top (names, per-message model
-badge, cost, uploaded attachments). See
-[Data & backup](data-and-backup.md) for the full back-up list.
+`.muselab-codex` is not a second session database. It contains attachment ownership and sanitized numeric usage snapshots that the browser needs after restart but that are not part of the transcript.
 
-## A request, end to end
+## Filesystem boundary
 
-A chat turn is one Server-Sent Events (SSE) stream:
+All file APIs resolve below `MUSELAB_ROOT`. Traversal and escaping symlinks are rejected, credential-shaped files are blocked, visible writes are atomic, deletion uses a workspace trash area, and upload/preview endpoints enforce size and type limits.
 
-1. **Browser → backend.** `GET /api/chat/stream` with the prompt, session id
-   and chosen `model` as query parameters
-   ([`backend/chat.py:L5043`](../backend/chat.py#L5043)). The auth token rides
-   as `?token=` because `EventSource` cannot set headers
-   ([Security model § authentication](backend-security.md#authentication)).
-2. **Model resolution & lock.** The session is locked to one model
-   (`sessions.py`). The first turn pins it; later turns reuse it so a
-   conversation never mixes vendors mid-stream (cross-vendor *thinking
-   signatures* don't transfer). A session created before any provider existed
-   self-heals to a configured model on its first real send.
-3. **Client pool.** `chat.py` fetches or spawns a `ClaudeSDKClient` keyed by
-   `(session_id, model, effort)`. For a third-party model it sets
-   `ANTHROPIC_BASE_URL` + `ANTHROPIC_API_KEY` + an **isolated**
-   `CLAUDE_CONFIG_DIR` so the CLI can't fall back to your Pro OAuth and bill the
-   wrong account.
-4. **Agent loop.** The SDK spawns the `claude` CLI subprocess, which runs the
-   full loop — tool calls (Read/Grep/Edit/Bash), MCP servers, skills, plan mode
-   — against your archive as the working directory.
-5. **Backend → browser (SSE).** Tokens, tool-call events, and a final `done`
-   event stream back. The turn is published through a `TurnBroadcast`, so a
-   browser disconnect never kills the reply — reconnecting replays the buffer
-   ([Model routing § SSE turn loop](routing.md#4-the-sse-turn-loop)). The
-   frontend renders incrementally; each assistant message records its own
-   `model` so badges stay correct after reload.
-6. **Persistence.** The CLI appends the transcript to its JSONL; muselab writes
-   the sidecar (cost, model, attachments). If the turn was long and Web Push is
-   configured, a completion notification fires even with the tab closed.
+This is an application boundary, not multi-tenant isolation. Anyone holding `MUSELAB_TOKEN` can still drive tools within the active Codex sandbox and approval policy.
 
-Scheduled runs ([scheduler.md](scheduler.md)) take the same path from step 3,
-minus a human — they run unattended with the full permission set.
+## Failure model
 
-## Going deeper
-
-This page is the map. Each subsystem has its own page with source-linked
-detail:
-
-| Page | Covers |
+| Failure | Behavior |
 |---|---|
-| [Model routing & chat loop](routing.md) | model resolution, client pool, env injection, every SSE event type |
-| [Session internals](backend-sessions.md) | index, sidecars, message queue, attachments, fork, restart recovery |
-| [Files API](backend-files.md) | all `/api/files/*` endpoints, `safe_resolve`, trash |
-| [Security model](backend-security.md) | auth, settings surface, billing isolation, known limitations |
-| [Frontend internals](frontend.md) | no-build SPA, rendering pipeline, SSE client, i18n, service worker |
-| [Skills](skills.md) | bundled skills, discovery, adding your own |
-| [Infrastructure](infrastructure.md) | scripts, systemd/launchd, Docker, tests, CI/CD |
-| [Glossary](glossary.md) | every muselab term of art, defined once |
+| app-server cannot initialize | FastAPI lifespan fails; health never reports ready |
+| app-server exits during use | Runtime becomes failed; a later explicit request creates a new process without replaying ambiguous mutations |
+| SSE disconnects | The turn continues and in-process events can be replayed on reconnect |
+| Browser reloads | Transcript returns from Codex history; attachments and usage return from workspace sidecars |
+| MCP or push degrades | Core chat remains available where possible and the affected UI reports degraded state |
+
+Mutating app-server requests are not automatically retried because the server may have applied the operation before the client lost its response.
+
+See [native implementation specs](specs/) for protocol decisions and verification evidence.

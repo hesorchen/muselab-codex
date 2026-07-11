@@ -1,6 +1,6 @@
 [Unit]
-Description=muselab — your archive + Muse, the AI inside
-Documentation=https://github.com/hesorchen/muselab
+Description=muselab-codex — Codex-native workspace
+Documentation=https://github.com/hesorchen/muselab-codex
 After=network-online.target
 Wants=network-online.target
 # Restart rate limit: at most 5 restarts inside any 5-minute window. Past
@@ -16,8 +16,8 @@ EnvironmentFile={{REPO_PATH}}/.env
 ExecStart={{UV_PATH}} run python -m backend.main
 Restart=on-failure
 RestartSec=10
-# Hardening: forbid the service (or any subprocess: MCP servers, skills, the
-# SDK-spawned claude CLI) from gaining new privileges via setuid/setgid/caps.
+# Hardening: forbid the service and its Codex/MCP subprocesses from gaining
+# new privileges via setuid/setgid/caps.
 # Zero-cost — muselab never needs to escalate. (ProtectHome is intentionally
 # omitted: the service must read/write your archive ROOT under $HOME.)
 NoNewPrivileges=true

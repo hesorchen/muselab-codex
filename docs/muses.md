@@ -1,6 +1,6 @@
 # The nine Muses
 
-> [简体中文](muses_zh.md)
+> [简体中文](muses_zh.md) · [← Documentation index](README.md)
 
 muselab takes its name from the **nine Muses** of Greek mythology — the
 goddesses who inspire art and learning. **Muse** is the AI persona within;

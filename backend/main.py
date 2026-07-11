@@ -1,4 +1,5 @@
 import functools
+import hashlib
 import logging
 import os
 import re
@@ -13,11 +14,19 @@ from .auth import require_token
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from .files import router as files_router
-from .chat import router as chat_router
-from .api_settings import router as settings_router
-from .api_scheduler import router as scheduler_router
 from .api_push import router as push_router
-from .settings import ROOT, PORT, HOST
+from .settings import (
+    ROOT,
+    PORT,
+    HOST,
+    CODEX_BIN,
+    CODEX_HISTORY_READ_TIMEOUT,
+    CODEX_COMPACT_TIMEOUT,
+)
+
+from .codex.api import router as chat_router
+from .codex.settings_api import router as settings_router
+from .codex.scheduler_api import router as scheduler_router
 
 
 class _TokenFilter(logging.Filter):
@@ -90,6 +99,52 @@ _asset_cache: dict[str, object] = {"mtime": None, "version": "0",
 _asset_cache_lock = threading.Lock()
 
 
+def _create_codex_runtime(request_handler=None):
+    """Build the app-scoped runtime without starting it at import time."""
+    from .codex import CodexRuntime, CodexSharedAppServer
+    configured_runtime = os.environ.get("MUSELAB_RUNTIME_DIR", "").strip()
+    if configured_runtime:
+        runtime_dir = Path(configured_runtime).expanduser().resolve()
+    else:
+        workspace_id = hashlib.blake2b(
+            str(ROOT).encode("utf-8"), digest_size=8).hexdigest()
+        runtime_base = Path(
+            os.environ.get("XDG_RUNTIME_DIR")
+            or Path.home() / ".local" / "state" / "muselab-codex"
+        )
+        runtime_dir = runtime_base / workspace_id
+    socket_path = runtime_dir / "app-server.sock"
+    return CodexRuntime(lambda: CodexSharedAppServer(
+        codex_bin=CODEX_BIN,
+        socket_path=socket_path,
+        request_handler=request_handler,
+        initialize_capabilities={"experimentalApi": True},
+        # UI control-plane calls should never sit behind a wedged turn for a
+        # full minute.  Runtime timeout handling discards that generation so
+        # the next request can recover on a fresh app-server.
+        request_timeout=12.0,
+    ))
+
+
+def _create_codex_status_server():
+    """Build an isolated app-server for MCP inventory probes.
+
+    Some remote MCP initializations block their app-server request loop. A
+    disposable process keeps that diagnostic wait away from active threads.
+    """
+    from .codex import CodexAppServer
+    return CodexAppServer(
+        command=(CODEX_BIN, "app-server", "--stdio"),
+        request_timeout=15.0,
+    )
+
+
+def _drain_after_turn(drain):
+    async def callback(thread_id: str, _status: str) -> None:
+        await drain.drain(thread_id)
+    return callback
+
+
 def _max_asset_mtime() -> int:
     # Single stat() per candidate instead of exists()+stat() (was 2 syscalls
     # × 5 files = 10 per static request). Missing files raise OSError, which
@@ -121,7 +176,7 @@ def _asset_version() -> str:
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
-    """Boot the in-process scheduler + push subsystem on startup.
+    """Own the Codex runtime and inherited peripheral subsystems.
     Uses the modern lifespan context manager — `@app.on_event("startup")`
     is deprecated and emits a warning on every server restart.
 
@@ -132,7 +187,96 @@ async def _lifespan(app: FastAPI):
     generation hitting a disk-quota error) doesn't take down the
     whole web server — the chat UI is the primary capability and
     must come up even if peripheral subsystems are degraded."""
-    from . import scheduler as _sched
+    from .codex import (
+        CodexApprovalBroker,
+        CodexAttachmentService,
+        CodexCompactService,
+        CodexEventRouter,
+        CodexElicitationBroker,
+        CodexHistoryService,
+        CodexMcpService,
+        CodexProviderService,
+        CodexSkillsService,
+        CodexThreadService,
+        CodexTerminalService,
+        CodexTurnService,
+        CodexUsageService,
+        CodexQueueService,
+        CodexQueueDrainService,
+        CodexScheduler,
+        CodexClientRequestRouter,
+        CodexUserInputBroker,
+    )
+    approvals = CodexApprovalBroker()
+    user_input = CodexUserInputBroker()
+    elicitation = CodexElicitationBroker()
+    client_requests = CodexClientRequestRouter(approvals, user_input, elicitation)
+    runtime = _create_codex_runtime(client_requests.handle)
+    app.state.codex_runtime = runtime
+    app.state.codex_attachments = CodexAttachmentService(ROOT)
+    app.state.codex_usage = CodexUsageService(ROOT)
+    app.state.codex_queue = CodexQueueService()
+    app.state.codex_threads = CodexThreadService(runtime, ROOT)
+    app.state.codex_mcp = CodexMcpService(
+        runtime,
+        ROOT,
+        status_requester_factory=_create_codex_status_server,
+    )
+    app.state.codex_providers = CodexProviderService(runtime, ROOT)
+    app.state.codex_skills = CodexSkillsService(runtime, ROOT)
+    app.state.codex_approvals = approvals
+    app.state.codex_user_input = user_input
+    app.state.codex_elicitation = elicitation
+    app.state.codex_client_requests = client_requests
+    app.state.codex_events = CodexEventRouter(runtime)
+    app.state.codex_history = CodexHistoryService(
+        app.state.codex_threads,
+        runtime,
+        app.state.codex_events,
+        timeout=CODEX_HISTORY_READ_TIMEOUT,
+    )
+    app.state.codex_turns = CodexTurnService(
+        runtime,
+        app.state.codex_events,
+        app.state.codex_threads,
+        app.state.codex_history,
+        app.state.codex_usage,
+    )
+    app.state.codex_queue_drain = CodexQueueDrainService(
+        app.state.codex_queue,
+        app.state.codex_turns,
+        app.state.codex_attachments,
+    )
+    app.state.codex_terminal = CodexTerminalService(
+        runtime, app.state.codex_events, ROOT)
+    app.state.codex_turns.on_turn_finished = _drain_after_turn(
+        app.state.codex_queue_drain)
+    app.state.codex_scheduler = CodexScheduler(
+        ROOT, app.state.codex_threads, app.state.codex_turns)
+    app.state.codex_compact = CodexCompactService(
+        runtime,
+        app.state.codex_events,
+        app.state.codex_turns,
+        app.state.codex_usage,
+        timeout=CODEX_COMPACT_TIMEOUT,
+    )
+    approvals.publisher = app.state.codex_turns.publish_permission
+    user_input.publisher = app.state.codex_turns.publish_user_input
+    elicitation.publisher = app.state.codex_turns.publish_elicitation
+    try:
+        await runtime.start()
+        await app.state.codex_events.start()
+        await app.state.codex_scheduler.start()
+    except Exception:
+        await app.state.codex_terminal.close()
+        await app.state.codex_events.close()
+        await approvals.close()
+        await user_input.close()
+        await elicitation.close()
+        await app.state.codex_scheduler.close()
+        await runtime.close()
+        raise
+
     from . import push as _push
     import traceback
     try:
@@ -140,13 +284,6 @@ async def _lifespan(app: FastAPI):
     except Exception as e:
         sys.stderr.write(
             f"[muselab] push init failed (continuing without push): "
-            f"{type(e).__name__}: {e}\n{traceback.format_exc()}\n")
-        sys.stderr.flush()
-    try:
-        await _sched.start_scheduler()
-    except Exception as e:
-        sys.stderr.write(
-            f"[muselab] scheduler start failed (continuing without scheduler): "
             f"{type(e).__name__}: {e}\n{traceback.format_exc()}\n")
         sys.stderr.flush()
     # Prune empty sessions + auto-purge expired trash. Both used to block
@@ -158,18 +295,6 @@ async def _lifespan(app: FastAPI):
     # POV. `asyncio.to_thread` runs the sync IO off the event loop so a
     # slow disk doesn't stall concurrent requests either.
     import asyncio as _asyncio
-
-    async def _bg_prune_sessions() -> None:
-        try:
-            from . import sessions as _sess_mod
-            pruned = await _asyncio.to_thread(_sess_mod.prune_empty_sessions)
-            if pruned:
-                sys.stderr.write(
-                    f"[muselab] pruned {len(pruned)} empty session(s) on startup\n")
-                sys.stderr.flush()
-        except Exception as _e:
-            sys.stderr.write(f"[muselab] startup prune failed (non-fatal): {_e}\n")
-            sys.stderr.flush()
 
     async def _bg_purge_trash() -> None:
         try:
@@ -186,7 +311,7 @@ async def _lifespan(app: FastAPI):
             sys.stderr.flush()
 
     async def _bg_warm_versions() -> None:
-        # Version detection runs a `claude --version` subprocess (up to 3s).
+        # Version detection runs a `codex --version` subprocess (up to 3s).
         # It used to run at import time (`_VERSIONS = _detect_versions()`),
         # blocking module load — and thus uvicorn cold start — for up to 3s.
         # Now lru_cache'd + warmed here off the event loop, so import is
@@ -208,82 +333,34 @@ async def _lifespan(app: FastAPI):
     # discarded can be garbage-collected mid-run, silently cancelling the
     # background work. Stash them on a module-level set and drop each one
     # when it finishes so the set doesn't grow unbounded.
-    for _coro in (_bg_prune_sessions(), _bg_purge_trash(),
-                  _bg_warm_versions(), _backfill_turn_counts()):
-        _t = _asyncio.create_task(_coro)
-        _BG_TASKS.add(_t)
-        _t.add_done_callback(_BG_TASKS.discard)
+    async def _run_startup_background() -> None:
+        # Let the lifespan manager publish startup-complete before optional
+        # disk/subprocess work begins. This keeps TestClient and real health
+        # probes from waiting on peripheral warm-up.
+        await _asyncio.sleep(0.05)
+        await _asyncio.gather(_bg_purge_trash(), _bg_warm_versions())
+
+    _t = _asyncio.create_task(_run_startup_background())
+    _BG_TASKS.add(_t)
+    _t.add_done_callback(_BG_TASKS.discard)
     # Same fire-and-forget pattern: rewrite turn_count for any session
     # written by the old algorithm. Gated by a sentinel file so reruns
     # are cheap; first run can take a few seconds on archives with
     # hundreds of sessions.
-    yield
-
-
-async def _backfill_turn_counts() -> None:
-    """One-shot migration: rewalk each session's JSONL via the SDK and
-    rewrite turn_count using the correct (real-prompt-only) filter.
-
-    Gated by a sentinel file under sessions/ so we don't re-scan every
-    JSONL on every restart (was adding noticeable boot latency on
-    archives with hundreds of sessions). To force a re-run after an SDK
-    upgrade that changes `_is_real_user_prompt` semantics, delete
-    `sessions/.backfill_done`.
-    """
-    import asyncio as _asyncio
-    from . import sessions as _sess
-    from . import chat as _chat
-    from .settings import ROOT as _ROOT
-    sentinel = _sess.SESS_DIR / ".backfill_done"
-    if sentinel.exists():
-        return
     try:
-        from claude_agent_sdk import get_session_messages as _gsm
-    except Exception:
-        return
-    if _ROOT is None:
-        return
-    try:
-        ss = _sess.list_sessions()
-    except Exception as e:
-        sys.stderr.write(f"[muselab] backfill list_sessions failed: {e}\n")
-        return
-    updated = 0
-    for s in ss:
-        sid = s.get("id")
-        if not sid:
-            continue
-        try:
-            msgs = _gsm(sid, directory=str(_ROOT))
-        except Exception:
-            continue
-        n_turns = sum(1 for sm in msgs if _chat._is_real_user_prompt(sm))
-        cur = s.get("turn_count")
-        if cur == n_turns:
-            continue
-        try:
-            _sess.bump_session(sid, message_count=len(msgs),
-                                turn_count=n_turns)
-            updated += 1
-        except Exception:
-            pass
-        # Yield to the event loop periodically so we don't starve the web
-        # server on a large archive (~200+ sessions).
-        if updated % 20 == 0:
-            await _asyncio.sleep(0)
-    if updated:
-        sys.stderr.write(
-            f"[muselab] backfilled turn_count for {updated} sessions\n")
-        sys.stderr.flush()
-    # Drop sentinel even when 0 sessions needed updating — that just means
-    # the archive is already correct; no reason to keep rescanning.
-    try:
-        sentinel.touch()
-    except OSError as e:
-        sys.stderr.write(f"[muselab] backfill sentinel write failed: {e}\n")
+        yield
+    finally:
+        await app.state.codex_turns.close()
+        await app.state.codex_terminal.close()
+        await approvals.close()
+        await user_input.close()
+        await elicitation.close()
+        await app.state.codex_scheduler.close()
+        await app.state.codex_events.close()
+        await runtime.close()
 
 
-app = FastAPI(title="muselab", version="1.1.0", lifespan=_lifespan)
+app = FastAPI(title="muselab-codex", version="0.1.0a1", lifespan=_lifespan)
 
 # Gzip every response ≥1KB. The frontend ships ~1.2MB of uncompressed text
 # assets (app.js / index.html / styles.css) plus JSON-heavy API responses
@@ -334,30 +411,18 @@ async def _security_headers(request: Request, call_next):
 app.include_router(files_router)
 app.include_router(chat_router)
 app.include_router(settings_router)
-app.include_router(scheduler_router)
+if scheduler_router is not None:
+    app.include_router(scheduler_router)
 app.include_router(push_router)
 
 
 @functools.lru_cache(maxsize=1)
 def _detect_versions() -> dict:
-    """Capture muselab + Python + claude-agent-sdk + claude CLI versions
-    so the UI can surface "what's actually running" and the upgrade flow has
-    something to diff against. Best-effort — missing pieces return None."""
-    sdk_version = None
-    try:
-        from claude_agent_sdk import __version__ as _v
-        sdk_version = _v
-    except Exception:
-        pass
+    """Capture the native Codex CLI version for local diagnostics."""
     cli_version = None
-    # locate_executable falls back past systemd's minimal PATH (nvm /
-    # Volta / ~/.npm-global). shutil.which("claude") alone would miss
-    # the most common install locations.
-    from .settings import locate_executable
-    claude_bin = locate_executable("claude")
-    if claude_bin:
+    if CODEX_BIN:
         try:
-            out = subprocess.run([claude_bin, "--version"], capture_output=True,
+            out = subprocess.run([CODEX_BIN, "--version"], capture_output=True,
                                   text=True, timeout=3)
             cli_version = (out.stdout.strip().splitlines() or [""])[0] or None
         except Exception:
@@ -365,30 +430,21 @@ def _detect_versions() -> dict:
     return {
         "muselab_version": app.version,
         "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        "sdk_version": sdk_version,
+        "sdk_version": None,
         "cli_version": cli_version,
         "cli_present": cli_version is not None,
     }
 
 
-# Versions are captured lazily via the lru_cache on _detect_versions (warmed
-# off the event loop in lifespan startup — see _bg_warm_versions). Capturing
-# at import time used to spawn a `claude --version` subprocess that blocked
-# module load for up to 3s, delaying uvicorn cold start.
+# Versions are captured lazily via the lru_cache on _detect_versions.
 
-# Surface the resolved config so ops can confirm what the running process
-# is actually using — host / port / root / which third-party vendors are
-# enabled. Helps diagnose "I added DEEPSEEK_API_KEY but the model picker
-# still doesn't show it" by making the env-var-vs-process state explicit.
+# Surface the resolved config so operators can confirm the process is using
+# the intended host, port, workspace, and Codex executable.
 def _startup_config_banner() -> None:
-    from . import endpoints as _ep
     host = os.environ.get("MUSELAB_HOST", "127.0.0.1")
     port = os.environ.get("MUSELAB_PORT", "8765")
-    enabled = [p.display for p in _ep.catalog()
-                 if os.environ.get(p.env_key)]
-    enabled_s = ", ".join(enabled) if enabled else "(none — Claude only)"
     print(f"[muselab] config: host={host} port={port} root={ROOT} "
-          f"third_party={enabled_s}",
+          f"runtime=codex bin={CODEX_BIN}",
           file=sys.stderr, flush=True)
 _startup_config_banner()
 
@@ -585,11 +641,19 @@ def meta() -> dict:
 
 @app.get("/api/health")
 def health() -> dict:
-    """Liveness probe — no auth required. Used by Docker HEALTHCHECK,
-    Caddy `health_uri`, k8s readiness probes, and uptime monitors. Stays
-    minimal on purpose: any heavier check (e.g. SDK client, archive
-    write probe) could itself fail intermittently and cause restarts."""
-    return {"status": "ok"}
+    """Public liveness and ready-state probe without workspace metadata."""
+    runtime = getattr(app.state, "codex_runtime", None)
+    runtime_health = runtime.health() if runtime is not None else None
+    ready = bool(runtime_health and runtime_health.running and runtime_health.state == "ready")
+    return {
+        "status": "ok" if ready else "starting",
+        "version": app.version,
+        "runtime": {
+            "state": runtime_health.state if runtime_health else "starting",
+            "ready": ready,
+            "restart_count": runtime_health.restart_count if runtime_health else 0,
+        },
+    }
 
 
 @app.post("/api/presence", dependencies=[Depends(require_token)])

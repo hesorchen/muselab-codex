@@ -1,54 +1,45 @@
-# muselab 文档
+# muselab-codex 文档
 
 > [English](README.md) · [← 返回项目 README](../README.md)
 
-## 安装与运行
+muselab-codex 是围绕 `codex app-server` 构建的单用户、自托管工作台。下面的文档按“安装 → 使用 → 理解 → 运维”组织；若第一次接触项目，从[快速入门](quickstart_zh.md)开始。
 
-- [快速入门](quickstart_zh.md) —— 环境要求、Docker、开发模式、各平台说明
-- [Linux 安装](install-linux_zh.md)
-- [macOS 安装](install-macos_zh.md)
-- [升级](upgrade_zh.md) —— 升级 SDK + CLI 而不丢数据
+## 安装与升级
 
-## 使用
+- [快速入门](quickstart_zh.md) —— 三种运行方式、首次登录、健康检查和 WSL2 注意事项
+- [Linux 安装](install-linux_zh.md) —— systemd 用户服务、日志、linger 与卸载
+- [macOS 安装](install-macos_zh.md) —— launchd agent、PATH、日志与卸载
+- [升级](upgrade_zh.md) —— 更新代码和依赖、核对 Codex CLI 基线、验证与回滚
 
-- [定制你的 CLAUDE.md](personalize-claude-md_zh.md) —— 让 Muse 了解你
-- [Skills](skills_zh.md) —— 开箱即用的 skill 清单，以及如何添加自己的
-- [手机端 PWA](mobile_zh.md) —— 加到主屏、推送通知、HTTPS
-- [定时任务](scheduler_zh.md) —— 按节奏运行保存的 prompt
+## 使用与配置
 
-## 模型
+- [配置参考](configuration_zh.md) —— `.env`、`CODEX_HOME`、`AGENTS.md`、Provider 与安全边界
+- [Skills](skills_zh.md) —— Codex 原生发现、启停、作用域和自定义 Skill
+- [定时任务](scheduler_zh.md) —— 保存 prompt、执行历史、时区和无人值守风险
+- [移动端 PWA](mobile_zh.md) —— 加到主屏、HTTPS、通知与多设备使用
+- [九位缪斯](muses_zh.md) —— 产品命名和会话入口的设计概念
 
-- [模型 / Providers](providers_zh.md) —— 内置目录（Claude、DeepSeek、GLM、MiniMax、Kimi、Qwen、小米 MiMo、百度 ERNIE、Codex Gateway）
-- [Codex Gateway](codex-gateway_zh.md) —— 连接本地 Codex 后端 Anthropic 兼容 sidecar
-- [接入新 provider](add-provider_zh.md) —— 接任意 Anthropic 兼容端点
-- [模型路由与 chat 循环](routing_zh.md) —— 模型如何被选择、池化，以及费用如何计入正确账户
+## 架构与实现
 
-## 架构与内部机制
+- [架构](architecture_zh.md) —— 组件边界、请求链路、事件路由、持久化和安全边界
+- [基础设施](infrastructure_zh.md) —— systemd、launchd、Docker、健康检查、CI 与发布门禁
+- [原生实现规格](specs/) —— 每一阶段的 app-server 协议选择和验证记录
+- [工具目录快照](tool-catalog.txt) —— 开发阶段记录的工具事件形状参考
 
-深度溯源解读——从 [架构](architecture_zh.md) 开始看全局。
+## 运维
 
-- [架构](architecture_zh.md) —— 目录地图 + 一个请求的完整链路
-- [会话内部机制](backend-sessions_zh.md) —— 索引、sidecar、队列、fork、崩溃恢复
-- [Files API](backend-files_zh.md) —— 每个 `/api/files/*` 端点 + `safe_resolve`
-- [安全模型](backend-security_zh.md) —— 鉴权、账单隔离与已知局限
-- [前端内部机制](frontend_zh.md) —— 无构建 SPA、渲染流水线、SSE 客户端、service worker
-- [MCP 架构](mcp-architecture_zh.md) —— 连接器策略与三层模型
-- [基础设施](infrastructure_zh.md) —— 脚本、服务、Docker、测试、CI/CD
+- [排错](troubleshooting_zh.md) —— 从 doctor 到日志、模型、浏览器缓存、MCP 和文件权限
+- [数据与备份](data-and-backup_zh.md) —— 工作区、`.env`、`CODEX_HOME`、恢复演练和可丢弃数据
+- [安全策略](../SECURITY.md) —— 威胁模型、部署基线和漏洞报告方式
 
-## 参考
+## 项目协作
 
-- [配置参考](configuration_zh.md) —— 每个 `.env` 变量 + 默认值
-- [数据与备份](data-and-backup_zh.md) —— 备份什么、如何恢复
-- [排错](troubleshooting_zh.md) —— 常见故障与修法
-- [词汇表](glossary_zh.md) —— muselab 的专有术语，统一定义
-
-## 概念
-
-- [同类对比](comparison_zh.md) —— muselab vs 其他自托管 AI 工作台
-- [九位缪斯](muses_zh.md) —— 名字背后的世界观
-
-## 项目
-
-- [安全策略](../SECURITY.md)
 - [贡献指南](../CONTRIBUTING.md)
+- [项目开发约束](../AGENTS.md)
 - [第三方授权](../THIRD_PARTY_LICENSES.md)
+
+## 文档约定
+
+- 当前产品行为以代码、测试和 `codex app-server` 返回值为准；规格文档记录的是实现决策，不覆盖运行时事实。
+- 面向用户的文档同时维护中文与英文版本。
+- 示例只使用中性路径和占位数据；真实令牌、API Key、`CODEX_HOME` 与工作区内容不能进入公开制品。

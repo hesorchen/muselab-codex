@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # muselab — Linux uninstaller. Stops & removes the systemd --user service.
-# Leaves .env, sessions/, and your archive untouched.
+# Leaves .env, Codex state, and your workspace untouched.
 set -euo pipefail
 
 UNIT="$HOME/.config/systemd/user/muselab.service"
@@ -8,7 +8,7 @@ UNIT="$HOME/.config/systemd/user/muselab.service"
 ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
 warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
 
-echo "muselab — uninstall (Linux)"
+echo "muselab-codex — uninstall (Linux)"
 
 if systemctl --user list-unit-files muselab.service >/dev/null 2>&1; then
   systemctl --user disable --now muselab.service 2>/dev/null || true
@@ -26,5 +26,5 @@ systemctl --user daemon-reload
 ok "systemd reloaded"
 
 echo
-echo "Note: .env, sessions/, and your MUSELAB_ROOT are NOT touched."
-echo "Delete the repo to fully remove muselab."
+echo "Note: .env, ~/.codex, and your MUSELAB_ROOT are NOT touched."
+echo "Delete the repo to fully remove muselab-codex."

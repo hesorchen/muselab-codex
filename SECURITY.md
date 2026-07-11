@@ -1,72 +1,72 @@
-# Security Policy
+# Security policy
+
+muselab-codex is a single-user, self-hosted Codex workspace. It is not a multi-tenant service and should not be treated as a hardened public shell gateway.
 
 ## Threat model
 
-muselab is a single-user, self-hosted web application. Whoever holds the
-`MUSELAB_TOKEN` can:
+Anyone holding `MUSELAB_TOKEN` can use the authenticated file APIs below `MUSELAB_ROOT`, create Codex threads, and ask Codex to execute tools under the active sandbox and approval policy. Treat the token as a password with authority over the workspace.
 
-- Read, write, upload, and delete files under `MUSELAB_ROOT`
-- Drive a Claude Agent SDK session running with `permission_mode="bypassPermissions"` and `cwd=MUSELAB_ROOT`
+The main protected assets are:
 
-This is intentional — muselab is an AI archive manager, not a sandbox. The
-practical implication is that **a leaked token is equivalent to remote code
-execution within `MUSELAB_ROOT`**. Operate accordingly:
+- files under `MUSELAB_ROOT`;
+- `.env`, including the application token and optional provider keys;
+- `CODEX_HOME`, including login state, configuration, Memory, Skills, MCP, and thread history;
+- prompts, transcripts, attachments, and tool outputs;
+- the operating-system account running Codex and MCP subprocesses.
 
-- Run the service as a dedicated unprivileged user (not `root`, not your login account)
-- Point `MUSELAB_ROOT` at `$HOME` or a subdirectory you own (system paths such as `/`, `/etc`, `/root`, `/home`, `/var`, `/usr`, `/boot` are refused at startup)
-- Place it behind nginx or Caddy with HTTPS; never expose port `8765` directly to the public internet
-- Treat `MUSELAB_TOKEN` like a password: keep it long, random, and rotate it if a leak is suspected
-- Add HTTP basic auth as a second factor in front of muselab when exposed beyond your LAN
+## Supported deployment baseline
 
-## What muselab defends against
+- run as a dedicated, unprivileged operating-system user;
+- keep `MUSELAB_HOST=127.0.0.1` unless a trusted network boundary exists;
+- use a long random `MUSELAB_TOKEN` and rotate it after suspected exposure;
+- use HTTPS plus an additional access-control layer for remote access;
+- keep the upstream port unreachable from the public internet;
+- keep `.env`, `CODEX_HOME`, and workspace backups private and encrypted;
+- mount only the intended workspace into a container, never an entire host home directory;
+- review MCP servers and Skills as executable extensions with the service user's authority.
 
-- Path traversal outside `MUSELAB_ROOT`
-- Reading or overwriting credential-shaped files (`.env*`, SSH private keys, `*.pem`, `credentials.json`, etc.) — blocked even with a valid token
-- Same-origin XSS via uploaded `.html` / `.svg` / Markdown — `/api/files/raw` serves arbitrary types as `application/octet-stream` attachments, HTML/SVG are served with a strict CSP and sandbox, and rendered Markdown is run through DOMPurify before insertion
-- Token length below 16 characters or `MUSELAB_ROOT` pointing at system paths — refused at startup
-- Timing side-channel on token comparison — constant-time comparison via `hmac.compare_digest`
-- Default response headers: `X-Content-Type-Options: nosniff` (no MIME sniffing of file previews) · `Referrer-Policy: same-origin` (tokens in query strings do not leak via cross-origin `Referer`) · `X-Frame-Options: SAMEORIGIN` (external sites cannot iframe the UI)
-- `noindex, nofollow, noarchive` meta tags and `/robots.txt` — accidental public exposure will not result in crawling
+## Security invariants
 
-## Reverse-proxy logging caveat
+### Authentication
 
-The streaming chat endpoint uses Server-Sent Events (`EventSource`), which the
-browser spec forbids from sending custom headers. The auth token therefore
-travels as a query string parameter (`?token=…`) on that one endpoint only.
-muselab's own access log strips it before writing (`_TokenFilter` in
-`backend/main.py`), but a reverse proxy in front of muselab will record the
-raw URL by default. **If you put muselab behind nginx / Caddy / a CDN,
-configure access logs to strip or mask the `token` query parameter.**
-Examples:
+Meaningful browser APIs require `MUSELAB_TOKEN`. Standard requests use `X-Auth-Token`. Browser channels that cannot set custom headers, such as SSE and raw downloads, use constrained query credentials; the application redacts them from its access log and sends a restrictive referrer policy.
 
-```nginx
-# nginx: redact token= in the access log
-log_format muselab_safe '$remote_addr - $remote_user [$time_local] '
-                        '"$request_method $uri?<redacted> $server_protocol" '
-                        '$status $body_bytes_sent';
-access_log /var/log/nginx/muselab.log muselab_safe;
-```
+`/api/health` is intentionally unauthenticated and returns only application version and runtime readiness. Workspace paths and detailed diagnostics remain authenticated.
 
-```caddy
-# Caddy: drop the query string from access logs
-log {
-    output file /var/log/caddy/muselab.log
-    format filter {
-        request>uri query {
-            delete token
-        }
-    }
-}
-```
+### Filesystem containment
 
-## What muselab does NOT defend against
+File operations resolve below `MUSELAB_ROOT`. The backend rejects path traversal, escaping symlinks, dangerous root workspaces, and credential-shaped internal files. User-visible text writes use atomic replacement, and normal deletion uses a workspace trash area.
 
-- A compromised `MUSELAB_TOKEN` — full access is granted by design
-- Symlink escapes from within `MUSELAB_ROOT` — do not place attacker-controlled symlinks in the archive
-- Resource exhaustion at the request layer — upload size is capped (100 MB by default, configurable via `MUSELAB_MAX_UPLOAD_MB`); `/api/files/grep` has a soft 8-second time budget and a 1 MB per-file cap; `/api/log/client-error` is rate-limited to 30 requests per IP per minute. Other endpoints do not have per-IP rate limiting. If muselab is exposed to more than one trusted user, place a reverse proxy (Caddy or nginx) in front with global rate limits.
+Containment does not make hostile files safe to execute. Codex tools, terminal commands, previews, and MCP servers must still be governed by an appropriate sandbox and approval policy.
+
+### Codex process boundary
+
+`codex app-server` runs as a private stdio child, not a network service. Initialization follows the app-server handshake, stdout remains protocol-only JSONL, and stderr is consumed separately without retaining sensitive lines.
+
+The process supervisor terminates only the app-server process it created. Mutating requests are not automatically retried after an ambiguous transport failure.
+
+### Credentials
+
+The browser never receives native Provider API key values. Keys are inherited from the private service environment, while provider definitions are written through app-server to Codex configuration.
+
+The default app-server child environment removes `OPENAI_API_KEY`; the primary path uses the explicitly authenticated Codex CLI state. `CODEX_HOME` remains Codex-owned and must never be copied into a repository, image layer, issue attachment, or public log.
+
+### Logging and public artifacts
+
+Application logs must not include tokens, OAuth material, API keys, raw prompts, file contents, or full protocol payloads. Tests use throwaway workspaces and fake app-server peers by default. Live checks must use ephemeral threads and must not read a developer's private archive.
+
+## Remote access
+
+Binding directly to `0.0.0.0` makes token authentication the only application barrier. Prefer a private overlay network, authenticated tunnel, or reverse proxy with TLS and independent access control. Configure proxies to disable SSE buffering and redact query strings from access logs.
+
+`scripts/setup-https.sh` can install a Caddy reverse proxy on supported Linux hosts, but operators remain responsible for DNS, firewall rules, upstream isolation, and access policy.
+
+## Provider and MCP risk
+
+Enabling a native model provider sends prompts and relevant tool context to that provider according to Codex behavior. Review the provider's data policy before use.
+
+MCP servers and Skills can expand tool authority. Only install sources you trust, inspect commands and environment-variable references, and disable entries that are not required.
 
 ## Reporting a vulnerability
 
-Email **hesorchen@gmail.com** with the subject line `muselab security`. Please
-do not open a public issue for anything that could be used to read other users'
-files or steal tokens. Expect a response within 7 days.
+Email **hesorchen@gmail.com** with the subject `muselab-codex security`. Include the affected revision, impact, reproduction steps, and a minimal sanitized proof of concept. Do not open a public issue for a vulnerability involving file access, credentials, authentication, sandbox escape, or command execution.

@@ -1,191 +1,61 @@
 #!/usr/bin/env bash
-# muselab doctor — re-runs the same checks the installer does, plus probes a
-# running instance. Use after install / after weird behaviour / before file
-# bug report. Works on Linux + macOS + WSL2.
-set -uo pipefail   # NOT -e: keep going past failures to give full report
-
-# Bail out early on native Windows shells — this script only knows systemd
-# (Linux / WSL2) and launchd (macOS). Git Bash / MSYS / Cygwin on native
-# Windows would silently skip the service-status section.
-case "$(uname -s 2>/dev/null)" in
-  MINGW*|MSYS*|CYGWIN*|Windows_NT)
-    printf "\033[31m✗\033[0m This script is for Linux / macOS / WSL2 only.\n" >&2
-    printf "  On Windows, install muselab inside WSL2 and run this script there.\n" >&2
-    printf "  See docs/quickstart.md (Windows via WSL2).\n" >&2
-    exit 1
-    ;;
-esac
+# Diagnose a local muselab-codex installation without reading credentials.
+set -uo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
-
-bold() { printf "\033[1m%s\033[0m\n" "$*"; }
-ok()   { printf "  \033[32m✓\033[0m %s\n" "$*"; }
-warn() { printf "  \033[33m!\033[0m %s\n" "$*"; }
-err()  { printf "  \033[31m✗\033[0m %s\n" "$*" >&2; }
-note() { printf "    %s\n" "$*"; }
-
 FAIL=0
 WARN=0
 
-bold "muselab doctor — $(date)"
-echo  "  Repo: $REPO"
-echo
+ok() { printf '  \033[32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[33m!\033[0m %s\n' "$*"; WARN=$((WARN + 1)); }
+err() { printf '  \033[31m✗\033[0m %s\n' "$*" >&2; FAIL=$((FAIL + 1)); }
+value() { grep -E "^$1=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]'; }
 
-bold "1. Prerequisites"
-if command -v uv >/dev/null 2>&1; then
-  ok "uv: $(uv --version 2>&1)"
+printf 'muselab-codex doctor\n\n'
+printf '1. Runtime\n'
+if command -v uv >/dev/null 2>&1; then ok "uv: $(uv --version 2>&1)"; else err "uv not found"; fi
+if command -v codex >/dev/null 2>&1; then
+  ok "codex: $(codex --version 2>&1 | head -1)"
+  if codex login status >/dev/null 2>&1; then ok "Codex login is active"; else warn "Codex is not logged in; run: codex login"; fi
 else
-  err "uv not found — install from https://astral.sh/uv"
-  FAIL=$((FAIL+1))
+  err "codex CLI not found; install: npm install -g @openai/codex@0.144.1"
 fi
-if command -v claude >/dev/null 2>&1; then
-  ok "claude CLI: $(claude --version 2>&1 | head -1)"
-  if [[ -f "$HOME/.claude/.credentials.json" ]]; then
-    ok "  Pro OAuth present (~/.claude/.credentials.json)"
-  else
-    warn "  no Pro OAuth credentials — run 'claude login' for Anthropic models"
-    WARN=$((WARN+1))
-  fi
-else
-  warn "claude CLI missing — Anthropic models unavailable, only configured 3rd-party providers will work"
-  WARN=$((WARN+1))
-fi
-for r in uvx npx; do
-  if command -v $r >/dev/null 2>&1; then ok "$r present"
-  else warn "$r missing — some MCP presets won't run"; WARN=$((WARN+1)); fi
-done
 
-echo
-bold "2. Configuration"
+printf '\n2. Configuration\n'
+TOKEN=""
+ROOT=""
+PORT="8765"
 if [[ -f .env ]]; then
-  ok ".env present"
-  # Portable .env value extraction (BSD/macOS grep lacks -P/\K).
-  TOKEN=$(grep -E '^MUSELAB_TOKEN=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
-  ROOT=$(grep -E '^MUSELAB_ROOT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
-  PORT=$(grep -E '^MUSELAB_PORT=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]')
-  PORT="${PORT:-8765}"
-  if [[ -z "$TOKEN" ]]; then err "MUSELAB_TOKEN missing in .env"; FAIL=$((FAIL+1))
-  elif (( ${#TOKEN} < 16 )); then err "MUSELAB_TOKEN too short (${#TOKEN} chars; need ≥16)"; FAIL=$((FAIL+1))
-  else ok "MUSELAB_TOKEN set (${TOKEN:0:4}…${TOKEN: -4}, ${#TOKEN} chars)"; fi
-  if [[ -z "$ROOT" ]]; then err "MUSELAB_ROOT missing in .env"; FAIL=$((FAIL+1))
-  elif [[ ! -d "$ROOT" ]]; then err "MUSELAB_ROOT=$ROOT but directory doesn't exist"; FAIL=$((FAIL+1))
-  else
-    ok "MUSELAB_ROOT = $ROOT"
-    if [[ -f "$ROOT/CLAUDE.md" ]]; then
-      L=$(wc -l < "$ROOT/CLAUDE.md")
-      ok "  CLAUDE.md present ($L lines)"
-    else
-      warn "  no CLAUDE.md at $ROOT — Muse will use defaults; run scripts/intake.sh to add"
-      WARN=$((WARN+1))
-    fi
-    for sub in health work money people notes archives; do
-      if [[ -d "$ROOT/$sub" ]]; then ok "  $sub/ present"
-      else note "  $sub/ missing (intake hasn't run, or you deleted it)"; fi
-    done
-  fi
+  TOKEN="$(value MUSELAB_TOKEN)"
+  ROOT="$(value MUSELAB_ROOT)"
+  PORT="$(value MUSELAB_PORT)"; PORT="${PORT:-8765}"
+  if [[ ${#TOKEN} -ge 16 ]]; then ok "MUSELAB_TOKEN is configured"; else err "MUSELAB_TOKEN is missing or too short"; fi
+  if [[ -n "$ROOT" && -d "$ROOT" ]]; then ok "workspace: $ROOT"; else err "MUSELAB_ROOT is missing or unavailable"; fi
 else
-  err ".env not found — run scripts/install-{linux,macos}.sh first"
-  FAIL=$((FAIL+1))
+  err ".env not found; run scripts/install-linux.sh or scripts/install-macos.sh"
 fi
 
-echo
-bold "3. Python deps"
-if uv sync --frozen --no-progress >/dev/null 2>&1; then
-  ok "uv sync --frozen passes"
-elif uv sync --no-progress >/dev/null 2>&1; then
-  warn "uv.lock out of sync — re-run scripts/install-{linux,macos}.sh"
-  WARN=$((WARN+1))
-else
-  err "uv sync failed — see: uv sync"
-  FAIL=$((FAIL+1))
-fi
+printf '\n3. Dependencies\n'
+if uv sync --frozen --no-progress >/dev/null 2>&1; then ok "uv.lock is reproducible"; else err "uv sync --frozen failed"; fi
 
-echo
-bold "4. Service"
+printf '\n4. Service\n'
 if command -v systemctl >/dev/null 2>&1; then
-  if systemctl --user is-active --quiet muselab.service 2>/dev/null; then
-    ok "systemd: muselab.service active"
-  elif systemctl --user list-unit-files muselab.service >/dev/null 2>&1; then
-    warn "systemd: muselab.service registered but not active"
-    note "  start: systemctl --user start muselab"
-    note "  logs:  journalctl --user -u muselab -n 50"
-    WARN=$((WARN+1))
-  else
-    warn "systemd: muselab.service not installed — run scripts/install-linux.sh"
-    WARN=$((WARN+1))
-  fi
-elif [[ -f "$HOME/Library/LaunchAgents/com.muselab.plist" ]]; then
-  if launchctl list 2>/dev/null | grep -q com.muselab; then
-    ok "launchd: com.muselab loaded"
-  else
-    warn "launchd: plist present but agent not loaded"
-    note "  load: launchctl load -w ~/Library/LaunchAgents/com.muselab.plist"
-    WARN=$((WARN+1))
-  fi
+  if systemctl --user is-active --quiet muselab.service; then ok "systemd user service is active"; else warn "systemd user service is not active"; fi
+elif [[ "$(uname -s)" == "Darwin" ]]; then
+  if launchctl print "gui/$(id -u)/com.muselab" >/dev/null 2>&1; then ok "launchd agent is active"; else warn "launchd agent is not active"; fi
 else
-  note "no auto-start configured (you may be running uv run manually)"
+  warn "no supported service manager detected"
 fi
 
-echo
-bold "5. HTTP probe"
-URL="http://127.0.0.1:${PORT:-8765}/"
-HEALTH_URL="http://127.0.0.1:${PORT:-8765}/api/health"
-# Prefer the auth-free /api/health (added 2026-05-20) since it returns a
-# stable JSON probe shape; fall back to "/" for older builds.
-if curl -fs -m 3 "$HEALTH_URL" 2>/dev/null | grep -q '"status":"ok"'; then
-  ok "$HEALTH_URL responds ok"
-elif curl -fs -o /dev/null -m 3 "$URL" 2>/dev/null; then
-  ok "$URL responds 200 (no /api/health — older build?)"
+printf '\n5. HTTP\n'
+if curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/api/health" | grep -q '"status":"ok"'; then
+  ok "health endpoint responds"
+elif [[ -n "$TOKEN" ]] && curl -fsS --max-time 3 -H "X-Auth-Token: $TOKEN" "http://127.0.0.1:${PORT}/api/meta" >/dev/null; then
+  ok "authenticated API responds"
 else
-  warn "$URL not responding — service may not be up"
-  WARN=$((WARN+1))
-fi
-if [[ -n "$TOKEN" ]]; then
-  if curl -fs -m 3 -H "X-Auth-Token: $TOKEN" "http://127.0.0.1:${PORT:-8765}/api/chat/context-info" >/dev/null 2>&1; then
-    ok "token works — /api/chat/context-info OK"
-  else
-    err "token rejected by /api/chat/context-info — TOKEN in .env doesn't match running process"
-    FAIL=$((FAIL+1))
-  fi
+  warn "service is not responding on 127.0.0.1:${PORT}"
 fi
 
-echo
-bold "6. Provider keys"
-# Portable .env value extraction (BSD/macOS grep lacks -P/\K).
-_env_val() { grep -E "^$1=" .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '[:space:]'; }
-[[ -n "${DEEPSEEK_API_KEY:-}"    ]] || DEEPSEEK_API_KEY=$(_env_val DEEPSEEK_API_KEY)
-[[ -n "${ZHIPUAI_API_KEY:-}"     ]] || ZHIPUAI_API_KEY=$(_env_val ZHIPUAI_API_KEY)
-[[ -n "${MINIMAX_API_KEY:-}"     ]] || MINIMAX_API_KEY=$(_env_val MINIMAX_API_KEY)
-[[ -n "${MOONSHOT_API_KEY:-}"    ]] || MOONSHOT_API_KEY=$(_env_val MOONSHOT_API_KEY)
-[[ -n "${DASHSCOPE_API_KEY:-}"   ]] || DASHSCOPE_API_KEY=$(_env_val DASHSCOPE_API_KEY)
-[[ -n "${XIAOMI_MIMO_API_KEY:-}" ]] || XIAOMI_MIMO_API_KEY=$(_env_val XIAOMI_MIMO_API_KEY)
-for entry in \
-    "DEEPSEEK_API_KEY:DeepSeek" \
-    "ZHIPUAI_API_KEY:GLM" \
-    "MINIMAX_API_KEY:MiniMax" \
-    "MOONSHOT_API_KEY:Kimi" \
-    "DASHSCOPE_API_KEY:Qwen" \
-    "XIAOMI_MIMO_API_KEY:Xiaomi MiMo"; do
-  envk="${entry%%:*}"; name="${entry##*:}"
-  val="${!envk:-}"
-  if [[ -n "$val" ]]; then
-    ok "$name key configured (${val:0:4}…${val: -4})"
-  else
-    note "$name key not set (optional — only needed if you want to use $name models)"
-  fi
-done
-
-echo
-bold "Summary"
-echo "  Failures: $FAIL    Warnings: $WARN"
-if (( FAIL > 0 )); then
-  err "doctor found blocking problems — see above"
-  exit 1
-elif (( WARN > 0 )); then
-  warn "doctor finished with warnings"
-  exit 0
-else
-  ok "all checks passed"
-  exit 0
-fi
+printf '\nSummary: %s blocking issue(s), %s warning(s)\n' "$FAIL" "$WARN"
+(( FAIL == 0 ))

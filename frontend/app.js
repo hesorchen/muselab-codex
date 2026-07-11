@@ -298,12 +298,11 @@ function portal() {
     // turn — both paths are drained by _drainPendingQueue(sid). Per-tab so
     // a compact on session A doesn't show "📦 压缩中…" on every other tab
     // (regression from when _compacting was global — fixed 2026-05-22).
-    // SDK get_context_usage() breakdown popup. Shows per-category token
-    // counts (system prompt / tools / memory files / messages / mcp / skills)
-    // so the user can see which slice is using their context window.
+    // app-server token-usage breakdown popup. Shows current input, cached
+    // input, output, and reasoning-output tokens.
     ctxBreakdown: { show: false, loading: false, data: null, error: "" },
     // Per-category expansion state inside the breakdown popup. Keyed by
-    // category name from SDK; only categories that map to a sub-list
+    // category name; only categories that map to a sub-list
     // (memoryFiles / mcpTools / agents) actually expand.
     ctxExpanded: {},
     editing: false, editText: "",
@@ -410,11 +409,15 @@ function portal() {
       messageQuery: "",
       messageLoading: false,
     },
-    // Tab strip — VS Code-Claude style. `openTabIds` is the visible order; each
+    // Editor-style tab strip. `openTabIds` is the visible order; each
     // entry is a session id (also present in `sessions`). currentId is the
     // active tab. Tabs can be opened from the session picker, closed via × on
     // the tab, or created by the "+ new" button.
     openTabIds: [],
+    _creatingSession: false,
+    _sessionCreatePromises: {},
+    _sessionsInitialized: false,
+    _sessionInitPromise: null,
     // [resident-panes] Which tabs keep their message-pane DOM mounted. The chat
     // panes (index.html) render one .msg-pane per id HERE — not per openTabIds —
     // so far-back tabs are unmounted, bounding how much retained DOM the browser
@@ -440,7 +443,7 @@ function portal() {
     // the SAME array reference — we mutate in place, never replace.
     tabState: {},
     messages: [],
-    model: "claude-sonnet-4-6",
+    model: "",
     // The configured "new-session default" model (Settings → 新会话). Kept
     // SEPARATE from `model`, which tracks the CURRENTLY-VIEWED session and is
     // overwritten to that session's locked model whenever you open an old tab.
@@ -448,7 +451,11 @@ function portal() {
     // not whatever old session you were just looking at. Loaded from the
     // /providers response at boot (and persisted in prefs for instant restore).
     defaultModel: "",
-    permission: "bypassPermissions",
+    permission: "default",
+    // The permission picker above the composer belongs to the current
+    // session.  Keep the Settings → Defaults choice separate so opening an
+    // older tab cannot silently replace the permission used by a new chat.
+    defaultPermission: "default",
     // Mobile-only: collapses the per-session settings (permission / effort)
     // behind a gear in the composer toolbar so the row stays single-line on
     // narrow phones. Desktop shows those selects inline and ignores this.
@@ -525,22 +532,11 @@ function portal() {
     _sendWaitingForUpload: false,
     dragHover: false,
 
-    // What Muse can see — populated from /api/chat/context-info on login.
-    // Drives the onboarding hints (claude_md chip, "drop a doc here" cards).
+    // Native Codex instruction surfaces, populated on login.
     contextInfo: {
-      archive_root: "",
-      claude_md_exists: false,
-      claude_md_lines: 0,
-      claude_md_mtime: 0,
-      archive_empty: true,
-      subdir_present: {},
-      has_claude_oauth: false,
-      has_anthropic_api: false,
-      third_party_configured: [],
-      has_any_provider: false,
-      // Guard so onboarding chips ("⚠ 未配档案" / "no provider") don't
-      // flash to the user while the first contextInfo fetch is still in
-      // flight. UI conditions check `_fetched && !X` rather than `!X`.
+      runtime: "codex",
+      sources: [],
+      instructions_source: "AGENTS.md",
       _fetched: false,
     },
 
@@ -560,20 +556,14 @@ function portal() {
               total_output_tokens: 0, total_cache_read_tokens: 0,
               total_cache_creation_tokens: 0, cache_hit_pct: 0,
               budget_usd: 0, budget_used_pct: 0 },
-    // Pro/Max rate-limit state: per-window snapshot from /api/chat/rate-limit,
-    // updated live by the `rate_limit` SSE event. Empty windows = never seen
-    // (third-party / API-key setups never report).
-    rateLimit: { windows: {}, updated_at: 0 },
-    // Precomputed footer badge (most-constrained window) — recomputed only when
-    // rateLimit changes, NOT per render, so the toolbar x-show is a cheap
-    // property read. null = nothing to show.
-    rlBadge: null,
-    // Codex Gateway quota snapshot. Backend reads only local Codex session
-    // JSONL rate-limit events; it never touches Codex OAuth credentials.
+    // Native Codex account rate-limit snapshot.
     codexLimit: { windows: {}, updated_at: 0, ok: false },
     codexBadge: null,
     mcp: { configured: false, servers: [] },
     availableModels: [],   // from /api/chat/providers
+    modelsLoading: true,
+    _modelsFetchPromise: null,
+    runtimeKind: "codex", // server may report "legacy" during migration
     atBottom: true,
     // Timestamp (ms) of the last genuine user scroll gesture on the chat body.
     // onChatScroll uses it to disengage auto-follow ONLY on user-driven
@@ -729,31 +719,18 @@ function portal() {
 
     settings: {
       show: false,
-      providers: [],
-      draftKeys: {},
+      nativeProviders: [],
       draftDefaults: { model: "", permission: "" },
       // (Removed 2026-05-28) draftParams — used to carry notify_scheduled /
       // notify_normal server-side toggles. Subscription state is now the
       // sole on/off; see `notifyEnabled` at the top of this object.
-      // MCP server list (loaded from /api/settings/mcp)
+      // MCP server list from Codex app-server config and live inventory.
       mcpServers: [],
-      mcpExamples: [],
-      // MCP add-form draft. `transport` picks the shape: "stdio" (local
-      // subprocess → command/args) or "remote" (http/sse connector → url +
-      // optional Authorization header), mirroring Claude app's local-vs-remote
-      // connector split.
-      mcpDraft: { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" },
-      // Provider editor drafts — keyed by stable provider id. Each holds the
-      // in-flight edit of a provider's endpoint / prefix / model-list / key,
-      // plus an `open` flag toggling the inline editor. Separate from the
-      // committed `providers` list so cancel just drops the draft.
-      providerDrafts: {},
-      // "Add a brand-new provider" form (id minted server-side on save).
-      providerNew: { show: false, base_url: "", prefix: "", models: "", api_key: "" },
-      skills: [],         // discovered skill list (read-only browse)
+      // Codex supports local STDIO and remote Streamable HTTP transports.
+      mcpDraft: { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", bearerTokenEnvVar: "" },
+      skills: [],         // app-server skill catalog + effective enable state
       skillFilter: "",    // free-text filter (name / description / source)
-      probeResults: {},   // env_key -> {ok, text} from last "Test" click
-      // Versions + upgrade — populated by loadVersions(), set by runUpgrade()
+      // Versions — populated by loadVersions().
       versions: null,
       versionsLoading: false,
       upgradeRunning: false,
@@ -804,99 +781,7 @@ function portal() {
     renamingPickerSid: "",
     pickerRenameDraft: "",
 
-    // Per-provider help hints rendered under the API-key input. Anthropic
-    // gets the most because it has two valid paths (Pro OAuth or API key);
-    // others are just a link to where to get the key.
-    // i18n for provider display labels — backend ships a single string
-    // (e.g. "百度千帆", "MiniMax (国际)") that's fine for zh users but
-    // shows Chinese text in the English UI. Map only the entries that
-    // contain CJK; everything else passes through unchanged.
-    PROVIDER_DISPLAY_I18N: {
-      "百度千帆":         { en: "Baidu Qianfan" },
-      "MiniMax (国际)":   { en: "MiniMax (International)" },
-      "Qwen (国际)":      { en: "Qwen (International)" },
-    },
-    localizeProviderDisplay(d) {
-      const m = this.PROVIDER_DISPLAY_I18N[d];
-      return (m && m[this.lang]) || d;
-    },
-
-    PROVIDER_HELP: {
-      ANTHROPIC_API_KEY: {
-        url: "https://console.anthropic.com/settings/keys",
-        zh: "API 按量付费。去 console.anthropic.com 拿 key 填这里。Pro/Max 订阅请用上面的 Claude Auth 卡片。两个都配 → CLI 自动用 Pro,不会重复扣费。",
-        en: "Pay-per-use API. Get a key at console.anthropic.com and paste it here. For Pro/Max subscription, use the Claude Auth card above. With both configured, CLI prefers Pro automatically — no double-billing.",
-      },
-      DEEPSEEK_API_KEY: {
-        url: "https://platform.deepseek.com/api_keys",
-        zh: "去 platform.deepseek.com 控制台创建 API key（注册送 5 元额度）。",
-        en: "Create an API key at platform.deepseek.com (free trial credit on signup).",
-      },
-      ZHIPUAI_API_KEY: {
-        url: "https://open.bigmodel.cn/usercenter/apikeys",
-        zh: "去 open.bigmodel.cn 控制台创建 API key。注意是国内站，不是 zhipuai.com.cn。",
-        en: "Create an API key at open.bigmodel.cn (China mainland site).",
-      },
-      MINIMAX_API_KEY: {
-        url: "https://platform.minimaxi.com/user-center/basic-information/interface-key",
-        zh: "去 platform.minimaxi.com（国内站）创建 API key。注意是 minimaxi.com 不是 minimax.io（后者是海外站，用同 key 401）。",
-        en: "Create an API key at platform.minimaxi.com (the .com - .io is overseas and rejects the same key).",
-      },
-      MOONSHOT_API_KEY: {
-        url: "https://platform.moonshot.cn/console/api-keys",
-        zh: "去 platform.moonshot.cn 控制台创建 API key（Kimi K2 系列走此 key）。",
-        en: "Create an API key at platform.moonshot.cn (for Kimi K2 models).",
-      },
-      DASHSCOPE_API_KEY: {
-        url: "https://dashscope.console.aliyun.com/apiKey",
-        zh: "去阿里云灵积 DashScope 控制台创建 API key（Qwen 系列走此 key）。注册后在「API-KEY管理」页面生成。",
-        en: "Create an API key in the DashScope console at dashscope.console.aliyun.com (for Qwen models). Find it under 「API-KEY管理」after registering.",
-      },
-      XIAOMI_MIMO_API_KEY: {
-        url: "https://platform.xiaomimimo.com",
-        zh: "去 platform.xiaomimimo.com 申请 MiMo API 内测资格并创建 key。",
-        en: "Apply for MiMo API beta access and create a key at platform.xiaomimimo.com.",
-      },
-      QIANFAN_API_KEY: {
-        url: "https://console.bce.baidu.com/qianfan/ais/console/applicationConsole/application/v2",
-        zh: "去百度智能云千帆控制台创建应用，获取 API key（ERNIE 系列走此 key）。注意需要 IAM 鉴权，非普通 sk-xxx 格式。",
-        en: "Create an app in Baidu Qianfan console to get an API key (for ERNIE models). Note: IAM auth, not plain sk-xxx format.",
-      },
-      CODEX_GATEWAY_API_KEY: {
-        url: "docs/codex-gateway.md",
-        zh: "连接你本机 127.0.0.1 上的 Codex Gateway。muselab 不保存 Codex OAuth 凭据，也不直接调用 OpenAI 原生接口。",
-        en: "Connect your local Codex Gateway on 127.0.0.1. muselab does not store Codex OAuth credentials or call OpenAI-native APIs directly.",
-      },
-    },
-
     _pendingExpanded: null,
-
-    // ===== Claude Auth (Pro/Max OAuth) — standalone provider =====
-    // Treated as its own card in Settings — separate from PROVIDER_HELP /
-    // settings.providers because it has no API key field. Auth lives in
-    // ~/.claude/.credentials.json (written by `claude login`), identity
-    // comes from `claude auth status --json` — both exposed via
-    // /api/settings/claude-auth/{status,disconnect}.
-    claudeAuth: {
-      loaded: false,           // first /status fetch completed
-      cli_installed: false,
-      cli_path: null,
-      credentials_file_present: false,
-      logged_in: false,
-      email: null,
-      org_name: null,
-      subscription_type: null,  // "max" / "pro" / "free" / null
-      expires_at: null,         // ms-since-epoch
-      reason: null,
-    },
-    // Connect modal state — managed independently from generic confirm()
-    // because it has its own polling lifecycle (every 3 sec until logged_in).
-    claudeAuthModal: {
-      open: false,
-      polling: false,
-      pollHandle: null,
-      copyToast: null,        // which command got copied ("install" | "login")
-    },
 
     // ===== init =====
     onGlobalKeyDown(ev) {
@@ -1060,7 +945,10 @@ function portal() {
       // content shows, then the page freezes 2–3 s while the bundle parses.
       // Warming them up front moves that cost off the click path. Fire-and-
       // forget; failures fall back to the existing on-demand lazy load.
-      this._prewarmPreviewLibs();
+      // Do not prewarm parser bundles during boot. requestIdleCallback's
+      // timeout fires while a busy restore is still running, so hljs/KaTeX
+      // compilation used to join the critical path and freeze both panes.
+      // The existing on-demand loaders keep first use correct.
       // 全局快捷键（绑在 document，避免每个 textarea 单独处理）
       document.addEventListener("keydown", e => this.onGlobalKeyDown(e));
       // (Cross-tab queue sync via localStorage `storage` events was removed
@@ -1234,7 +1122,8 @@ function portal() {
           // (e.g. resized while on the mobile menu) → land on a default tab
           // so the content pane isn't blank next to the sidebar.
           if (e.matches && this.settings.show && !this.settings.activePage) {
-            this.settings.activePage = "provider";
+            this.settings.activePage = this.runtimeKind === "codex"
+              ? "native-providers" : "provider";
           }
         };
         // addEventListener is the modern API; older Safari needs
@@ -1556,7 +1445,19 @@ function portal() {
       }, 8000);
 
       this.loadPrefs();
-      this.loadRoot();
+      // The shell must paint immediately. Context, tree and transcript data
+      // enrich it progressively; none is required to remove the full-screen
+      // splash. Waiting for even a "small" request here made all panes appear
+      // coupled to the slowest boot task.
+      requestAnimationFrame(() => this._markReady());
+
+      // Model discovery gates the composer, so start it before session and
+      // file enrichment.  A shared in-flight promise prevents the deferred
+      // stats refresh below from issuing a duplicate model/list request.
+      this._fetchModels({ retries: 2 });
+
+      // Restore the two user-visible working surfaces first and independently.
+      // A long transcript must not block the selected file, and vice versa.
       // Push-notification deep-link: a turn-done notification opens
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
       // session so the user lands in the conversation they were pinged about
@@ -1567,7 +1468,12 @@ function portal() {
           if (sid) this._openSessionFromDeeplink(sid);
         } catch (_) { /* noop */ }
       });
-      this.fetchStats();
+      // The file tree can involve many directory reads and keyed DOM inserts.
+      // Start it after current preview/session requests have entered flight and
+      // after the browser has had a chance to paint their loading skeletons.
+      setTimeout(() => { this.loadRoot().catch(() => {}); }, 150);
+      // Stats/providers are toolbar enrichment, never first-paint data.
+      setTimeout(() => { this.fetchStats(); }, 300);
       // Trash badge state — light fetch (just count), gated by token
       // which is already verified at this point. Fire-and-forget;
       // failures degrade silently to "no badge styling".
@@ -1614,14 +1520,8 @@ function portal() {
           if (this._isMobileLayout()) this.mobileTab = wantTab;
         });
       }
-      // Block readiness on context-info (the most important one for the
-      // onboarding cards). Others come along in parallel.
-      try {
-        await this.fetchContextInfo();
-        this._markReady();
-      } catch (e) {
-        // Will retry via heartbeat
-      }
+      // Context is useful for labels/onboarding but not a paint dependency.
+      this.fetchContextInfo().catch(() => { /* heartbeat retries */ });
       this._startLiveConnections();
     },
 
@@ -1661,7 +1561,14 @@ function portal() {
             && document.visibilityState !== "visible") return;
         if (!this.token) return;
         try {
-          await this._syncSessionListQuiet();
+          const updated = await this._syncSessionListQuiet();
+          // A transient app-server failure during cold boot used to leave the
+          // page permanently blank: later polls filled `sessions` but never
+          // resumed current-tab reconciliation or loadSession().  Complete
+          // initialization as soon as any later list pull succeeds.
+          if (updated && !this._sessionsInitialized) {
+            await this.initSessions({ skipRefresh: true });
+          }
         } catch (_) { /* best-effort; next tick retries */ }
       }, 10_000);
     },
@@ -2387,7 +2294,7 @@ function portal() {
 
     // Render markdown -> sanitized HTML. All markdown rendering MUST go through
     // here; passing raw `marked.parse(...)` to x-html opens XSS via untrusted
-    // file content / Claude responses containing <script>, on*, javascript: etc.
+    // file content or model responses containing <script>, on*, javascript: etc.
     // ===== attachment helpers (images + docs) =====
     // Classify a file by mime/extension to decide which preview chip to show
     // and (cosmetically) what kind label to display. Server has the
@@ -2494,9 +2401,9 @@ function portal() {
       // 2026-06-23 re-loosened for legibility. The 1280/q0.72 era turned
       // dense screenshots (game settlement screens, spreadsheets, receipts)
       // with ~10px text into mush. New ceiling tracks the vision API's own
-      // limit: Claude downsamples any attachment to ≤1568px on the long edge
-      // (~1.15 MP) BEFORE the model sees it, so sending more than 1568 is
-      // pure wasted upload for model-reading purposes — 1568 maximizes legible
+      // limit: the vision input path downsamples attachments to ≤1568px on the
+      // long edge (~1.15 MP), so sending more adds upload cost without improving
+      // model readability — 1568 maximizes legible
       // detail at the smallest bytes that still saturate what the model gets.
       // Costs ~2-3× the bytes of the 1280/q0.72 era: a deliberate trade of
       // 4G upload speed for readability (the original 2026-05-21 retune went
@@ -3171,7 +3078,7 @@ function portal() {
     renderMd(text) { return this.mdRender(text); },
     // Friendly label for a model id — falls back to the raw id if not in catalog.
     // Used by the bubble badge so old messages keep showing their original model
-    // (deepseek / glm / claude variants) instead of just the long id.
+    // across provider variants instead of just the long id.
     modelLabel(id) {
       if (!id) return "";
       const meta = this._modelMeta(id);
@@ -3389,7 +3296,7 @@ function portal() {
     // Returns "" for paths we can't safely open (would 403 / 404 on backend).
     _normalizeArchivePath(p) {
       if (!p) return "";
-      const root = (this.contextInfo && this.contextInfo.archive_root) || "";
+      const root = (this.contextInfo && this.contextInfo.workspace_root) || "";
       if (p.startsWith("/")) {
         if (root && (p === root || p.startsWith(root + "/"))) {
           return p.slice(root.length).replace(/^\/+/, "");
@@ -3468,6 +3375,25 @@ function portal() {
       }
       return name;
     },
+    hasToolInput(m) {
+      if (!m || !m.input) return false;
+      if (typeof m.input === "string") return m.input.length > 0;
+      return typeof m.input === "object" && Object.keys(m.input).length > 0;
+    },
+    toolInputText(m) {
+      if (!m || !m.input) return "";
+      let text = "";
+      if (typeof m.input === "string") text = m.input;
+      else if (typeof m.input.code === "string") text = m.input.code;
+      else {
+        try { text = JSON.stringify(m.input, null, 2); }
+        catch (_) { text = String(m.input); }
+      }
+      const limit = 50_000;
+      return text.length > limit
+        ? text.slice(0, limit) + "\n… (input truncated)"
+        : text;
+    },
 
     // ===== MCP tool enrichment =====
     // Known MCP servers get a recognizable emoji icon + short label so
@@ -3497,15 +3423,15 @@ function portal() {
       "muselab":              "🎭",
     },
     // Parse mcp__<server>__<tool> into a UI-friendly descriptor.
-    // Server names sometimes carry an OAuth-provider prefix like
-    // "claude_ai_Gmail" — we strip the known prefix to find the icon.
+    // Server names sometimes carry a legacy OAuth-provider prefix; strip the
+    // known prefix to find the icon.
     mcpServerInfo(toolName) {
       if (!toolName || !toolName.startsWith("mcp__")) return null;
       const rest = toolName.slice(5);
       const parts = rest.split("__");
       let rawServer = parts[0] || "";
       const tool = parts.slice(1).join(" · ");
-      // Strip OAuth provider prefix if present ("claude_ai_Gmail" → "Gmail")
+      // Strip a known OAuth provider prefix when present.
       let cleanServer = rawServer;
       const OAUTH_PREFIXES = ["claude_ai_", "claude_ai__"];
       for (const p of OAUTH_PREFIXES) {
@@ -3627,7 +3553,16 @@ function portal() {
     // Single entry point for rendering a markdown FILE (preview pane + editor
     // live preview): strip frontmatter, render, then resolve relative images.
     _renderPreviewMd(text) {
-      return this._resolveMdImages(this.mdRender(this._stripFrontmatter(text)));
+      const body = this._stripFrontmatter(text);
+      // For large notes, skip the second full detached-DOM construction used
+      // by math and file-path linkification. marked + DOMPurify still produce
+      // the complete safe preview; rich post-processing is progressive.
+      const large = typeof body === "string"
+        && body.length > (this.LARGE_MD_DEFER_CHARS || 200 * 1024);
+      const html = large
+        ? this._mdRenderUncached(body, { streaming: true })
+        : this.mdRender(body);
+      return this._resolveMdImages(html);
     },
 
     // opts.streaming === true → cheap path used on every throttled re-render
@@ -3964,7 +3899,7 @@ function portal() {
           : null;
         // Direct ROOT-relative lookup missed. The model commonly emits a path
         // relative to a SUBDIR of the archive root (e.g. "learning/x.html"
-        // when the file actually lives at "claude_space/learning/x.html").
+        // when the file actually lives at "workspace/learning/x.html").
         // Search the archive by basename and accept a UNIQUE hit whose full
         // path ends with the clicked path — same file, just a missing prefix.
         // Generic (no hardcoded dir) and safe (suffix + exact-name + sole-match).
@@ -4009,7 +3944,7 @@ function portal() {
     },
 
     // Open a background-task result file. Its output_file lives under
-    // /tmp/claude-<uid>/.../tasks/<id>.output — OUTSIDE the archive root, so
+    // a runtime temp directory — OUTSIDE the archive root, so
     // the archive-scoped /api/files/read (and openByPathToasted's parent-dir
     // list) can't reach it. Route through the dedicated /api/chat/task-output
     // endpoint via openFile's readUrl override. No tree reveal (not in tree).
@@ -4340,7 +4275,8 @@ function portal() {
       // behavior via openTabIds.
       this._setLS("muselab_prefs", JSON.stringify({
         schema: 2,          // bump when prefs format changes incompatibly
-        model: this.model, defaultModel: this.defaultModel, permission: this.permission,
+        model: this.model, defaultModel: this.defaultModel,
+        permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
         openTabIds: this.openTabIds,
         previewTabs: this.tabs.map(t => ({ path: t.path, name: t.name, preview: !!t.preview })),
@@ -4367,6 +4303,16 @@ function portal() {
       // when another device pushed a different state.
     },
 
+    _scheduleSavePrefs() {
+      // localStorage is synchronous. Coalesce rapid preview-tab changes and
+      // persist them outside the click frame.
+      clearTimeout(this._savePrefsTimer);
+      this._savePrefsTimer = setTimeout(() => {
+        this._savePrefsTimer = null;
+        this.savePrefs();
+      }, 80);
+    },
+
     loadPrefs() {
       try {
         const p = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
@@ -4378,17 +4324,37 @@ function portal() {
         if (p.model) this.model = p.model;
         if (p.defaultModel) this.defaultModel = p.defaultModel;
         if (p.permission) this.permission = p.permission;
+        if (["default", "plan", "bypassPermissions"].includes(p.defaultPermission)) {
+          this.defaultPermission = p.defaultPermission;
+        }
         if (typeof p.leftOpen === "boolean") this.leftOpen = p.leftOpen;
         if (typeof p.rightOpen === "boolean") this.rightOpen = p.rightOpen;
         if (typeof p.leftWidth === "number") this.leftWidth = p.leftWidth;
         if (typeof p.rightWidth === "number") this.rightWidth = p.rightWidth;
         if (typeof p.showHidden === "boolean") this.showHidden = p.showHidden;
         if (p.currentId) this.currentId = p.currentId;
-        if (Array.isArray(p.openTabIds)) this.openTabIds = p.openTabIds;
+        if (Array.isArray(p.openTabIds)) {
+          // Alpine x-for requires unique, stable scalar keys. Repair stale
+          // duplicate/null ids before the tab strip mounts; otherwise its
+          // keyed lookup can crash at `_x_effects` on the next insertion.
+          this.openTabIds = [...new Set(p.openTabIds.filter(
+            id => typeof id === "string" && id))];
+        }
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
-        if (Array.isArray(p.previewTabs)) this.tabs = p.previewTabs;
+        if (Array.isArray(p.previewTabs)) {
+          // Three keyed x-for views consume this same array. Duplicate/empty
+          // paths from old prefs corrupt Alpine's per-template lookup and the
+          // next preview click then dies at `elForSpot.after(...)`.
+          const seen = new Set();
+          this.tabs = p.previewTabs.filter(t => {
+            const path = t && typeof t.path === "string" ? t.path : "";
+            if (!path || seen.has(path)) return false;
+            seen.add(path);
+            return true;
+          });
+        }
         if (typeof p.previewSelected === "string") this._pendingPreviewSelected = p.previewSelected;
         // Stash the mobile tab choice in a "pending" slot — actually applying
         // it has to wait until after _bootApp's openFile(previewSelected)
@@ -4426,16 +4392,6 @@ function portal() {
       if (!ok || !data) return;
       data._fetched = true;
       this.contextInfo = data;
-      // First successful load: if the user hasn't configured any provider,
-      // pop the Settings drawer so they can fix it before trying to chat.
-      // _providerCheckDone gate ensures we don't re-pop on heartbeat
-      // reconnects or polling refreshes.
-      if (!this._providerCheckDone) {
-        this._providerCheckDone = true;
-        if (!data.has_any_provider && !this.settings.show) {
-          this.openSettings();
-        }
-      }
     },
 
     async fetchStats() {
@@ -4446,18 +4402,13 @@ function portal() {
           this.stats = { ...this.stats, total_cost_usd: d.total_cost_usd, total_messages: d.total_messages };
         }
       } catch {}
-      await this.fetchMcp();
-      await this.fetchRateLimit();
-      try {
-        const r = await fetch("/api/chat/providers", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.availableModels = d.models || [];
-          if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
-          this._ensureValidModel();
-          this._rebindModelSelect();
-        }
-      } catch {}
+      // Inventory can wait for remote MCP startup. Do not delay model and
+      // quota loading; the MCP drawer updates when the probe settles.
+      this.fetchMcp();
+      await this._fetchModels({ retries: 2 });
+      // Account quota is optional toolbar enrichment. In particular, a slow
+      // account/rateLimits/read must never sit in front of model discovery.
+      this.fetchCodexRateLimit();
     },
 
     async fetchCodexRateLimit(opts = {}) {
@@ -4479,20 +4430,6 @@ function portal() {
           this.codexBadge = this.codexLimit.provider_authoritative
             ? this.limitBadgeFromWindows(this.codexLimit.windows)
             : null;
-        }
-      } catch {}
-    },
-
-    // Pull the current Pro/Max rate-limit snapshot. SSE pushes live deltas
-    // during a turn, but a freshly-loaded page (or one that hasn't sent a turn
-    // yet this session) needs the snapshot to show quota immediately.
-    async fetchRateLimit() {
-      try {
-        const r = await fetch("/api/chat/rate-limit", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.rateLimit = { windows: d.windows || {}, updated_at: d.updated_at || 0 };
-          this.rlBadge = this.rateLimitWorst();
         }
       } catch {}
     },
@@ -4551,8 +4488,6 @@ function portal() {
     },
 
     currentQuotaBadge() {
-      if (this._isCodexModel(this.model)) return null;
-      if (this._isClaudeModel(this.model)) return this.rlBadge;
       return null;
     },
 
@@ -4614,7 +4549,10 @@ function portal() {
     async fetchMcp() {
       try {
         const r = await fetch("/api/chat/mcp", { headers: this.hdr() });
-        if (r.ok) this.mcp = await r.json();
+        if (r.ok) {
+          this.mcp = await r.json();
+          this.settings.mcpServers = this.mcp.servers || [];
+        }
       } catch {}
     },
 
@@ -4632,9 +4570,8 @@ function portal() {
       const cur = this.sessions.find(s => s.id === this.currentId);
       const oldM = cur ? cur.model : "";
       if (newM === oldM) return;
-      // If the new model doesn't honor the current effort (e.g. switched
-      // from Opus 4.7 → Sonnet with effort=xhigh, or to any non-Claude
-      // vendor), reset to "" (auto). Without this the option becomes
+      // If the new model doesn't honor the current effort, reset to "" (auto).
+      // Without this the option becomes
       // hidden by _effortAllowed but the select still reports the stale
       // value, and the backend would forward a no-op effort param on
       // every turn. Fire-and-forget the PATCH — the local reset already
@@ -4667,7 +4604,7 @@ function portal() {
           const r = await fetch("/api/chat/sessions/" + this.currentId, {
             method: "PATCH",
             headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ model: newM }),
+            body: JSON.stringify({ model: newM, model_provider: this._modelProvider(newM) }),
           });
           if (!r.ok) {
             this.model = oldM;
@@ -4688,7 +4625,7 @@ function portal() {
         return;
       }
 
-      // Session has history — confirm + create new.
+      // Session has history — confirm + native Codex fork.
       const label = this.modelLabel(newM);
       const ok = await this.confirm({
         title: this.t("model.switch_title"),
@@ -4700,12 +4637,10 @@ function portal() {
         return;
       }
       try {
-        const r = await fetch("/api/chat/sessions", {
+        const r = await fetch("/api/chat/sessions/" + encodeURIComponent(this.currentId) + "/fork", {
           method: "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
-          // open_ids: same open-tab protection as newSession() (this model-fork
-          // also creates a session, which triggers the empty-session recycler).
-          body: JSON.stringify({ name: "", model: newM, open_ids: this.openTabIds || [] }),
+          body: JSON.stringify({ model: newM, model_provider: this._modelProvider(newM) }),
         });
         if (!r.ok) {
           this.model = oldM;
@@ -4714,14 +4649,14 @@ function portal() {
         }
         const meta = await r.json();
         await this.refreshSessions();
-        // Model-fork creates a brand-new session — wire it up as a tab the
-        // same way newSession() does (tabState + openTabIds + activate).
+        // The native fork creates a Codex-owned transcript — wire it up as a
+        // tab the same way newSession() does (tabState + openTabIds + activate).
         this.currentId = meta.id;
         const newSt = this._ensureTabState(meta.id);
-        newSt.messages.length = 0;
-        newSt._loaded = true;
+        newSt._loaded = false;
         this._activateTabState(meta.id);
         if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+        await this.loadSession(meta.id);
         this._fetchTabUsage(meta.id);
         this.savePrefs();
         this.toast(this.t("model.new_session_ok", { label }), "success", 2000);
@@ -4737,18 +4672,7 @@ function portal() {
     // Backend disconnects the cached client so the next turn rebuilds with
     // the new value.
     //
-    // Effort support varies by model. Per claude_agent_sdk types.py:
-    //   - "low"/"medium"/"high"/"max"  → all Anthropic models honor
-    //   - "xhigh"                       → Opus 4.7 / 4.8 only; SDK silently
-    //                                     falls back to "high" on Sonnet / Haiku
-    //   - non-Claude providers           → show only when /api/chat/providers
-    //                                     marks supports_effort=true. Codex
-    //                                     Gateway opts in because its sidecar
-    //                                     translates the Anthropic-compatible
-    //                                     request to a Codex/OpenAI backend.
-    // Per "无效的直接隐藏" feedback (2026-05-22) we don't grey-out — we
-    // hide. User feedback: greyed options still look pick-able and waste
-    // dropdown space.
+    // Availability is reported per model by the Codex runtime.
     _modelMeta(model) {
       const m = model || "";
       const list = this.availableModels || [];
@@ -4765,8 +4689,9 @@ function portal() {
       }
       return null;
     },
-    _isClaudeModel(model) {
-      return (model || "").startsWith("claude-");
+    _modelProvider(model) {
+      const meta = this._modelMeta(model);
+      return meta && typeof meta.provider === "string" ? meta.provider : "";
     },
     _isCodexModel(model) {
       const m = model || "";
@@ -4774,24 +4699,13 @@ function portal() {
       const meta = this._modelMeta(m);
       return !!(meta && /codex/i.test(meta.group || ""));
     },
-    _isOpus47(model) {
-      // Misnomer kept for blast-radius reasons: this gate fires for any
-      // Opus model that supports the `xhigh` effort level. Per Anthropic's
-      // effort-level docs, that is Opus 4.7 AND Opus 4.8 — both are listed
-      // as "Available on Claude Opus 4.8 and Claude Opus 4.7". Future
-      // Opus models will likely keep the privilege; extend this match
-      // when they ship.
-      const m = (model || "");
-      return m.startsWith("claude-opus-4-7") || m.startsWith("claude-opus-4-8");
-    },
     _supportsEffort(model) {
-      if (this._isClaudeModel(model)) return true;
       const meta = this._modelMeta(model);
       return !!(meta && meta.supports_effort === true);
     },
     _supportsThinking(model) {
       // Thinking toggle shows for any provider whose endpoint honors the
-      // standard Anthropic thinking config (provider-level supports_thinking,
+      // configured thinking mode (provider-level supports_thinking,
       // surfaced per-model by /api/chat/providers). Vendors that reject it
       // (e.g. Qianfan) are hidden so the switch isn't a no-op. Default true
       // when the model isn't in the catalog yet (optimistic — matches the
@@ -4802,16 +4716,19 @@ function portal() {
     },
     _effortAllowed(level, model) {
       if (level === "") return true;            // "auto" always available
-      if (!this._supportsEffort(model)) return false;
-      if (level === "xhigh") return this._isOpus47(model);
-      return true;                              // low / medium / high / max
+      const meta = this._modelMeta(model);
+      const advertised = meta && Array.isArray(meta.reasoning_efforts)
+        ? meta.reasoning_efforts : [];
+      return advertised.includes(level);
     },
     effortChoices(model) {
       // Avoid x-show directly on <option>: iOS Safari's native picker can cache
       // or ignore dynamically hidden option nodes, leaving only the selected
       // "auto" visible. Render the filtered option list instead.
-      return ["", "low", "medium", "high", "xhigh", "max"]
-        .filter(level => this._effortAllowed(level, model))
+      const meta = this._modelMeta(model);
+      const advertised = meta && Array.isArray(meta.reasoning_efforts)
+        ? meta.reasoning_efforts : [];
+      return ["", ...advertised]
         .map(level => ({ value: level, labelKey: "effort." + (level || "auto") }));
     },
     async onEffortChange() {
@@ -4944,6 +4861,11 @@ function portal() {
         // True while an async backend older-window fetch is in flight, so
         // rapid "Load earlier" clicks don't fire duplicate requests.
         _fetchingOlder: false,
+        // Stable app-server currently has no paginated transcript read. A
+        // very large thread can be marked metadata-only by the backend so it
+        // does not monopolize every other Codex request.
+        historyUnavailable: false,
+        _historyWarned: false,
       };
     },
     _ensureTabState(id) {
@@ -5056,7 +4978,10 @@ function portal() {
           // drain replays the turn under this mode (fixes queued messages
           // bypassing tool approval the UI said was required).
           body: JSON.stringify({ text: item.text || "", image_ids,
-                                 permission: this.permission || "" }),
+                                 permission: this.permission || "default",
+                                 model: this.model || "",
+                                 model_provider: this._modelProvider(this.model),
+                                 effort: this.effort || "" }),
         });
         if (r.status === 409) {
           this.toast(this.lang === "zh"
@@ -5363,11 +5288,9 @@ function portal() {
       await this._syncQueueFromServer(sid);
     },
     // Pull the per-session context meter (input/output tokens, limit, %)
-    // from the backend and merge it into tabState[sid].sessionUsage. Limit
-    // is model-specific (opus/sonnet/haiku → 200k, others → 128k default),
-    // so we MUST refresh whenever the active model could differ from what
-    // last produced the cached numbers — that includes brand-new sessions
-    // which would otherwise sit at the _blankTabState default of 128k.
+    // from the backend and merge it into tabState[sid].sessionUsage. The
+    // limit is the exact modelContextWindow emitted by app-server; never
+    // guess a model-specific default when Codex has not reported one yet.
     async _fetchTabUsage(sid) {
       if (!sid) return;
       const st = this._ensureTabState(sid);
@@ -5476,11 +5399,33 @@ function portal() {
       this._residentTabIds = list;
     },
 
-    async initSessions() {
-      await this.refreshSessions();
+    async initSessions(options = {}) {
+      if (this._sessionInitPromise) return this._sessionInitPromise;
+      this._sessionInitPromise = this._initSessionsOnce(options);
+      try {
+        return await this._sessionInitPromise;
+      } finally {
+        this._sessionInitPromise = null;
+      }
+    },
+    async _initSessionsOnce(options = {}) {
+      let refreshed = !!options.skipRefresh;
+      // One failed list request now tears down the unresponsive app-server.
+      // Retry once so this same page benefits from the fresh generation
+      // instead of requiring the user to press reload again.
+      for (let attempt = 0; !refreshed && attempt < 2; attempt++) {
+        refreshed = await this.refreshSessions();
+        if (!refreshed && attempt === 0) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
+      }
+      if (!refreshed) {
+        this.connState = "reconnecting";
+        return false;
+      }
       if (!this.sessions.length) {
         const s = await this.newSession();
-        this.currentId = s.id;
+        if (s) this.currentId = s.id;
       } else if (!this.sessions.find(x => x.id === this.currentId)) {
         // localStorage had no saved session (new device / cleared storage).
         // Tab state is device-local now, so just land on the most recent
@@ -5505,7 +5450,9 @@ function portal() {
         await this.loadSession(this.currentId);
         st._loaded = true;
       }
+      this._sessionsInitialized = true;
       this.savePrefs();
+      return true;
     },
     // Shared session-list pull behind both the explicit refresh and the 10s
     // quiet poll. Returns true when the list was (re)applied, false on a 304
@@ -5521,6 +5468,18 @@ function portal() {
     // a direct fetch. Both call paths cache the latest ETag so the next
     // conditional poll always compares against a fresh baseline.
     async _pullSessionList(conditional = false, extraIds = "") {
+      // Never let the 10s poll stack concurrent thread/list requests behind a
+      // slow app-server. A request pile starves thread/start and makes New
+      // session appear frozen. Explicit refreshes share the active pull.
+      if (this._sessionListPullPromise) return this._sessionListPullPromise;
+      this._sessionListPullPromise = this._pullSessionListOnce(conditional, extraIds);
+      try {
+        return await this._sessionListPullPromise;
+      } finally {
+        this._sessionListPullPromise = null;
+      }
+    },
+    async _pullSessionListOnce(conditional = false, extraIds = "") {
       const headers = { ...this.hdr() };
       if (conditional && this._sessionsEtag) {
         headers["If-None-Match"] = this._sessionsEtag;
@@ -5559,10 +5518,11 @@ function portal() {
     },
     async refreshSessions() {
       const ok = await this._pullSessionList(false);
-      if (!ok) return;
-      // <select x-model="currentId"> needs a tickle to sync display when
-      // sessions populate (same Alpine-x-model-on-dynamic-options race).
-      await this._rebindSelect("currentId");
+      if (!ok) return false;
+      // The legacy currentId <select> no longer exists.  Flipping currentId
+      // to an empty string and back here corrupts Alpine's keyed tab DOM on
+      // refresh (`reading 'after'`) and serves no current UI binding.
+      return true;
     },
     // FIX ⑪: quiet variant for the 10s foreground poll. Identical list-merge
     // (incl. the FIX ⑩ active-flag dots + green-dot transition) but WITHOUT
@@ -5574,7 +5534,7 @@ function portal() {
     // _applySessionList, so an idle multi-tab user stops re-rendering the
     // picker every 10s.
     async _syncSessionListQuiet() {
-      await this._pullSessionList(true);
+      return await this._pullSessionList(true);
     },
     // Shared session-list applier. Snapshots the prior server-side `active`
     // flags BEFORE swapping in the new list (FIX ⑩) so we can detect a
@@ -5749,7 +5709,109 @@ function portal() {
       return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-` +
              `${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
     },
+    async _newServerSession() {
+      if (this._creatingSession) return null;
+      this._creatingSession = true;
+      const seedModel = this.defaultModel || this.model || "";
+      this.model = seedModel;
+      this.permission = this.defaultPermission || "default";
+      const draftId = "draft-" + this._uuid();
+      const now = Date.now() / 1000;
+      const draft = {
+        id: draftId,
+        name: this.lang === "zh" ? "新会话" : "New chat",
+        model: seedModel,
+        model_provider: this._modelProvider(seedModel),
+        created_at: now,
+        updated_at: now,
+        message_count: 0,
+        auto_named: true,
+        pinned: false,
+        active: false,
+      };
+      // Perceived creation must not wait for app-server's thread/start. Mount
+      // a local draft immediately, then atomically replace its id with the
+      // native Codex UUID when the background request returns.
+      this._optimisticMetas[draftId] = draft;
+      this.sessions = [draft, ...this.sessions];
+      const st = this._ensureTabState(draftId);
+      st.messages.length = 0;
+      st._loaded = true;
+      if (!this.openTabIds.includes(draftId)) this.openTabIds.push(draftId);
+      this.currentId = draftId;
+      this._activateTabState(draftId);
+
+      const createPromise = (async () => {
+        const response = await fetch("/api/chat/sessions", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({
+            // Keep name unset. Codex fills thread.preview from the first user
+            // turn; persisting a timestamp through thread/name/set would make
+            // that placeholder an explicit name and mask the native preview.
+            model: seedModel,
+            model_provider: this._modelProvider(seedModel),
+          }),
+        });
+        if (!response.ok) throw new Error("session " + response.status);
+        const meta = await response.json();
+        if (!meta || !meta.id) throw new Error("session id missing");
+        if (meta.auto_named) {
+          meta.name = this.lang === "zh" ? "新会话" : "New chat";
+        }
+
+        const draftIndex = this.sessions.findIndex(s => s.id === draftId);
+        const nextSessions = this.sessions.filter(
+          s => s.id !== draftId && s.id !== meta.id);
+        nextSessions.splice(Math.max(0, draftIndex), 0, meta);
+        this.sessions = nextSessions;
+        this.tabState[meta.id] = this.tabState[draftId] || st;
+        this.openTabIds = this.openTabIds.map(id => id === draftId ? meta.id : id);
+        this._residentTabIds = (this._residentTabIds || []).map(
+          id => id === draftId ? meta.id : id);
+        const wasCurrent = this.currentId === draftId;
+        // Let Alpine mount the native keyed pane before moving currentId.
+        await this.$nextTick();
+        if (wasCurrent) {
+          this.currentId = meta.id;
+          this._activateTabState(meta.id);
+        }
+        delete this.tabState[draftId];
+        delete this._optimisticMetas[draftId];
+        delete this._sessionCreatePromises[draftId];
+        this.savePrefs();
+        this._fetchTabUsage(meta.id);
+        return meta;
+      })();
+      this._sessionCreatePromises[draftId] = createPromise;
+      try {
+        return await createPromise;
+      } catch (_error) {
+        delete this._sessionCreatePromises[draftId];
+        delete this._optimisticMetas[draftId];
+        this.sessions = this.sessions.filter(s => s.id !== draftId);
+        this.openTabIds = this.openTabIds.filter(id => id !== draftId);
+        this._residentTabIds = (this._residentTabIds || []).filter(
+          id => id !== draftId);
+        delete this.tabState[draftId];
+        if (this.currentId === draftId) {
+          this.currentId = this.openTabIds[this.openTabIds.length - 1] || "";
+          if (this.currentId) this._activateTabState(this.currentId);
+        }
+        this.toast(this.lang === "zh"
+          ? "创建会话失败，请检查 Codex 运行状态"
+          : "Could not create the session — check the Codex runtime",
+          "error", 4000);
+        return null;
+      } finally {
+        this._creatingSession = false;
+      }
+    },
     newSession() {
+      // Codex owns thread UUIDv7 identifiers, so the browser must adopt the
+      // id returned by thread/start. Keep the optimistic UUID path only for
+      // the inherited runtime while migration tests still exercise it.
+      if (this.runtimeKind === "codex") return this._newServerSession();
       // No longer stops streams in OTHER tabs — each tab has its own ES in
       // tabState[id].es. The new session starts fresh in its own tab.
       // Default name uses the user's BROWSER-LOCAL clock — the backend
@@ -5782,6 +5844,7 @@ function portal() {
       // this.model, so without this the selector would still show the old
       // session's model even though the new session is seeded with the default.
       this.model = seedModel;
+      this.permission = this.defaultPermission || "default";
       const meta = {
         id,
         name: prefix + stamp,
@@ -5819,7 +5882,11 @@ function portal() {
         // open_ids: protect THIS browser's open tabs from the backend's
         // empty-session recycler (prune_empty_sessions keep_ids) — an open but
         // still-empty scratch tab must not be swept when a new one is created.
-        body: JSON.stringify({ id, name: meta.name, model: seedModel, open_ids: this.openTabIds || [] }),
+        body: JSON.stringify({
+          id, name: meta.name, model: seedModel,
+          model_provider: this._modelProvider(seedModel),
+          open_ids: this.openTabIds || [],
+        }),
       }).then(r => (r && r.ok ? r.json() : null)).then(srv => {
         // Confirmed: drop the optimistic guard and reconcile any server-side
         // normalisation (e.g. provider model fallback) into the local row.
@@ -5843,7 +5910,7 @@ function portal() {
     },
 
     // Create a curator-mode session and kick off the workflow. As of
-    // 2026-05-23 this covers BOTH archive tidying AND CLAUDE.md profile
+    // 2026-05-23 this covers BOTH archive tidying AND AGENTS.md profile
     // gap completion (the old startProfileIntake was merged in — two
     // near-identical entry points were confusing, the curator prompt
     // step 3b now walks the user through any blank profile sections).
@@ -5855,8 +5922,8 @@ function portal() {
       const ok = await this.confirm({
         title: zh ? "整理档案" : "Organize archive",
         body: zh
-          ? "将新建一个 [整理档案] 会话：Muse 会扫描 archive、提出整理建议，并对 CLAUDE.md 里还没填的章节逐项问你。每一步动文件前都会等你确认。"
-          : "Will create a new [Organize] session: Muse scans the archive, proposes tidy-up changes, and walks through any blank CLAUDE.md profile sections. Every file-modifying step waits for your confirmation.",
+          ? "将新建一个 [整理档案] 会话：Muse 会扫描 archive、提出整理建议，并对 AGENTS.md 里还没填的章节逐项问你。每一步动文件前都会等你确认。"
+          : "Will create a new [Organize] session: Muse scans the archive, proposes tidy-up changes, and walks through any blank AGENTS.md profile sections. Every file-modifying step waits for your confirmation.",
         okText: zh ? "开始" : "Start",
       });
       if (!ok) return;
@@ -5910,6 +5977,26 @@ function portal() {
         await this.switchSession();
       }
       this.savePrefs();
+    },
+
+    // Open a native collaboration child thread referenced by an app-server
+    // collabAgentToolCall. The child may not be on the first list page, so
+    // hydrate its metadata from the authoritative thread/read route first.
+    async openCollabThread(id) {
+      if (!id) return;
+      try {
+        const r = await fetch("/api/chat/sessions/" + encodeURIComponent(id), {
+          headers: this.hdr(),
+        });
+        if (!r.ok) throw new Error("thread not found");
+        const meta = await r.json();
+        const existing = this.sessions.find(s => s.id === id);
+        if (existing) Object.assign(existing, meta);
+        else this.sessions.unshift(meta);
+        await this.openTab(id);
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "子 agent 会话暂不可用" : "Subagent thread is unavailable", "warn", 3500);
+      }
     },
 
     // Open a session id arriving from a push-notification deep-link
@@ -6272,8 +6359,8 @@ function portal() {
       if (txt.includes("401") || txt.includes("unauthorized") ||
           txt.includes("invalid api key") || txt.includes("authentication")) {
         return zh
-          ? "提示：认证失败。检查 Settings 里对应 provider 的 API key，或 Claude Auth 是否仍然有效。"
-          : "Hint: auth failed. Check the provider's API key in Settings, or whether Claude Auth is still valid.";
+          ? "提示：认证失败。检查 Codex 登录状态或对应原生 Provider 的 API key。"
+          : "Hint: auth failed. Check Codex login status or the matching native provider API key.";
       }
       // Rate limit
       if (txt.includes("rate limit") || txt.includes("429") || txt.includes("too many requests")) {
@@ -6505,8 +6592,8 @@ function portal() {
     // tool_use_id, then parse the "#N" out of the result text.
     //
     // We also persist observed subjects to localStorage keyed per chat
-    // session — so when the conversation context gets compacted (Claude
-    // drops old messages from its rolling window to save tokens), later
+    // session — so when the conversation context gets compacted and older
+    // messages leave the active window, later
     // TaskUpdate(delete #2) renderings can still resolve "#2 → Fix #2:
     // Windows .env 去 BOM" from the persistent map. Without this, long
     // chats render naked "✗ 删除 #2" with no subject — confusing.
@@ -6920,9 +7007,8 @@ function portal() {
       return trimmed + (text.length > 80 ? "…" : "");
     },
     async _refreshCtxMeter() {
-      // Pull SDK ContextUsageResponse via /context-breakdown so the meter
-      // shows post-compact (or any other out-of-band) state without waiting
-      // for the next stream's 'done' event.
+      // Pull app-server token usage via /context-breakdown so the meter shows
+      // post-compact state without waiting for the next stream's done event.
       if (!this.currentId) return;
       const { ok, data } = await this.api(
         `/api/chat/context-breakdown/${this.currentId}`);
@@ -6930,7 +7016,7 @@ function portal() {
       const used = Math.max(0, Number(data.totalTokens || 0));
       const maxT = Math.max(0, Number(data.maxTokens
                                        || this.sessionUsage.context_limit
-                                       || 200000));
+                                       || 0));
       // Write IN-PLACE into the tab's sessionUsage object, then re-point the
       // root `this.sessionUsage` at that same object. Replacing this.sessionUsage
       // with a fresh `{...}` literal (as before) detached it from
@@ -6955,18 +7041,14 @@ function portal() {
       if (!this.currentId) return;
       this.ctxBreakdown = { show: true, loading: true, data: null, error: "" };
       this.ctxExpanded = {};
-      const { ok, data, error, status } = await this.api(
+      const { ok, data, error } = await this.api(
         `/api/chat/context-breakdown/${this.currentId}`);
       this.ctxBreakdown.loading = false;
       if (ok && data) {
         this.ctxBreakdown.data = data;
       } else {
-        // 409 = no live client yet (session hasn't streamed a turn).
-        this.ctxBreakdown.error = status === 409
-          ? (this.lang === "zh"
-              ? "需要先发一条消息才能查 breakdown（SDK 要求 live client）"
-              : "Send a message first — SDK breakdown needs a live client")
-          : (error || (this.lang === "zh" ? "查询失败" : "Fetch failed"));
+        this.ctxBreakdown.error = error
+          || (this.lang === "zh" ? "查询失败" : "Fetch failed");
       }
     },
     // % of maxTokens used by this category — drives both the stacked bar
@@ -7812,6 +7894,7 @@ function portal() {
         // a high-effort tab to one with no override should clear the
         // dropdown, not inherit the old value.
         this.effort = cur.effort || "";
+        this.permission = cur.permission || "default";
         // thinking: default true when the field is absent (legacy sessions).
         this.thinkingEnabled = cur.thinking !== false;
       }
@@ -8073,6 +8156,14 @@ function portal() {
           return;
         }
         const s = await r.json();
+        st.historyUnavailable = !!s.history_unavailable;
+        if (st.historyUnavailable && !st._historyWarned) {
+          st._historyWarned = true;
+          this.toast(this.lang === "zh"
+            ? "这个会话的完整历史暂时无法展示；仍会在原会话中继续发送"
+            : "Full history is temporarily unavailable; sending will continue in the same thread",
+            "warn", 6000);
+        }
         // Build a lookup of blob preview URLs from the current in-memory
         // messages so we can carry them over after the server rebuild.
         // Server messages only store {mime} for images — no preview URL —
@@ -8251,6 +8342,7 @@ function portal() {
           // effort defaults to "" (adaptive); always assign so switching from
           // a high-effort tab to a fresh one doesn't leave the old value visible.
           this.effort = s.effort || "";
+          this.permission = s.permission || "default";
           // thinking: default true when absent (legacy sessions had no field).
           this.thinkingEnabled = s.thinking !== false;
           if (quiet) {
@@ -8818,163 +8910,41 @@ function portal() {
     },
 
     // ===== settings modal =====
-    async openSettings() {
-      const r = await fetch("/api/settings", { headers: this.hdr() });
-      if (!r.ok) {
-        this.toast(this.lang === "zh" ? "无法加载设置" : "Failed to load settings", "error");
-        return;
-      }
-      const d = await r.json();
-      this.settings.providers = d.providers;
-      this.settings.draftKeys = Object.fromEntries(d.providers.map(p => [p.env_key, ""]));
-      // Reset provider-editor drafts each open so a stale half-edit from a
-      // previous session doesn't reappear. Seed one (closed) draft per
-      // provider up front: the editor's x-model bindings reference
-      // providerDrafts[p.id].base_url / .models / etc. without optional
-      // chaining, and Alpine evaluates x-model even inside an x-show-hidden
-      // block — so a missing entry throws "Cannot read properties of
-      // undefined". Pre-seeding keeps every binding resolvable.
-      this.settings.providerDrafts = Object.fromEntries(
-        d.providers.map(p => [p.id, this._draftFromProvider(p)])
-      );
-      this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
-      this.settings.draftDefaults = { ...d.defaults };
-      // `d.params` is empty since 2026-05-28 (kept as {} for FE back-compat).
-      // Desktop: sidebar is always visible, so land on a default tab
-      // (provider — the most-used section) and render only that pane.
-      // Mobile: stay at the top-level menu (activePage=null) and let the
-      // user drill in; selecting a row shows that section + a Back button.
-      this.settings.activePage = this.isWideScreen ? "provider" : null;
+    openSettings() {
+      // Opening settings is a UI action, not a network transaction. Show the
+      // modal on the click frame and lazily refresh only the visible page.
+      this.runtimeKind = "codex";
+      this.settings.draftDefaults = {
+        model: this.defaultModel || this.model || "",
+        permission: this.defaultPermission || "default",
+      };
+      this.settings.activePage = this.isWideScreen ? "native-providers" : null;
       this.settings.show = true;
-      // Load MCP + Skill in parallel — non-fatal if any fails. Cost dashboard
-      // stays lazy because Codex quota refresh intentionally runs a CLI probe.
-      this.refreshMcpList();
-      this.refreshSkillList();
-      this.loadClaudeAuthStatus();
+      if (this.settings.activePage) {
+        requestAnimationFrame(() => this._refreshSettingsPage(this.settings.activePage));
+      }
+    },
+    openSettingsPage(page) {
+      this.settings.activePage = page;
+      this._refreshSettingsPage(page);
+    },
+    _refreshSettingsPage(page) {
+      if (page === "native-providers") this.refreshNativeProviders();
+      else if (page === "skills") this.refreshSkillList();
+      else if (page === "mcp") this.refreshMcpList();
+      else if (page === "versions") this.loadVersions();
     },
 
-    // ===== Claude Auth methods =====
-    async loadClaudeAuthStatus() {
-      try {
-        const r = await fetch("/api/settings/claude-auth/status", {
-          headers: this.hdr(),
-          // Bypass HTTP cache so a stale "未连接" verdict cached after an
-          // earlier failed probe doesn't outlive a `claude login` the user
-          // ran later in the terminal. Forces the backend to re-invoke the
-          // CLI every call.
-          cache: "no-store",
-        });
-        if (!r.ok) {
-          // Surface the failure instead of silently keeping the old state.
-          // Without this, a transient 500 / 401 made the UI stick on a
-          // wrong "未连接" verdict forever (until next openSettings).
-          this.claudeAuth = {
-            ...this.claudeAuth,
-            loaded: true,
-            logged_in: false,
-            reason: `http-${r.status}`,
-          };
-          return;
-        }
-        const d = await r.json();
-        this.claudeAuth = { ...this.claudeAuth, ...d, loaded: true };
-      } catch (e) {
-        this.claudeAuth = {
-          ...this.claudeAuth,
-          loaded: true,
-          logged_in: false,
-          reason: `network: ${e && e.message ? e.message : 'unknown'}`,
-        };
-      }
-    },
-    openClaudeAuthModal() {
-      this.claudeAuthModal.open = true;
-      this.claudeAuthModal.copyToast = null;
-      // Refresh status once before polling kicks in.
-      this.loadClaudeAuthStatus();
-      this.startClaudeAuthPoll();
-    },
-    closeClaudeAuthModal() {
-      this.claudeAuthModal.open = false;
-      this.stopClaudeAuthPoll();
-    },
-    startClaudeAuthPoll() {
-      if (this.claudeAuthModal.pollHandle) return;
-      this.claudeAuthModal.polling = true;
-      this.claudeAuthModal.pollHandle = setInterval(async () => {
-        await this.loadClaudeAuthStatus();
-        if (this.claudeAuth.logged_in) {
-          this.stopClaudeAuthPoll();
-          this.closeClaudeAuthModal();
-          this.toast(this.t("claude_auth.connect_success"), "success");
-        }
-      }, 3000);
-    },
-    stopClaudeAuthPoll() {
-      if (this.claudeAuthModal.pollHandle) {
-        clearInterval(this.claudeAuthModal.pollHandle);
-        this.claudeAuthModal.pollHandle = null;
-      }
-      this.claudeAuthModal.polling = false;
-    },
-    async copyClaudeAuthCmd(which) {
-      // which = "install" | "login"
-      const cmd = which === "install"
-        ? this.t("claude_auth.cli_install_cmd")
-        : "claude login";
-      try {
-        await navigator.clipboard.writeText(cmd);
-        this.claudeAuthModal.copyToast = which;
-        setTimeout(() => {
-          if (this.claudeAuthModal.copyToast === which) this.claudeAuthModal.copyToast = null;
-        }, 1500);
-      } catch (e) {
-        this.toast("clipboard write failed", "error");
-      }
-    },
-    async disconnectClaudeAuth() {
-      const ok = await this.confirm({
-        title: this.t("claude_auth.disconnect_confirm_title"),
-        body:  this.t("claude_auth.disconnect_confirm_body"),
-        confirmText: this.t("claude_auth.disconnect_btn"),
-        kind: "warning",
-      });
-      if (!ok) return;
-      try {
-        const r = await fetch("/api/settings/claude-auth/disconnect",
-                              { method: "POST", headers: this.hdr() });
-        if (!r.ok) {
-          this.toast(this.lang === "zh" ? "断开失败" : "Disconnect failed", "error");
-          return;
-        }
-        const d = await r.json();
-        this.toast(this.t("claude_auth.disconnect_done") + " " + (d.backup_path || ""), "success", 4000);
-        await this.loadClaudeAuthStatus();
-      } catch (e) {
-        this.toast(e.message || "error", "error");
-      }
-    },
-    async reauthClaude() {
-      // Reuse Connect modal — `claude login` overwrites existing creds.
-      this.openClaudeAuthModal();
-    },
-    claudeAuthExpiresHuman() {
-      if (!this.claudeAuth.expires_at) return "—";
-      const d = new Date(this.claudeAuth.expires_at);
-      return d.toLocaleDateString(this.lang === "zh" ? "zh-CN" : "en-US",
-              { year: "numeric", month: "short", day: "numeric" });
-    },
     // ===== Muse main-chat empty-state opener + muse grid =====
     // museOpener() picks a state-aware first line for Muse to render as
     // a UI-only "Muse said" bubble at the top of a fresh chat. It's NOT a
     // real LLM call — it's a fixed template per archive state, chosen from
-    // the new contextInfo fields (claude_md_meaningfully_filled + subdir
+    // the new contextInfo fields (instructions_meaningfully_filled + subdir
     // counts). Hidden the moment the user starts typing so it doesn't
     // distract from their own first message.
     museOpener() {
       const ci = this.contextInfo;
       if (!ci || !ci._fetched) return "";
-      if (!ci.has_any_provider) return "";  // provider-warn card handles this state
       // Count filled subdirs (excludes "archives" which is purely cold storage)
       const subs = ci.subdir_present || {};
       const subdir_count = Object.entries(subs).filter(
@@ -8983,7 +8953,7 @@ function portal() {
       // Files at archive root counted by archive_empty toggling false even
       // when no subdir has content (root-level docs)
       const has_root_files = !ci.archive_empty;
-      const profile_filled = !!ci.claude_md_meaningfully_filled;
+      const profile_filled = !!ci.instructions_meaningfully_filled;
 
       // State 4: archive rich — ≥4 subdirs with content
       if (subdir_count >= 4) return this.t("muse_opener.rich");
@@ -8996,19 +8966,19 @@ function portal() {
       }
       // State 2: only profile filled, no archive files
       if (profile_filled) return this.t("muse_opener.profile_only");
-      // State 1: nothing filled — even if CLAUDE.md *file* exists (template)
+      // State 1: nothing filled — even if AGENTS.md *file* exists (template)
       return this.t("muse_opener.empty");
     },
     museOpenerAction() {
-      // State 1 + 2 get an action button to open / fill CLAUDE.md inline.
+      // State 1 + 2 get an action button to open / fill AGENTS.md inline.
       const ci = this.contextInfo;
-      if (!ci || !ci._fetched || !ci.has_any_provider) return null;
+      if (!ci || !ci._fetched) return null;
       const subs = ci.subdir_present || {};
       const subdir_count = Object.values(subs).filter(Boolean).length;
       if (subdir_count >= 1 || !ci.archive_empty) return null;  // states 3/4
       return {
         label: this.t("muse_opener.action_open_profile"),
-        // Reuse the existing /organize workflow — it walks CLAUDE.md gaps too
+        // Reuse the existing /organize workflow — it walks AGENTS.md gaps too
         handler: () => this.startOrganize(),
       };
     },
@@ -9032,17 +9002,15 @@ function portal() {
       this.useSuggestedPrompt(text);
     },
 
-    claudeAuthPlanLabel() {
-      const s = this.claudeAuth.subscription_type;
-      if (!s) return "—";
-      if (s === "max") return "Max";
-      if (s === "pro") return "Pro";
-      if (s === "free") return "Free";
-      return s;
-    },
     codexLimitRows() {
       const ws = (this.codexLimit && this.codexLimit.windows) || {};
-      return Object.entries(ws).map(([key, w]) => ({ key, ...w }));
+      return Object.entries(ws).map(([key, w]) => {
+        const used = typeof w.used_percent === "number" ? w.used_percent : null;
+        const remaining = typeof w.remaining_percent === "number"
+          ? w.remaining_percent
+          : (used === null ? null : Math.max(0, 100 - used));
+        return { key, ...w, remaining_percent: remaining };
+      });
     },
     codexLimitUpdatedText() {
       const ts = this.codexLimit && this.codexLimit.updated_at;
@@ -9087,11 +9055,13 @@ function portal() {
     // be that number because third-party vendors report $0.
     totalTokens(bucket) {
       if (!bucket) return 0;
+      if (this.cost?.data?.breakdown_available === false) {
+        return bucket.total_tokens || 0;
+      }
       // Respect the dashboard's per-category filter chips. If the user
       // clicks "cache" off, all sums (KPI cards / day bars / vendor + model
       // rows) recompute without cache tokens. cache_read + cache_creation
-      // share the "cache" toggle — they're both Anthropic prompt-caching
-      // accounting and the user thinks of them as one bucket.
+      // share the "cache" toggle because the user sees them as one bucket.
       const f = (this.cost && this.cost.filters)
         || { input: true, output: true, cache: true };
       let total = 0;
@@ -9124,7 +9094,7 @@ function portal() {
     // response (other consumers / future re-use), we just don't render it.
     async refreshSkillList() {
       try {
-        const r = await fetch("/api/settings/skills", { headers: this.hdr() });
+        const r = await fetch("/api/chat/skills", { headers: this.hdr() });
         if (!r.ok) return;
         const d = await r.json();
         this.settings.skills = d.skills || [];
@@ -9132,22 +9102,53 @@ function portal() {
     },
     async refreshMcpList() {
       try {
-        const r = await fetch("/api/settings/mcp", { headers: this.hdr() });
+        const r = await fetch("/api/chat/mcp?reload=true", { headers: this.hdr() });
         if (!r.ok) return;
         const d = await r.json();
         this.settings.mcpServers = d.servers || [];
-        this.settings.mcpExamples = d.examples || [];
+        this.mcp = d;
       } catch (e) { /* silent — UI shows empty state */ }
     },
+    async refreshNativeProviders() {
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+          const r = await fetch("/api/settings/providers", { headers: this.hdr() });
+          if (r.ok) {
+            this.settings.nativeProviders = (await r.json()).providers || [];
+            return;
+          }
+        } catch (_e) { /* app-server may still be warming after a restart */ }
+        if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 250 * (attempt + 1)));
+      }
+      this.settings.nativeProviders = [];
+    },
+    async setNativeProvider(provider, enabled) {
+      if (!provider || !provider.id) return;
+      try {
+        const r = await fetch(`/api/settings/providers/${encodeURIComponent(provider.id)}`, {
+          method: "PATCH",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ enabled: !!enabled }),
+        });
+        if (!r.ok) throw new Error("status " + r.status);
+        this.settings.nativeProviders = (await r.json()).providers || [];
+        await this._fetchModels();
+        this.toast(this.lang === "zh" ? "已更新 Codex 原生模型" : "Codex-native models updated", "success", 1800);
+      } catch (_e) {
+        this.toast(this.lang === "zh" ? "更新失败" : "Update failed", "error", 3000);
+      }
+    },
     async toggleMcp(name, disabled) {
-      const r = await fetch(`/api/settings/mcp/${encodeURIComponent(name)}/toggle`, {
+      const r = await fetch(`/api/chat/mcp/${encodeURIComponent(name)}`, {
         method: "PATCH",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ disabled }),
+        body: JSON.stringify({ enabled: !disabled }),
       });
       if (r.ok) {
+        const d = await r.json();
+        this.settings.mcpServers = d.servers || [];
+        this.mcp = d;
         this.toast(this.t("set.mcp.toggle_saved"), "success", 1500);
-        this.refreshMcpList();
       } else {
         this.toast(this.t("set.mcp.save_failed"), "error", 3000);
       }
@@ -9162,12 +9163,14 @@ function portal() {
         okText: this.t("set.mcp.delete"),
       });
       if (!ok) return;
-      const r = await fetch(`/api/settings/mcp/${encodeURIComponent(name)}`, {
+      const r = await fetch(`/api/chat/mcp/${encodeURIComponent(name)}`, {
         method: "DELETE", headers: this.hdr(),
       });
       if (r.ok) {
+        const d = await r.json();
+        this.settings.mcpServers = d.servers || [];
+        this.mcp = d;
         this.toast(this.t("set.mcp.deleted"), "success", 1500);
-        this.refreshMcpList();
       } else {
         this.toast(this.t("set.mcp.delete_failed"), "error", 3000);
       }
@@ -9176,8 +9179,8 @@ function portal() {
       const d = this.settings.mcpDraft;
       const name = (d.name || "").trim();
       const remote = d.transport === "remote";
-      // Build the request body per transport. Remote → {type:http, url,
-      // headers}; local → {command, args, env}. Validation differs too.
+      // Remote credentials are referenced by environment-variable name;
+      // secret values never cross this form or the inventory API.
       let body;
       if (remote) {
         const url = (d.url || "").trim();
@@ -9185,10 +9188,13 @@ function portal() {
           this.toast(this.t("set.mcp.name_url_required"), "warn", 2500);
           return;
         }
-        const headers = {};
-        const auth = (d.authHeader || "").trim();
-        if (auth) headers["Authorization"] = auth;
-        body = { name, type: "http", url, headers, disabled: false };
+        body = {
+          name,
+          transport: "http",
+          url,
+          bearer_token_env_var: (d.bearerTokenEnvVar || "").trim(),
+          enabled: true,
+        };
       } else {
         const command = (d.command || "").trim();
         if (!name || !command) {
@@ -9196,359 +9202,93 @@ function portal() {
           return;
         }
         const args = (d.argsStr || "").trim().split(/\s+/).filter(Boolean);
-        body = { name, command, args, env: {}, disabled: false };
+        body = { name, transport: "stdio", command, args, enabled: true };
       }
-      const r = await fetch(`/api/settings/mcp/${encodeURIComponent(name)}`, {
-        method: "PUT",
+      const r = await fetch("/api/chat/mcp", {
+        method: "POST",
         headers: { ...this.hdr(), "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
       if (r.ok) {
+        const result = await r.json();
+        this.settings.mcpServers = result.servers || [];
+        this.mcp = result;
         this.toast(this.t("set.mcp.added"), "success", 1500);
-        this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", authHeader: "" };
-        this.refreshMcpList();
+        this.settings.mcpDraft = { show: false, transport: "stdio", name: "", command: "", argsStr: "", url: "", bearerTokenEnvVar: "" };
       } else {
         this.toast(this.t("set.mcp.save_failed"), "error", 3000);
       }
     },
-    // Provider key self-test — hits the vendor's anthropic-compatible endpoint
-    // with the configured key and reports back. Useful when user gets 401 and
-    // doesn't want to paste keys to debug.
-    async probeProvider(envKey, probeModel) {
-      // probeModel is the first model in this provider's catalog (e.g. "qwen3-max"
-      // for Qwen domestic, "qwen-intl:qwen3-max" for Qwen international). Using it
-      // as the result key ensures two providers that share one env key (DASHSCOPE_API_KEY)
-      // get independent probe results.
-      if (!probeModel) return;
-      this.settings.probeResults[probeModel] = { ok: null, text: this.t("set.probe_running") };
+
+    async loginMcpOauth(s) {
+      if (!s || !s.name || s.disabled) return;
+      // Open synchronously while the click gesture is active; browsers often
+      // block a new window created only after the async HTTP round-trip.
+      const oauthWindow = window.open("about:blank", "_blank");
       try {
-        const r = await fetch(`/api/chat/probe/${encodeURIComponent(probeModel)}`,
-                                 { headers: this.hdr() });
+        const r = await fetch(`/api/chat/mcp/${encodeURIComponent(s.name)}/oauth`, {
+          method: "POST",
+          headers: this.hdr(),
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
         const d = await r.json();
-        if (d.ok) {
-          this.settings.probeResults[probeModel] = {
-            ok: true,
-            text: `${this.t("set.probe_ok")} · ${d.key_hint}`,
-          };
+        if (!d.authorization_url) throw new Error("missing authorization URL");
+        if (oauthWindow) {
+          oauthWindow.opener = null;
+          oauthWindow.location.replace(d.authorization_url);
         } else {
-          const status = d.status ? `HTTP ${d.status}` : (d.reason || "error");
-          // Extract a single-line vendor message if there is one
-          let detail = "";
-          try {
-            const ex = d.vendor_response_excerpt ?
-              JSON.parse(d.vendor_response_excerpt) : null;
-            detail = ex?.error?.message || ex?.error?.type || "";
-          } catch { detail = (d.vendor_response_excerpt || "").slice(0, 120); }
-          // Tack on a hint based on common error shapes
-          let hint = "";
-          if (d.status === 401) hint = " · " + this.t("set.probe_hint_401");
-          else if (d.status === 403) hint = " · " + this.t("set.probe_hint_403");
-          else if (d.status === 429) hint = " · " + this.t("set.probe_hint_429");
-          this.settings.probeResults[probeModel] = {
-            ok: false,
-            text: `${status}: ${detail || "—"}${hint}`,
-          };
+          window.location.assign(d.authorization_url);
         }
+        this.toast(this.t("set.mcp.oauth_opened"), "success", 2500);
       } catch (e) {
-        this.settings.probeResults[probeModel] = {
-          ok: false, text: this.t("set.probe_failed") + ": " + e.message,
-        };
+        if (oauthWindow) oauthWindow.close();
+        this.toast(this.t("set.mcp.oauth_failed"), "error", 3500);
       }
     },
-
-    // Toggle a provider's visibility in the model picker. probeModel uniquely
-    // identifies each provider (e.g. "qwen3.6-plus" vs "qwen-intl:qwen3.6-plus").
-    // Save a single provider's key without going through the bottom-bar
-    // Save (which writes every draft at once). Lets the Settings UI offer
-    // an inline "保存" button next to the input — same one-key edit
-    // gesture the user expects from any modern settings page. The bottom
-    // bar still works for batch saves.
-    async saveProviderKey(envKey) {
-      const v = (this.settings.draftKeys[envKey] || "").trim();
-      if (!v) {
-        this.toast(this.lang === "zh" ? "请先输入 key" : "Enter a key first", "warn", 2000);
-        return false;
-      }
-      try {
-        const r = await fetch("/api/settings", {
-          method: "PUT",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ provider_keys: { [envKey]: v } }),
-        });
-        if (!r.ok) throw new Error("status " + r.status);
-        // Optimistic local refresh: mark this provider configured + clear
-        // the draft so the row collapses back to "已配置" view next render.
-        const p = this.settings.providers.find(x => x.env_key === envKey);
-        if (p) p.configured = true;
-        this.settings.draftKeys[envKey] = "";
-        this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
-        // Refresh providers + model list so any newly-enabled model
-        // appears in the chat dropdown immediately.
-        await this._fetchModels();
-        return true;
-      } catch (e) {
-        this.toast(this.lang === "zh" ? "保存失败：" + e.message : "Save failed: " + e.message, "error", 4000);
-        return false;
-      }
-    },
-
-    async toggleProvider(providerId, disabled) {
-      // Visibility toggle now keys off the provider's STABLE id (not its
-      // first model id, which changes when the user edits the model list).
-      // Backend honours both forms so older toggles survive the migration.
-      const r = await fetch("/api/settings", {
-        method: "PUT",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ provider_disabled: { [providerId]: disabled } }),
-      });
-      const d = await r.json();
-      if (d.ok) {
-        // Update local state so the toggle reflects immediately.
-        const p = this.settings.providers.find(x => x.id === providerId);
-        if (p) p.disabled = disabled;
-        // Refresh the model list so the picker drops the hidden provider.
-        await this._fetchModels();
-      }
-    },
-
-    // ===== Provider editor (full endpoint / prefix / models / key) =====
-    // Build a closed editor draft seeded from a provider's committed values.
-    _draftFromProvider(p) {
-      return {
-        open: false,
-        base_url: p.base_url || "",
-        prefix: p.prefix || "",
-        models: (p.models || []).join("\n"),
-        api_key: "",
-      };
-    },
-
-    // Open or close the inline editor for one provider. Opening seeds the
-    // draft from the committed values; closing just drops the open flag so
-    // the next open re-seeds (cancel = discard).
-    toggleProviderEditor(p) {
-      const drafts = this.settings.providerDrafts;
-      if (drafts[p.id] && drafts[p.id].open) {
-        drafts[p.id].open = false;
-        return;
-      }
-      drafts[p.id] = { ...this._draftFromProvider(p), open: true };
-    },
-
-    _parseModels(text) {
-      // Models entered one-per-line (or comma-separated); trim + drop blanks.
-      return (text || "").split(/[\n,]+/).map(s => s.trim()).filter(Boolean);
-    },
-
-    // ===== Anthropic / Claude model list (the one editable knob on the
-    // special-auth Claude row; auth + endpoint stay fixed) =====
-    toggleAnthropicModels(p) {
-      const drafts = this.settings.providerDrafts;
-      if (drafts[p.id] && drafts[p.id].open) { drafts[p.id].open = false; return; }
-      drafts[p.id] = { open: true, models: (p.models || []).join("\n") };
-    },
-
-    async saveAnthropicModels(p) {
-      const dr = this.settings.providerDrafts[p.id];
-      if (!dr) return;
-      const models = this._parseModels(dr.models);
-      try {
-        const r = await fetch("/api/settings/providers/anthropic-models", {
-          method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ models }),
-        });
-        if (!r.ok) {
-          let msg = "status " + r.status;
-          try { const e = await r.json(); if (e.detail) msg = e.detail; } catch (_) {}
-          throw new Error(msg);
-        }
-        this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
-        if (this.settings.providerDrafts[p.id]) this.settings.providerDrafts[p.id].open = false;
-        await this._reloadProviders();
-        await this._fetchModels();
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "保存失败：" : "Save failed: ") + e.message, "error", 4000);
-      }
-    },
-
-    // If the Claude model-list editor is open with unsaved changes, persist it
-    // as part of the global "Save". The global save body (PUT /api/settings)
-    // only carries default_model / permission / provider keys — the Claude
-    // model list lives behind a SEPARATE endpoint. So a user who edited the
-    // model list and then hit the panel's main Save (instead of the editor's
-    // own inline Save) got a misleading "No changes" toast and lost the edit
-    // (2026-06-10 user report). This flushes that draft so the global Save
-    // captures it too. Returns 1 if the list actually changed, else 0.
-    // Scope: Claude models only (models_editable row). Third-party providers
-    // keep their explicit per-row Save (they also carry an api_key field we
-    // don't want to auto-submit on a global save).
-    async _flushAnthropicModelDraft() {
-      const prov = (this.settings.providers || []).find(p => p.models_editable);
-      if (!prov) return 0;
-      const dr = this.settings.providerDrafts[prov.id];
-      if (!dr || !dr.open) return 0;
-      const next = this._parseModels(dr.models);
-      const cur = prov.models || [];
-      if (next.join("\n") === cur.join("\n")) return 0;  // no real change
-      const r = await fetch("/api/settings/providers/anthropic-models", {
-        method: "POST",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ models: next }),
-      });
-      if (!r.ok) {
-        let msg = "status " + r.status;
-        try { const e = await r.json(); if (e.detail) msg = e.detail; } catch (_) {}
-        throw new Error(msg);
-      }
-      dr.open = false;
-      return 1;
-    },
-
-    async _submitProvider(body, pid) {
-      try {
-        const r = await fetch("/api/settings/providers", {
-          method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        if (!r.ok) {
-          let msg = "status " + r.status;
-          try { const e = await r.json(); if (e.detail) msg = e.detail; } catch (_) {}
-          throw new Error(msg);
-        }
-        this.toast(this.lang === "zh" ? "✓ 已保存" : "✓ Saved", "success", 1800);
-        if (pid && this.settings.providerDrafts[pid]) {
-          this.settings.providerDrafts[pid].open = false;
-        }
-        await this._reloadProviders();
-        await this._fetchModels();
-        return true;
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "保存失败：" : "Save failed: ") + e.message, "error", 4000);
-        return false;
-      }
-    },
-
-    async saveProvider(p) {
-      const dr = this.settings.providerDrafts[p.id];
-      if (!dr) return;
-      const body = {
-        id: p.id,
-        base_url: (dr.base_url || "").trim(),
-        prefix: (dr.prefix || "").trim(),
-        display: p.display,
-        env_key: p.env_key,
-        models: this._parseModels(dr.models),
-      };
-      if ((dr.api_key || "").trim()) body.api_key = dr.api_key.trim();
-      await this._submitProvider(body, p.id);
-    },
-
-    async addProviderFromDraft() {
-      const n = this.settings.providerNew;
-      const body = {
-        id: null,
-        base_url: (n.base_url || "").trim(),
-        prefix: (n.prefix || "").trim(),
-        models: this._parseModels(n.models),
-      };
-      if ((n.api_key || "").trim()) body.api_key = n.api_key.trim();
-      const ok = await this._submitProvider(body, null);
-      if (ok) {
-        this.settings.providerNew = { show: false, base_url: "", prefix: "", models: "", api_key: "" };
-      }
-    },
-
-    async restoreProvider(p) {
-      try {
-        const r = await fetch("/api/settings/providers/restore", {
-          method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ id: p.id }),
-        });
-        if (!r.ok) throw new Error("status " + r.status);
-        this.toast(this.lang === "zh" ? "✓ 已恢复默认" : "✓ Restored to default", "success", 1800);
-        if (this.settings.providerDrafts[p.id]) this.settings.providerDrafts[p.id].open = false;
-        await this._reloadProviders();
-        await this._fetchModels();
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "恢复失败：" : "Restore failed: ") + e.message, "error", 4000);
-      }
-    },
-
-    async deleteProvider(p) {
-      const zh = this.lang === "zh";
-      const msg = zh
-        ? (p.is_builtin
-            ? `隐藏内置 provider「${p.display}」？随时可恢复默认。`
-            : `删除 provider「${p.display}」？`)
-        : (p.is_builtin
-            ? `Hide built-in provider "${p.display}"? You can restore it anytime.`
-            : `Delete provider "${p.display}"?`);
-      // Use the custom danger modal so this matches every other destructive
-      // confirm in the app (native confirm() here was the lone inconsistency).
-      const ok = await this.confirm({
-        title: zh ? (p.is_builtin ? "隐藏 provider" : "删除 provider")
-                  : (p.is_builtin ? "Hide provider" : "Delete provider"),
-        body: msg,
-        danger: true,
-        okText: zh ? (p.is_builtin ? "隐藏" : "删除") : (p.is_builtin ? "Hide" : "Delete"),
-      });
-      if (!ok) return;
-      try {
-        const r = await fetch("/api/settings/providers/delete", {
-          method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ id: p.id }),
-        });
-        if (!r.ok) throw new Error("status " + r.status);
-        this.toast(this.lang === "zh" ? "✓ 已删除" : "✓ Deleted", "success", 1800);
-        await this._reloadProviders();
-        await this._fetchModels();
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "删除失败：" : "Delete failed: ") + e.message, "error", 4000);
-      }
-    },
-
-    // Re-fetch the provider list (after a CRUD op) without wiping the rest of
-    // the settings modal state. Adds draftKeys slots for any new env_keys.
-    async _reloadProviders() {
-      const r = await fetch("/api/settings", { headers: this.hdr() });
-      if (!r.ok) return;
-      const d = await r.json();
-      this.settings.providers = d.providers;
-      for (const p of d.providers) {
-        if (!(p.env_key in this.settings.draftKeys)) this.settings.draftKeys[p.env_key] = "";
-        // Seed a draft for any provider that doesn't have one yet (e.g. a
-        // newly added custom provider) so its editor x-model bindings stay
-        // resolvable. Don't clobber a draft that's mid-edit.
-        if (!this.settings.providerDrafts[p.id]) {
-          this.settings.providerDrafts[p.id] = this._draftFromProvider(p);
-        }
-      }
-    },
-
     // Refresh the available model list from backend — called when provider
     // visibility changes so the model picker dropdown stays in sync.
-    async _fetchModels() {
-      try {
-        const r = await fetch("/api/chat/providers", { headers: this.hdr() });
-        if (r.ok) {
-          const d = await r.json();
-          this.availableModels = d.models || [];
-          if (d.default_model) { this.defaultModel = d.default_model; this.savePrefs(); }
-          this._ensureValidModel();
+    async _fetchModels(opts = {}) {
+      if (this._modelsFetchPromise) return this._modelsFetchPromise;
+      const retries = Number.isInteger(opts.retries) ? Math.max(0, opts.retries) : 0;
+      this.modelsLoading = true;
+      const load = async () => {
+        for (let attempt = 0; attempt <= retries; attempt += 1) {
+          try {
+            const r = await fetch("/api/chat/providers", {
+              headers: this.hdr(),
+              cache: "no-store",
+            });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const d = await r.json();
+            if (!Array.isArray(d.models)) throw new Error("invalid model catalog");
+            this.runtimeKind = d.runtime || "codex";
+            this.availableModels = d.models;
+            if (d.default_model) {
+              this.defaultModel = d.default_model;
+              this.savePrefs();
+            }
+            this._ensureValidModel();
+            this._rebindModelSelect();
+            return true;
+          } catch (e) {
+            if (attempt < retries) {
+              await new Promise(resolve => setTimeout(resolve, 400 * (2 ** attempt)));
+            }
+          }
         }
-      } catch (e) {
-        // Silently skip — the dropdown can be refreshed next time it opens.
+        return false;
+      };
+      this._modelsFetchPromise = load();
+      try {
+        return await this._modelsFetchPromise;
+      } finally {
+        this.modelsLoading = false;
+        this._modelsFetchPromise = null;
       }
     },
     // Ensure `this.model` references a model whose provider is currently
-    // configured. Without this, a fresh install (.env's MUSELAB_MODEL
-    // default = claude-sonnet-4-6) plus a user who only configured e.g.
-    // DEEPSEEK_API_KEY would send chats as Claude and hit 401 on every
-    // turn — the dropdown shows the wrong model on first load.
+    // configured. Otherwise a stale default can produce a 401 on every turn
+    // while the dropdown shows the wrong model.
     _ensureValidModel() {
       // No providers configured at all → leave model empty so the dropdown
       // shows the placeholder and the no-provider onboarding card surfaces.
@@ -9574,26 +9314,6 @@ function portal() {
             ? `已切到 ${newLabel}（${oldModel} 对应的 provider 未配置）`
             : `Switched to ${newLabel} (${oldModel}'s provider not configured)`,
           "info", 3500);
-      }
-    },
-
-    async installMcpPreset(ex) {
-      // Presets may be either stdio (command/args) or remote (url/headers).
-      const body = (ex.type === "http" || ex.type === "sse" || ex.url)
-        ? { name: ex.name, type: ex.type || "http", url: ex.url,
-            headers: ex.headers || {}, disabled: false }
-        : { name: ex.name, command: ex.command, args: ex.args || [],
-            env: ex.env || {}, disabled: false };
-      const r = await fetch(`/api/settings/mcp/${encodeURIComponent(ex.name)}`, {
-        method: "PUT",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (r.ok) {
-        this.toast(this.t("set.mcp.installed"), "success", 1500);
-        this.refreshMcpList();
-      } else {
-        this.toast(this.t("set.mcp.save_failed"), "error", 3000);
       }
     },
 
@@ -9659,48 +9379,14 @@ function portal() {
         this.settings.versionsLoading = false;
       }
     },
-    async runUpgrade(only = null) {
-      // only = "sdk" | "cli" | null. When null, upgrade everything available.
-      if (!this.settings.versions) return;
-      let targets;
-      if (only) {
-        targets = [only];
-      } else {
-        targets = [];
-        if (this.settings.versions.sdk_upgrade_available) targets.push("sdk");
-        if (this.settings.versions.system_cli_upgrade_available) targets.push("cli");
-      }
-      if (targets.length === 0) {
-        this.toast(this.lang === "zh" ? "无需升级" : "Nothing to upgrade", "info", 2000);
-        return;
-      }
-      this.settings.upgradeRunning = true;
-      this.settings.upgradeResult = null;
-      try {
-        const r = await fetch("/api/settings/upgrade", {
-          method: "POST",
-          headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify({ targets }),
-        });
-        if (r.ok) {
-          this.settings.upgradeResult = await r.json();
-          if (this.settings.upgradeResult.ok) {
-            this.toast(this.lang === "zh" ? "升级完成" : "Upgrade complete", "success", 3000);
-            // Refresh the versions table so user sees the new numbers
-            await this.loadVersions();
-          } else {
-            this.toast(this.lang === "zh" ? "升级失败 — 查看日志" : "Upgrade failed — see log", "error", 5000);
-          }
-        } else {
-          this.toast((this.lang === "zh" ? "请求失败：" : "Request failed: ") + r.status, "error", 4000);
-        }
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "升级出错：" : "Upgrade error: ") + e.message, "error", 5000);
-      } finally {
-        this.settings.upgradeRunning = false;
-      }
+    copyCliResumeCommand() {
+      const command = this.settings.versions?.cli_resume_command || "";
+      if (!command) return;
+      navigator.clipboard?.writeText(command).then(
+        () => this.toast(this.t("toast.copied"), "success", 1500),
+        () => this.errToast("copy", this.lang === "zh" ? "需要 HTTPS" : "HTTPS required"),
+      );
     },
-
     async restartService() {
       if (this.settings.restarting) return;
       // Confirm before restarting — a stray tap on a phone would otherwise
@@ -9760,100 +9446,16 @@ function portal() {
     },
 
     async saveSettings() {
-      // Flush an open Claude model-list edit first so the global Save captures
-      // it too (see _flushAnthropicModelDraft). modelChanges folds into the
-      // "Saved N settings" tally below so the toast reflects the model edit
-      // instead of misreporting "No changes".
-      let modelChanges = 0;
-      try {
-        modelChanges = await this._flushAnthropicModelDraft();
-      } catch (e) {
-        this.toast((this.lang === "zh" ? "模型列表保存失败：" : "Model list save failed: ") + e.message, "error", 4000);
-        return;
+      const defaults = this.settings.draftDefaults || {};
+      if (defaults.model) this.defaultModel = defaults.model;
+      if (["default", "plan", "bypassPermissions"].includes(defaults.permission)) {
+        this.defaultPermission = defaults.permission;
       }
-      const body = {
-        default_model: this.settings.draftDefaults.model,
-        default_permission: this.settings.draftDefaults.permission,
-      };
-      // Send every typed provider key through the generic provider_keys
-      // map. Backend whitelists against PROVIDER_KEYS (derived from
-      // endpoints.CATALOG), so adding a new vendor only needs the FE to
-      // render an input row — no field-name plumbing change here.
-      // Old k2f mapping (anthropic_api_key / deepseek_api_key / ...) is
-      // still accepted by the backend for backwards compat, but we don't
-      // emit it anymore — drift between FE k2f and backend Pydantic was
-      // the exact bug that hid Kimi / Qwen / MiMo from Settings UI.
-      const providerKeys = {};
-      for (const [envK, v] of Object.entries(this.settings.draftKeys || {})) {
-        if (v && v.trim()) providerKeys[envK] = v.trim();
-      }
-      if (Object.keys(providerKeys).length > 0) body.provider_keys = providerKeys;
-      const r = await fetch("/api/settings", {
-        method: "PUT",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (r.ok) {
-        const d = await r.json();
-        this.settings.show = false;
-        // Prefer `updated_count` (user-facing tally) over `updated.length`
-        // (raw env-key count). Backend dedupes the MUSELAB_MODEL +
-        // MUSELAB_DEFAULT_MODEL pair so changing the model dropdown reads
-        // as "1 setting" not "2". Fallback to .length keeps it working
-        // against an older backend that doesn't return the new field.
-        // n=0 means the user hit Save without changing anything — show a
-        // different toast so they don't think a change was lost.
-        const envN = (typeof d.updated_count === "number")
-          ? d.updated_count
-          : (d.updated || []).length;
-        const n = envN + modelChanges;
-        let msg;
-        if (n === 0) {
-          msg = this.lang === "zh" ? "无改动" : "No changes";
-        } else {
-          msg = this.lang === "zh"
-            ? `已保存 ${n} 项设置`
-            : `Saved ${n} setting${n === 1 ? "" : "s"}`;
-        }
-        this.toast(msg, n === 0 ? "info" : "success");
-        // Settings "default model" 改了之后，下一个新建会话应该用新值。
-        // 之前只写了服务端 env，但前端的 this.model 还是 localStorage 里的
-        // 老值 → 用户看不到任何变化。同步前端 + localStorage 让"我改了它生效"
-        // 的预期成立。已建会话有自己 locked model，不受影响。
-        const newDefaultModel = this.settings.draftDefaults.model;
-        if (newDefaultModel) {
-          // newSession() seeds from defaultModel — update it so the change
-          // takes effect on the very next new chat without a providers refetch.
-          this.defaultModel = newDefaultModel;
-          // Also move the active dropdown to the new default (the original
-          // behavior) so "I changed it" is immediately visible.
-          if (newDefaultModel !== this.model) this.model = newDefaultModel;
-          this.savePrefs();
-        }
-        const newDefaultPerm = this.settings.draftDefaults.permission;
-        if (newDefaultPerm && newDefaultPerm !== this.permission) {
-          this.permission = newDefaultPerm;
-          this.savePrefs();
-        }
-        // 刷新可用 provider 列表
-        const r2 = await fetch("/api/chat/providers", { headers: this.hdr() });
-        if (r2.ok) {
-          this.availableModels = (await r2.json()).models || [];
-          // 关键：先校正 this.model 再 rebind。否则 default_model 仍是
-          // 出厂值 claude-sonnet-4-6（GET /api/settings 在 MUSELAB_MODEL 未设
-          // 时回退到它），而用户只配了 DeepSeek、没有 Anthropic 鉴权 → claude
-          // 根本不在 availableModels 里 → 下一条消息按 claude 发送、命中
-          // chat.py 的 auth 守卫报错。saveProviderKey（逐行保存）走 _fetchModels
-          // 已含此校正，批量保存这条路径之前漏了。
-          this._ensureValidModel();
-          this._rebindModelSelect();
-        }
-        // 也刷新 contextInfo — has_any_provider 变了，否则 "no provider" 卡片不消失
-        this.fetchContextInfo();
-      } else {
-        const prefix = this.lang === "zh" ? "保存失败：" : "Save failed: ";
-        this.toast(prefix + (await r.text()), "error");
-      }
+      this.savePrefs();
+      this.settings.show = false;
+      this.toast(this.lang === "zh"
+        ? "Codex 设置会在新会话或输入框中生效"
+        : "Codex settings apply from the new-session composer", "info");
     },
     async deleteSession() {
       const cur = this.sessions.find(x => x.id === this.currentId);
@@ -9867,7 +9469,10 @@ function portal() {
       if (!ok) return;
       await fetch("/api/chat/sessions/" + cur.id, { method: "DELETE", headers: this.hdr() });
       await this.refreshSessions();
-      if (this.sessions.length === 0) { const s = await this.newSession(); this.currentId = s.id; }
+      if (this.sessions.length === 0) {
+        const s = await this.newSession();
+        if (s) this.currentId = s.id;
+      }
       else { this.currentId = this.sessions[0].id; }
       await this.loadSession(this.currentId);
       this.savePrefs();
@@ -9878,11 +9483,19 @@ function portal() {
     async loadRoot() {
       this.childCache = {};
       const children = await this.fetchChildren("");
-      this.visible = children.map(c => ({ ...c, depth: 0 }));
+      this.visible = this._uniqueFileNodes(children)
+        .map(c => ({ ...c, depth: 0 }));
       this.expanded = new Set();
-      const want = this._pendingExpanded || [];
+      // Restoring every directory that was ever left open can rebuild
+      // thousands of keyed rows on refresh. Only reveal ancestors of the
+      // selected preview; unrelated folders stay collapsed and load lazily.
+      const selectedPath = this._pendingPreviewSelected || this.selected || "";
+      const want = [...new Set(this._pendingExpanded || [])]
+        .filter(p => selectedPath && selectedPath.startsWith(p + "/"))
+        .sort((a, b) => a.length - b.length)
+        .slice(0, 8);
       this._pendingExpanded = null;
-      for (const p of want.sort((a, b) => a.length - b.length)) {
+      for (const p of want) {
         const node = this.visible.find(n => n.path === p);
         if (node && node.is_dir) await this.expand(node);
       }
@@ -9914,7 +9527,10 @@ function portal() {
         while (end < this.visible.length
                 && this.visible[end].depth > node.depth) end++;
       }
-      this.visible.splice(idx, end - idx);
+      this.visible = [
+        ...this.visible.slice(0, idx),
+        ...this.visible.slice(end),
+      ];
       // Clean up expanded set: the node itself + any of its descendants
       // that were expanded. New Set() reassignment forces Alpine to
       // notice (Set mutation in place doesn't trigger reactivity).
@@ -9963,11 +9579,19 @@ function portal() {
       let end = parentIdx + 1;
       while (end < this.visible.length
               && this.visible[end].depth > parentNode.depth) end++;
-      this.visible.splice(parentIdx + 1, end - parentIdx - 1);
+      this.visible = [
+        ...this.visible.slice(0, parentIdx + 1),
+        ...this.visible.slice(end),
+      ];
       for (const p of innerExpanded) this.expanded.delete(p);
       const children = await this.fetchChildren(parent);
-      const items = children.map(c => ({ ...c, depth: parentNode.depth + 1 }));
-      this.visible.splice(parentIdx + 1, 0, ...items);
+      const items = this._uniqueFileNodes(children)
+        .map(c => ({ ...c, depth: parentNode.depth + 1 }));
+      this.visible = [
+        ...this.visible.slice(0, parentIdx + 1),
+        ...items,
+        ...this.visible.slice(parentIdx + 1),
+      ];
       // Re-expand previously-open inner subtrees in shortest-path-first
       // order so each expand() can find its parent already rendered.
       for (const p of innerExpanded.sort((a, b) => a.length - b.length)) {
@@ -9995,6 +9619,15 @@ function portal() {
         this.toast(this.t("toast.dir_truncated", { path: path || "", n: d.entries.length }), "warn", 3500);
       }
       return d.entries;
+    },
+    _uniqueFileNodes(nodes) {
+      const seen = new Set();
+      return (nodes || []).filter(n => {
+        const path = n && typeof n.path === "string" ? n.path : "";
+        if (!path || seen.has(path)) return false;
+        seen.add(path);
+        return true;
+      });
     },
     toggleHidden() {
       this.showHidden = !this.showHidden;
@@ -10102,8 +9735,15 @@ function portal() {
       if (this.expanded.has(n.path)) return;
       const idx = this.visible.findIndex(x => x.path === n.path);
       if (idx < 0) return;
-      const items = children.map(c => ({ ...c, depth: n.depth + 1 }));
-      this.visible.splice(idx + 1, 0, ...items);
+      const existingPaths = new Set(this.visible.map(x => x.path));
+      const items = this._uniqueFileNodes(children)
+        .filter(c => !existingPaths.has(c.path))
+        .map(c => ({ ...c, depth: n.depth + 1 }));
+      this.visible = [
+        ...this.visible.slice(0, idx + 1),
+        ...items,
+        ...this.visible.slice(idx + 1),
+      ];
       this.expanded.add(n.path);
       this.expanded = new Set(this.expanded);
     },
@@ -10112,7 +9752,10 @@ function portal() {
       if (idx < 0) return;
       let end = idx + 1;
       while (end < this.visible.length && this.visible[end].depth > n.depth) end++;
-      this.visible.splice(idx + 1, end - idx - 1);
+      this.visible = [
+        ...this.visible.slice(0, idx + 1),
+        ...this.visible.slice(end),
+      ];
       for (const p of Array.from(this.expanded)) {
         if (p === n.path || p.startsWith(n.path + "/")) this.expanded.delete(p);
       }
@@ -10908,25 +10551,40 @@ function portal() {
         if (existing) {
           // Target already open (preview or pinned) — keep its pin state, but
           // the temp slot follows the user: drop any OTHER preview tab.
-          this.tabs = this.tabs.filter(t => t.path === n.path || !t.preview);
+          if (this.tabs.some(t => t.path !== n.path && t.preview)) {
+            this.tabs = this.tabs.filter(t => t.path === n.path || !t.preview);
+          }
         } else {
           // Recycle the single existing preview slot in place (keeps tab
           // order stable); otherwise create the preview tab.
           const pi = this.tabs.findIndex(t => t.preview);
-          if (pi >= 0) this.tabs.splice(pi, 1, { path: n.path, name, preview: true });
-          else this.tabs.push({ path: n.path, name, preview: true });
+          // Immutable replacement is important here: `tabs` is rendered by
+          // three independent keyed x-for templates. In-place splice/push can
+          // interleave their effects and leave one lookup pointing at an
+          // already-removed node (`reading 'after'`), freezing previewMode in
+          // "loading" even though the file request completed.
+          if (pi >= 0) {
+            this.tabs = this.tabs.map((t, i) => i === pi
+              ? { path: n.path, name, preview: true } : t);
+          } else {
+            this.tabs = [...this.tabs, { path: n.path, name, preview: true }];
+          }
         }
       } else {
         // Deliberate open / pin. Promote an existing preview tab to permanent,
         // or create a permanent tab.
         const existing = this.tabs.find(t => t.path === n.path);
-        if (existing) existing.preview = false;
-        else this.tabs.push({ path: n.path, name, preview: false });
+        if (existing && existing.preview) {
+          this.tabs = this.tabs.map(t => t.path === n.path
+            ? { ...t, preview: false } : t);
+        } else if (!existing) {
+          this.tabs = [...this.tabs, { path: n.path, name, preview: false }];
+        }
       }
       this.selected = n.path;
       this.editing = false;
       // Persist preview-pane state so a refresh restores tabs + selected.
-      this.savePrefs();
+      this._scheduleSavePrefs();
       // Mobile: opening a file should jump to the preview pane (otherwise
       // the user is still on `files` tab and sees nothing change).
       if (this._isMobileLayout()) this.mobileTab = "preview";
@@ -10940,7 +10598,13 @@ function portal() {
       // no fetch, no "loading" flash. Invalidated on edit/reload/external write.
       const cachedPrev = this._previewCacheGet(n.path);
       if (cachedPrev) {
-        this._applyPreviewCache(cachedPrev);
+        // Paint the active-tab marker before rebuilding a potentially large
+        // cached markdown/text DOM.
+        const cachedPath = n.path;
+        this.previewMode = "loading";
+        requestAnimationFrame(() => {
+          if (this.selected === cachedPath) this._applyPreviewCache(cachedPrev);
+        });
         return;
       }
       // Clear the previous file's preview data and surface a loading
@@ -10986,7 +10650,11 @@ function portal() {
             if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
               this._previewCacheSet(targetPath, { mode: "md", rawText: this.rawText, renderedMd: this.renderedMd });
             }
-            this.$nextTick(() => this.highlightCode(".markdown"));
+            // Avoid a second all-code-block walk (and parser cold-load) on
+            // very large files. Fenced code remains readable without colors.
+            if (this.rawText.length <= this.LARGE_MD_DEFER_CHARS) {
+              this.$nextTick(() => this.highlightCode(".markdown"));
+            }
           };
           if (this.rawText.length > this.LARGE_MD_DEFER_CHARS) {
             this.previewMode = "loading";
@@ -11162,6 +10830,7 @@ function portal() {
     async openByPath(path) { await this.openFile({ path, name: path.split("/").pop() }); },
 
     async switchTab(path) {
+      if (!path || path === this.selected) return;
       // 不再 push（已在 tabs 里），只是切换 selected 并重新加载内容。
       // Preserve the tab's preview/pinned state: a single-click to view a
       // preview tab must NOT pin it (only a double-click / edit does). Pass
@@ -11170,13 +10839,6 @@ function portal() {
       const cur = this.tabs.find(t => t.path === path);
       await this.openFile({ path, name: path.split("/").pop() },
                           { preview: !!(cur && cur.preview) });
-      // Pass mode:"background" so we expand/scroll the tree quietly —
-      // the user clicked a preview tab, they want to STAY in preview
-      // (especially on mobile, where revealInTree's default mode would
-      // bounce them to the files pane). The pulse animation also
-      // doesn't fire here because there's no "I'm looking for this
-      // file in the tree" user intent — they were already on it.
-      await this.revealInTree(path, { mode: "background" });
     },
     async revealInTree(path, opts = {}) {
       // Make the file's row visible in the tree pane and flash it so the
@@ -13416,7 +13078,7 @@ function portal() {
             `### ${this.t("help.sec_layout")}`,
             this.t("help.layout_list"),
             "",
-            `${this.t("help.docs_link")} → [docs/personalize-claude-md.md](docs/personalize-claude-md.md)`,
+            `${this.t("help.docs_link")} → [docs/skills.md](docs/skills.md)`,
           ].join("\n");
           this._injectAssistantNote(md);
           return;
@@ -13467,16 +13129,7 @@ function portal() {
         }
         case "compact": {
           if (!this.currentId) return;
-          const r = await fetch(`/api/chat/sessions/${this.currentId}/compact`,
-                                  { method: "POST", headers: this.hdr() });
-          if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
-          const meta = await r.json();
-          await this.refreshSessions();
-          this.currentId = meta.id;
-          await this.loadSession(meta.id);
-          // Pre-fill input with the compact prompt — user reviews then sends
-          this.input = this.t("slash.compact_prompt");
-          this.toast(this.t("slash.compact_ok"), "success", 2500);
+          await this.runCompact(this.currentId);
           return;
         }
         case "model": {
@@ -13563,8 +13216,6 @@ function portal() {
     // Suggested first questions when the user has set things up but hasn't
     // chatted yet. Tailored a bit to what data they've dropped in.
     // Skill chips for the onboarding card — give a short, friendly example
-    // prompt that triggers each known skill (matches the 7 presets in skills/).
-    // The 7 preset skills shipped under skills/. Only labels are bespoke; the
     // inserted prompt comes from _skillSeed() so every skill reads identically.
     SKILL_TRIGGERS: [
       { name: "web-search",         label_zh: "查时效数据",   label_en: "live web fact" },
@@ -13587,7 +13238,8 @@ function portal() {
     },
 
     skillSuggestions() {
-      const loaded = new Set(this.settings.skills.map(s => s.name));
+      const loaded = new Set(
+        this.settings.skills.filter(s => s.enabled !== false).map(s => s.name));
       const lang = this.lang;
       return this.SKILL_TRIGGERS
         .filter(t => loaded.has(t.name))
@@ -13606,7 +13258,8 @@ function portal() {
       const q = (this.settings.skillFilter || "").trim().toLowerCase();
       if (!q) return this.settings.skills;
       return this.settings.skills.filter(s => {
-        const hay = (s.name + " " + (s.description || "") + " " + (s.source || ""))
+        const hay = (s.name + " " + (s.display_name || "") + " "
+          + (s.description || "") + " " + (s.source || ""))
           .toLowerCase();
         return hay.includes(q);
       });
@@ -13616,7 +13269,11 @@ function portal() {
     // skill-invocation prompt (see _skillSeed) and focuses it so the user can
     // fill in the rest. Closes the Settings modal first so the chat is visible.
     trySkill(sk) {
-      const prompt = this._skillSeed(sk.name);
+      if (sk.enabled === false) {
+        this.toast(this.t("set.skills.disabled_hint"), "warn", 2500);
+        return;
+      }
+      const prompt = sk.default_prompt || this._skillSeed(sk.name);
       // Close settings modal if open
       if (this.settings && this.settings.show) this.settings.show = false;
       // Close skills drawer if open
@@ -13638,16 +13295,12 @@ function portal() {
     skillsDrawerOpen: false,
     toggleSkillsDrawer() {
       this.skillsDrawerOpen = !this.skillsDrawerOpen;
-      // Refresh skills list each time the drawer opens — picks up newly
-      // installed Claude Code skills without requiring a settings open.
+      // Refresh skills list each time the drawer opens so newly installed
+      // Codex skills appear without requiring a page reload.
       if (this.skillsDrawerOpen) this.loadSkills();
     },
-    // MCP drawer (chat-input 🔌 entry). Same drawer chrome as skills
-    // drawer; mirrors the read-only view that used to live as a tiny
-    // top-bar badge — now expanded into a full card list showing each
-    // MCP's source (muselab.json / ~/.claude.json / .mcp.json) and
-    // enabled state. Editing still lives in Settings → MCP; this drawer
-    // is a one-glance "what tools does Muse have right now?" surface.
+    // MCP drawer (chat-input 🔌 entry). It mirrors app-server's effective
+    // Codex config and live tool inventory; editing lives in Settings → MCP.
     mcpDrawerOpen: false,
     toggleMcpDrawer() {
       this.mcpDrawerOpen = !this.mcpDrawerOpen;
@@ -13658,18 +13311,17 @@ function portal() {
         this.fetchMcp();
       }
     },
-    // Friendly label for an MCP's source — used as the card's `title`
-    // attr (hover tooltip) so curious users can still trace where a
-    // server came from, but the source isn't a chip cluttering every
-    // card. Keys come from backend _load_mcp_merged's `_source` field.
+    // Friendly label for the Codex config layer that owns an MCP server.
     mcpSourceLabel(src) {
       const zh = this.lang === "zh";
       const m = {
-        "muselab":              zh ? "muselab 自有 mcp.json" : "muselab mcp.json",
-        "claude_user_global":   zh ? "Claude Code 用户全局（~/.claude.json）" : "Claude Code user-global (~/.claude.json)",
-        "claude_user_settings": zh ? "Claude Code 用户设置（~/.claude/settings.json）" : "Claude Code user-settings (~/.claude/settings.json)",
-        "claude_user_project":  zh ? "Claude Code 项目级（~/.claude.json 的 projects）" : "Claude Code per-project (~/.claude.json projects)",
-        "archive_project":      zh ? "档案根 .mcp.json" : "archive root .mcp.json",
+        user: zh ? "Codex 用户配置" : "Codex user config",
+        project: zh ? "Codex 项目配置" : "Codex project config",
+        system: zh ? "Codex 系统配置" : "Codex system config",
+        enterpriseManaged: zh ? "管理员托管配置" : "Managed config",
+        mdm: zh ? "设备托管配置" : "Device-managed config",
+        runtime: zh ? "Codex runtime / 插件" : "Codex runtime / plugin",
+        codex: zh ? "Codex 配置" : "Codex config",
       };
       return m[src] || (src || "unknown");
     },
@@ -13707,12 +13359,33 @@ function portal() {
     },
     async loadSkills() {
       try {
-        const r = await fetch("/api/settings/skills", { headers: this.hdr() });
+        const r = await fetch("/api/chat/skills?force_reload=true", { headers: this.hdr() });
         if (r.ok) {
           const data = await r.json();
           this.settings.skills = data.skills || [];
         }
       } catch (e) { /* network / first-boot — silent fail */ }
+    },
+
+    async toggleSkill(sk) {
+      if (!sk || !sk.path || sk._saving) return;
+      sk._saving = true;
+      try {
+        const r = await fetch("/api/chat/skills", {
+          method: "PATCH",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: sk.path, enabled: !sk.enabled }),
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        const updated = data.skill || {};
+        Object.assign(sk, updated);
+        this.toast(this.t("set.skills.toggle_saved"), "success", 1500);
+      } catch (e) {
+        this.toast(this.t("set.skills.toggle_failed"), "error", 3500);
+      } finally {
+        sk._saving = false;
+      }
     },
 
     onboardingPrompts() {
@@ -13779,19 +13452,25 @@ function portal() {
       }
     },
 
-    claudeMdChipTitle() {
+    agentsChipTitle() {
       const i = this.contextInfo;
-      if (!i.claude_md_exists) {
-        return this.t("ctx.no_claude_md", { root: i.archive_root });
+      if (!i.instructions_exists) {
+        return this.t("ctx.no_agents", {
+          root: i.workspace_root,
+          global: i.global_agents_path || "~/.codex/AGENTS.md",
+        });
       }
-      const d = i.claude_md_mtime ? new Date(i.claude_md_mtime * 1000).toLocaleDateString() : "";
-      return this.t("ctx.claude_md_tip", { root: i.archive_root, date: d });
+      const d = i.instructions_mtime ? new Date(i.instructions_mtime * 1000).toLocaleDateString() : "";
+      return this.t("ctx.instructions_tip", { root: i.workspace_root, date: d });
     },
-    openClaudeMdHelp() {
+    openAgentsHelp() {
       this.modal = {
         show: true,
-        title: this.t("ctx.no_claude_md_title"),
-        body: this.t("ctx.no_claude_md_body", { root: this.contextInfo.archive_root }),
+        title: this.t("ctx.no_instructions_title"),
+        body: this.t("ctx.no_instructions_body", {
+          root: this.contextInfo.workspace_root,
+          global: this.contextInfo.global_agents_path || "~/.codex/AGENTS.md",
+        }),
         input: null, danger: false,
         okText: this.t("btn.confirm"),
         confirm: () => { this.modal.show = false; },
@@ -13801,7 +13480,7 @@ function portal() {
 
     // 2026-05-23: startProfileIntake removed — 「设置档案」按钮已合并入
     // 「整理档案」(startOrganize). 整理档案 workflow 现在同时覆盖 archive
-    // 整理 + CLAUDE.md profile 补全（见 backend/prompts.py CURATOR_SYSTEM_PROMPT
+    // 整理 + AGENTS.md profile 补全（见 backend/prompts.py CURATOR_SYSTEM_PROMPT
     // 第 3 步 3b 节）。后端 /sessions/profile-intake 端点保留向后兼容，
     // 现在 forward 到 /sessions/organize.
 
@@ -13864,13 +13543,7 @@ function portal() {
       if (pct >= 70) return this.t("ctx.warn",   args);
       return this.t("ctx.normal", args);
     },
-    // Real compact: a) make sure the OLD session has been summarized in chat,
-    // b) fork it, c) the fork inherits the summary as starting context.
-    // Easier path: just send a /compact instruction to the CURRENT session that
-    // asks the model to produce a self-contained summary, which the user can
-    // copy / use as basis. The "true" compact is a feature of the underlying
-    // CLI we don't have direct API for, so we implement it as a synthesized
-    // summarize-and-fork workflow.
+    // Run app-server's native thread/compact/start on the current thread.
     async runCompact(targetSid, opts = {}) {
       // Default to the active session — the manual ctx-ring click + the
       // command palette both want "compact what I'm looking at". The
@@ -13919,11 +13592,8 @@ function portal() {
         if (!ok) return;
       }
 
-      // Native compact: send "/compact" to CLI via SDK, which writes
-      // compact_boundary + isCompactSummary to the session JSONL. Lossless,
-      // preserves tool use history, same session ID. Old self-implemented
-      // summarize-and-fork is gone — it was lossy and unnecessary once we
-      // realized the SDK forwards slash commands to CLI natively.
+      // Native compact stays on the same Codex thread. The backend waits for
+      // the contextCompaction turn to complete and refreshes token usage.
       // Per-session compact flag. Setting only on `st` means the bottom
       // "📦 压缩对话中…" pending bubble (x-show binds to the current tab's
       // st.compacting) appears only on the session that's actually being
@@ -14359,6 +14029,17 @@ function portal() {
     },
 
     async send(opts = {}) {
+      const pendingCreate = this._sessionCreatePromises[this.currentId];
+      if (pendingCreate) {
+        const draftId = this.currentId;
+        let native = null;
+        try { native = await pendingCreate; } catch (_) { return; }
+        // Re-enter only if the user is still on the tab where Send was
+        // pressed. The native id adoption above has replaced draftId.
+        if (native && this.currentId === native.id) return this.send(opts);
+        if (this.currentId !== draftId) return;
+      }
+      const isReconnect = !!opts.reconnect;
       // ===== Pin target session at function entry =====
       // CRITICAL (fixes 2026-05-22 cross-tab leak): send() has multiple
       // await points downstream (stillUploading polling loop, queue drain
@@ -14389,12 +14070,12 @@ function portal() {
       // permission mode (D4 audit).
       const sendModel = this.model;
       const sendPermission = this.permission;
+      const sendEffort = this.effort || "";
       // Reconnect mode: skip user-input validation + user-msg push.
       // Used by _reconnectActiveTurn() when loadSession discovers an
       // in-flight background turn on the current session — we just want
       // to subscribe to the existing TurnBroadcast (empty prompt =
       // attach), all the EventSource handlers below stay the same.
-      const isReconnect = !!opts.reconnect;
       // Continuation mode: a reconnect that attaches to the bg-task watcher's
       // HEADLESS CONTINUATION turn (it published the finished task's card flip
       // + the model's auto-continue reaction). Unlike a queue-drain reconnect,
@@ -14407,12 +14088,8 @@ function portal() {
       // the item (NOT from this.input / this.pendingImages — those may
       // hold a different draft the user has typed since enqueue).
       const resumed = opts.resumedItem || null;
-      // No-provider gate: with zero configured models every send would 401
-      // the Anthropic auth pre-check AND lock the session to the unreachable
-      // claude fallback on first send. Refuse the turn and route the user to
-      // Settings instead. Reconnect (attach to an in-flight turn) is exempt —
-      // it adds no new turn. This is the frontend half of the fix; the
-      // backend leaves new sessions' model empty until a provider exists.
+      // No-model gate: without a discovered Codex model a new turn cannot be
+      // started. Reconnect (attaching to an in-flight turn) is exempt.
       if (!isReconnect && (!this.availableModels || !this.availableModels.length)) {
         this.toast(
           this.lang === "zh" ? "请先在设置里配置一个模型" : "Configure a model in Settings first",
@@ -14722,7 +14399,9 @@ function portal() {
             prompt: text,
             session_id: streamSid,
             model: sendModel,
+            model_provider: this._modelProvider(sendModel),
             permission: sendPermission,
+            effort: sendEffort,
             image_ids: attachIds.length ? attachIds.join(",") : "",
           }),
         });
@@ -14736,7 +14415,9 @@ function portal() {
             + "?prompt=" + encodeURIComponent(text)
             + "&session_id=" + encodeURIComponent(streamSid)
             + "&model=" + encodeURIComponent(sendModel)
+            + "&model_provider=" + encodeURIComponent(this._modelProvider(sendModel))
             + "&permission=" + encodeURIComponent(sendPermission)
+            + "&effort=" + encodeURIComponent(sendEffort)
             + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
             + "&token=" + encodeURIComponent(this.token);
         } else {
@@ -15143,17 +14824,25 @@ function portal() {
         // Also pre-initialise askOtherOpen / askOtherText for the same
         // reason — they're touched by openAskOther later.
         const pendingAnswers = {};
+        const askOtherOpen = {};
+        const askOtherText = {};
         for (const q of (d.questions || [])) {
-          pendingAnswers[q.question] = q.multiSelect ? [] : null;
+          const key = this.askQuestionKey(q);
+          pendingAnswers[key] = q.multiSelect ? [] : null;
+          askOtherOpen[key] = !!q.isOther || !(q.options || []).length;
+          askOtherText[key] = "";
         }
         streamState.messages.push({
           role: "ask_user_question",
           id: d.id,
+          kind: d.kind || "tool_input",
+          server: d.server || "",
+          prompt: d.message || "",
           questions: d.questions,
           pendingAnswers,
           submitted: false,
-          askOtherOpen: false,
-          askOtherText: "",
+          askOtherOpen,
+          askOtherText,
         });
 
         _scrollIfActive();
@@ -15165,8 +14854,10 @@ function portal() {
         streamState.messages.push({
           role: "permission_request",
           id: d.id,
+          kind: d.kind || "approval",
           tool: d.tool,
           summary: d.summary,
+          url: d.url || "",
           resolved: false,
           decision: null,
         });
@@ -15581,7 +15272,7 @@ function portal() {
       // Queue empty — interrupt the active turn (original behaviour).
       // Backend uses SDK's client.interrupt() — keeps the client / CLI
       // subprocess alive so the next message continues the same
-      // conversation without reloading CLAUDE.md / MCP / system prompt.
+      // conversation without reloading AGENTS.md / MCP / system prompt.
       if (st.es) { try { st.es.close(); } catch {} st.es = null; }
       st.streaming = false;
       this.streaming = false; this.es = null;
@@ -15594,11 +15285,8 @@ function portal() {
     },
 
     // ====== ask_user_question UI helpers ======
-    // Defensive label/description extraction. The backend now normalizes
-    // option objects to `{label, description}` (see ask_user_question.py
-    // _normalize_questions), but we keep this fallback so a frontend
-    // running against an older backend, or a future malformed payload,
-    // doesn't render buttons with empty text.
+    // Native app-server questions use `{label, description}`. Keep a small
+    // compatibility fallback while inherited transcripts are still readable.
     askOptionLabel(opt) {
       if (opt == null) return "";
       if (typeof opt === "string") return opt;
@@ -15608,11 +15296,18 @@ function portal() {
       if (opt == null || typeof opt === "string") return "";
       return String(opt.description || opt.desc || opt.detail || "");
     },
+    askOptionValue(opt) {
+      if (opt == null || typeof opt === "string") return this.askOptionLabel(opt);
+      return String(opt.value ?? this.askOptionLabel(opt));
+    },
+    askQuestionKey(q) {
+      return String(q?.id || q?.question || "");
+    },
     // Single-select: user clicks an option → submit immediately.
     pickAskOption(msg, qIdx, optionLabel) {
       if (msg.submitted) return;
       const q = msg.questions[qIdx];
-      msg.pendingAnswers[q.question] = optionLabel;
+      msg.pendingAnswers[this.askQuestionKey(q)] = optionLabel;
       // If single-select AND all questions answered → submit
       if (!q.multiSelect && this._allAskQuestionsAnswered(msg)) {
         this.submitAskAnswers(msg);
@@ -15622,7 +15317,7 @@ function portal() {
     toggleAskOption(msg, qIdx, optionLabel) {
       if (msg.submitted) return;
       const q = msg.questions[qIdx];
-      const key = q.question;
+      const key = this.askQuestionKey(q);
       const cur = msg.pendingAnswers[key];
       const arr = Array.isArray(cur) ? cur.slice() : [];
       const i = arr.indexOf(optionLabel);
@@ -15632,7 +15327,7 @@ function portal() {
     isAskOptionPicked(msg, qIdx, optionLabel) {
       const q = msg.questions?.[qIdx];
       if (!q) return false;
-      const cur = msg.pendingAnswers?.[q.question];
+      const cur = msg.pendingAnswers?.[this.askQuestionKey(q)];
       if (q.multiSelect) return Array.isArray(cur) && cur.includes(optionLabel);
       return cur === optionLabel;
     },
@@ -15640,65 +15335,48 @@ function portal() {
       const qs = msg.questions || [];
       if (!qs.length) return false;
       return qs.every(q => {
-        const v = msg.pendingAnswers?.[q.question];
+        const v = msg.pendingAnswers?.[this.askQuestionKey(q)];
+        if (!q.required && (v == null || (Array.isArray(v) && v.length === 0))) return true;
         if (q.multiSelect) return Array.isArray(v) && v.length > 0;
-        return v != null;
+        return v != null && String(v).length > 0;
       });
     },
-    // "Other" free-text fallback. The MCP tool only lets the model give
-    // 2-4 fixed buttons; when none fit, the user opens this and types
-    // a regular reply. The typed text is sent as the answer for EVERY
-    // pending question on the card (typical case is one question; for
-    // multi-question cards the model gets the same custom reply for
-    // each Q, which is fine — it's only meaningful when no other
-    // option fits, so duplicating beats forcing the user to type N
-    // separate replies).
-    openAskOther(msg) {
+    // Codex can attach choices or request free-form input. Keep custom input
+    // per native question id so batched questions retain distinct answers.
+    openAskOther(msg, q) {
       if (msg.submitted) return;
-      msg.askOtherOpen = true;
-      if (msg.askOtherText == null) msg.askOtherText = "";
+      const key = this.askQuestionKey(q);
+      msg.askOtherOpen[key] = true;
+      if (msg.askOtherText[key] == null) msg.askOtherText[key] = "";
       // Focus the textarea on next tick — Alpine has to apply the x-show
       // toggle first or the element isn't in the DOM yet.
       this.$nextTick(() => {
-        const ta = document.querySelector(".ask-question .ask-other-textarea");
+        const fields = document.querySelectorAll(".ask-question .ask-other-textarea");
+        const ta = fields[fields.length - 1];
         if (ta && typeof ta.focus === "function") ta.focus();
       });
     },
-    cancelAskOther(msg) {
-      msg.askOtherOpen = false;
+    cancelAskOther(msg, q) {
+      msg.askOtherOpen[this.askQuestionKey(q)] = false;
     },
-    async submitAskOther(msg) {
+    async submitAskOther(msg, q) {
       if (msg.submitted) return;
-      const text = (msg.askOtherText || "").trim();
+      const key = this.askQuestionKey(q);
+      const text = (msg.askOtherText?.[key] || "").trim();
       if (!text) {
-        this.toast(this.lang === "zh" ? "请输入回复" : "Please enter a reply",
-                    "warn", 2000);
+        this.toast(this.t("ask.enter_reply"), "warn", 2000);
         return;
       }
-      msg.submitted = true;
-      // Use the typed text as the answer for every question on the card.
-      // Backend's _normalize_questions has already canonicalized q.question
-      // into the keying we need.
-      const answers = {};
+      msg.pendingAnswers[key] = text;
+      msg.askOtherOpen[key] = false;
+      if (this._allAskQuestionsAnswered(msg)) this.submitAskAnswers(msg);
+    },
+    _redactSubmittedSecretAnswers(msg) {
       for (const q of (msg.questions || [])) {
-        answers[q.question] = text;
-      }
-      try {
-        const r = await fetch(
-          `/api/chat/answer/${encodeURIComponent(this.currentId)}/${encodeURIComponent(msg.id)}`,
-          {
-            method: "POST",
-            headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ answers }),
-          },
-        );
-        if (!r.ok) {
-          msg.submitted = false;
-          this.toast(this.t("ask.submit_failed"), "error", 3000);
-        }
-      } catch (e) {
-        msg.submitted = false;
-        this.toast(this.t("ask.submit_failed"), "error", 3000);
+        if (!q.isSecret) continue;
+        const key = this.askQuestionKey(q);
+        msg.pendingAnswers[key] = null;
+        msg.askOtherText[key] = "";
       }
     },
     async submitAskAnswers(msg) {
@@ -15720,6 +15398,8 @@ function portal() {
         if (!r.ok) {
           msg.submitted = false;
           this.toast(this.t("ask.submit_failed"), "error", 3000);
+        } else {
+          this._redactSubmittedSecretAnswers(msg);
         }
       } catch (e) {
         msg.submitted = false;
@@ -15731,6 +15411,9 @@ function portal() {
       if (msg.resolved) return;
       msg.resolved = true;
       msg.decision = decision;
+      if (msg.kind === "mcp_url" && decision === "allow" && msg.url) {
+        window.open(msg.url, "_blank", "noopener,noreferrer");
+      }
       try {
         const r = await fetch(
           `/api/chat/permission/${encodeURIComponent(this.currentId)}/${encodeURIComponent(msg.id)}`,

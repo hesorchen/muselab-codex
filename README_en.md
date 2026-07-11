@@ -1,118 +1,177 @@
-<h1 align="center">muselab</h1>
+<h1 align="center">muselab-codex</h1>
 
 <p align="center">
-  <a href="https://github.com/hesorchen/muselab/actions/workflows/ci.yml"><img src="https://github.com/hesorchen/muselab/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/hesorchen/muselab-codex/actions/workflows/ci.yml"><img src="https://github.com/hesorchen/muselab-codex/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
   <a href="docs/quickstart.md"><img src="https://img.shields.io/badge/deploy-self--hosted-orange.svg" alt="Self-hosted"></a>
-  <a href="https://github.com/hesorchen/muselab/pkgs/container/muselab"><img src="https://img.shields.io/badge/ghcr.io-muselab-blue?logo=docker" alt="Container"></a>
-  <a href="https://deepwiki.com/hesorchen/muselab"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
   <a href="README.md"><img src="https://img.shields.io/badge/lang-中文-red" alt="中文"></a>
 </p>
 
-<p align="center"><strong>muselab is a self-hosted AI personal workspace built on the Claude Agent SDK.</strong></p>
+<p align="center"><strong>A self-hosted AI workspace built on <code>codex app-server</code></strong></p>
 
-<p align="center"><em>Muse comes from the Muses of Greek mythology, goddesses of inspiration, art, and knowledge.</em></p>
+<p align="center"><em>Give Codex a durable local workspace and a browser designed for long-running work.</em></p>
 
 <table align="center">
 <tr>
-<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100"></td>
-<td align="center"><img src="promo/media/screenshot-desktop.png" width="360"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-files.jpeg" width="100" alt="Mobile file pane"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-preview.png" width="100" alt="Mobile preview pane"></td>
+<td align="center"><img src="promo/media/screenshot-mobile-chat.png" width="100" alt="Mobile chat pane"></td>
+<td align="center"><img src="promo/media/screenshot-desktop.png" width="360" alt="Desktop workspace"></td>
 </tr>
 <tr>
 <td align="center">Mobile · files</td>
 <td align="center">Mobile · preview</td>
 <td align="center">Mobile · chat</td>
-<td align="center">Desktop · dark theme + live HTML</td>
+<td align="center">Desktop · three-pane workspace</td>
 </tr>
 </table>
 
-<p align="center"><sub>Click any image to enlarge.</sub></p>
+<p align="center"><sub>Click an image for the original. muselab-codex keeps the same three-pane workspace experience as muselab.</sub></p>
+
+muselab-codex turns a locally authenticated Codex installation into a persistent file and conversation workspace. Your material stays local, Codex works directly with the real workspace, and the browser provides file management, previews, multi-thread chat, streaming, and mobile access.
+
+```text
+Browser → FastAPI HTTP/SSE → codex app-server Unix WebSocket → Codex
+```
+
+There is one agent runtime. muselab-codex does not maintain a second model loop or reduce Codex to a generic chat endpoint.
+
+muselab-codex supervises a local Unix-socket listener. To enter the same live thread
+state from a terminal, copy the `codex resume --remote unix:///.../app-server.sock`
+command shown under Settings → About. A plain `codex` command still starts an
+independent runtime.
 
 ## Core features
 
-| | |
+| Capability | What it provides |
 |---|---|
-| **Complete user context** | Your personal archive keeps accumulating; the more you use it, the better Muse understands you, creating compounding context |
-| **Leading Agent Harness** | Built on the Claude Agent SDK, with agent capabilities such as tool use, Skills, and MCP extensions |
-| **Switchable foundation models** | One-click switching across 9 provider families: Claude (OAuth) / GPT via local Codex Gateway / DeepSeek / GLM / MiniMax / Kimi / Qwen / MiMo / ERNIE |
-| **Cross-domain analysis** | Family information, career planning, health records, and financial data live in one context, so Muse can surface cross-domain insights |
-| **Native rendering** | HTML pages and Markdown documents render live as they are written, with no plugins required |
-| **Mobile PWA** | Near-native App experience, synced sessions across desktop and phone, and continued work while you are away from your desk |
+| **Codex-native agent harness** | `codex app-server` owns threads, turns, tools, approvals, sandboxing, Skills, MCP, and account limits |
+| **Durable local context** | `MUSELAB_ROOT`, `AGENTS.md`, Memory, and workspace files form an inspectable context system |
+| **File workspace** | Tree, full-text search, upload, edit, trash, and previews for Markdown, code, images, PDF, CSV, XLSX, and HTML |
+| **Multi-thread workflows** | Streaming, replay, message queues, fork, compact, sub-agent threads, and concurrent browser tabs |
+| **Native extensions** | Skills, MCP servers, OAuth state, approvals, and structured user questions are surfaced directly from Codex |
+| **Scheduler and terminal** | Run saved prompts on a schedule and supervise background terminal processes |
+| **Self-hosted and mobile** | Localhost defaults, systemd, launchd, Docker, PWA, HTTPS reverse proxy, and Web Push |
+| **Native Responses providers** | Verified MiniMax M2.7, Qwen 3.7 Plus, and MiMo V2.5 Pro through Codex `model_providers` |
 
 ## Quick start
 
-**One-line install** (Linux + macOS + WSL2):
+### One-line install
+
+Linux, macOS, and WSL2 with systemd enabled:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab-codex/main/scripts/quick-install.sh | bash
 ```
 
-**Manual install**:
+The installer clones the repository, checks `uv`, Node.js, and Codex CLI, validates `codex login`, creates a private `.env`, and registers a user service.
+
+### Manual install
 
 ```bash
-git clone https://github.com/hesorchen/muselab && cd muselab
-bash scripts/install-linux.sh    # or install-macos.sh
+git clone https://github.com/hesorchen/muselab-codex
+cd muselab-codex
+codex login
+bash scripts/install-linux.sh        # use install-macos.sh on macOS
 ```
 
-**Verify after installation**:
+### Verify the installation
 
-1. Open `http://localhost:8765` in your browser
-2. Paste `MUSELAB_TOKEN` to log in
-3. Configure at least one model
-4. Send `hello` and confirm Muse responds
+1. Open `http://127.0.0.1:8765` in a browser.
+2. Enter the generated `MUSELAB_TOKEN`.
+3. Create a thread and send “Hello”.
+4. Ask Codex to read or create a workspace file.
 
-Something wrong? Run `bash scripts/doctor.sh` for layered diagnostics and concrete repair suggestions.
+If something fails, run `bash scripts/doctor.sh` or follow [Troubleshooting](docs/troubleshooting.md). `runtime.ready: true` in the health response means both FastAPI and Codex app-server are ready.
 
-> **Windows users:** install through WSL2 (see [Quick start](docs/quickstart.md#windows-via-wsl2)).
->
-> **Unattended mode** (CI / Docker / demo recording): `MUSELAB_NONINTERACTIVE=1 bash ...`
+> **Windows:** install through WSL2 with systemd enabled; see [Quick start](docs/quickstart.md#wsl2).
 
-## Session practice
+## Conversation workflow
 
-> "This is my checkup report from this year. Compare it with last year's report and turn the metric changes into a one-page HTML trend report."
+> “Scan this directory, explain how the Markdown, PDF, and spreadsheet files relate, then write a new Markdown overview.”
 
-Muse finds both PDFs in `health/`, reads the files, extracts the metrics, and writes a single-file HTML report with charts — rendered directly in the preview pane. Then you say:
+Muse reads the real files, uses terminal tools, requests approval when needed, and writes results back in the same Codex thread. You can continue with a standalone HTML report and inspect it in the preview pane. When a long conversation approaches its context limit, use native compact to reduce the current thread context and keep working.
 
-> "Now check the insurance policies in `money/`. Do these metric changes reveal any coverage gaps?"
+There is no separate chunking or application-owned RAG index. Every workspace change remains visible, editable, and backup-friendly.
 
-Archives from two domains are analyzed in the same session, producing concrete guidance.
+## Why Codex-native?
 
-🌐 More scene demos on the [muselab promo page](https://hesorchen.github.io/muselab/promo/).
-
-## Why not existing solutions?
-
-| Solution | Limitation | How muselab works |
+| Approach | Common limitation | muselab-codex choice |
 |---|---|---|
-| ChatGPT / Claude.ai | Files are uploaded temporarily; memory is a black box | Archived files stay local, with a transparent memory mechanism |
-| Claude Code | Born in the terminal, built for code | The same Agent Harness, aimed at life files, usable on desktop and phone |
-| RAG document chat | Chunking + retrieval loses cross-document meaning; better suited for massive document sets | Stores source documents and reads complete files for lossless understanding |
-
-Full comparison (Open WebUI / LobeChat / AnythingLLM / claudecodeui, etc.): [How it compares](docs/comparison.md).
+| Generic web chat | Temporary uploads and application-reimplemented tools | Use the local workspace and Codex tool loop directly |
+| Standalone terminal session | Great for a shell, but no preview pane, mobile UI, or browser tabs | Let the browser and CLI join the same app-server runtime |
+| Application-owned agent layer | Threads, approvals, Skills, and MCP can diverge from upstream semantics | Keep Codex authoritative; adapt only the UI and transport |
 
 ## Practical details
 
-- **Modern file tree** — Modern file operations: drag-and-drop upload, fuzzy search, rename, and trash
-- **Multiple modes and themes** — Light / dark / eye-care themes, with your own accent color
-- **Bilingual UI** — Switch between English and Chinese in one click, without refreshing the page
-- **Message queue** — Keep sending messages while Muse thinks; the queue runs them in order so no idea is lost
-- **Scheduled tasks** — Create overnight tasks and check the results when you wake up
+- **Three-pane workspace** — Coordinate the file tree, preview pane, and chat; preview Markdown, code, images, PDF, CSV, XLSX, and HTML.
+- **Multi-thread tabs** — Open a new thread immediately, then replay, rename, fork, compact, or queue messages.
+- **Bilingual and themeable** — Switch languages without a reload; use light, dark, or eye-care themes and the mobile PWA.
+- **One native runtime** — Copy the remote command from Settings → About to enter the same live thread state from Codex CLI.
+- **Observable agent state** — See health, account usage, context usage, tool progress, approvals, and MCP questions in the browser.
 
-## Docs
+## Codex-native architecture
 
-**[📚 Full documentation index](docs/README.md)**
+| muselab-codex owns | Codex app-server owns |
+|---|---|
+| Browser UI, PWA, and token authentication | Threads, turns, and transcripts |
+| HTTP/SSE adaptation and process supervision | Model calls, streaming events, and the tool loop |
+| Safe workspace file APIs | Sandbox, approvals, and user questions |
+| Attachment storage and numeric usage sidecars | Skills, MCP, Memory, and configuration precedence |
+| systemd, launchd, and Docker integration | Login state, account limits, and native history |
 
-- **Get started:** [Quick start](docs/quickstart.md) · [Linux install](docs/install-linux.md) · [macOS install](docs/install-macos.md) · [Upgrade](docs/upgrade.md)
-- **Usage:** [Personalize CLAUDE.md](docs/personalize-claude-md.md) · [Skills](docs/skills.md) · [Mobile PWA](docs/mobile.md) · [Scheduled tasks](docs/scheduler.md)
-- **Models:** [Providers](docs/providers.md) · [Codex Gateway](docs/codex-gateway.md) · [Add a provider](docs/add-provider.md) · [Model routing](docs/routing.md)
-- **Internals:** [Architecture](docs/architecture.md) · [Sessions](docs/backend-sessions.md) · [Files API](docs/backend-files.md) · [Security model](docs/backend-security.md) · [Frontend](docs/frontend.md) · [Infrastructure](docs/infrastructure.md)
-- **Reference:** [Configuration](docs/configuration.md) · [Data & backup](docs/data-and-backup.md) · [Troubleshooting](docs/troubleshooting.md) · [Glossary](docs/glossary.md)
-- **Concepts:** [How it compares](docs/comparison.md) · [The nine Muses](docs/muses.md)
-- **Project:** [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Third-party licenses](THIRD_PARTY_LICENSES.md)
+This boundary is a maintenance rule: when Codex already defines authoritative semantics, muselab-codex adapts them instead of recreating them.
 
-## Status
+## Native model providers
 
-v1.1 — first stable enhancement release.
+| Provider | Model | Environment variable | Web Search |
+|---|---|---|---|
+| MiniMax | `minimax-m2.7` | `MINIMAX_API_KEY` | disabled for compatibility |
+| Qwen | `qwen3.7-plus` | `DASHSCOPE_API_KEY` | disabled for compatibility |
+| Xiaomi MiMo | `mimo-v2.5-pro` | `XIAOMI_MIMO_API_KEY` | disabled for compatibility |
+
+Put credentials in the private environment inherited by the service, restart it, then enable the provider under **Settings → Models**. The browser never reads, displays, or submits the keys. See [Configuration](docs/configuration.md).
+
+## Development
+
+Requires Python 3.12+, [uv](https://docs.astral.sh/uv/), Node.js, and an authenticated Codex CLI. The current tested protocol baseline is `codex-cli 0.144.1`.
+
+```bash
+git clone https://github.com/hesorchen/muselab-codex
+cd muselab-codex
+uv sync
+cp .env.example .env
+# Set at least MUSELAB_TOKEN and MUSELAB_ROOT in .env
+uv run python -m backend.main
+```
+
+Quality gates:
+
+```bash
+uv run pytest tests/
+uv run ruff check backend/ tests/
+bash scripts/lint.sh
+node --check frontend/app.js
+```
+
+## Documentation
+
+**[📚 English documentation index](docs/README.md)** · **[中文文档](docs/README_zh.md)**
+
+- **Start:** [Quick start](docs/quickstart.md) · [Linux](docs/install-linux.md) · [macOS](docs/install-macos.md) · [Upgrade](docs/upgrade.md)
+- **Configure:** [Environment and providers](docs/configuration.md) · [Skills](docs/skills.md) · [Scheduler](docs/scheduler.md) · [Mobile](docs/mobile.md)
+- **Understand:** [Architecture](docs/architecture.md) · [Infrastructure](docs/infrastructure.md) · [Native specs](docs/specs/)
+- **Operate:** [Troubleshooting](docs/troubleshooting.md) · [Data and backup](docs/data-and-backup.md) · [Security](SECURITY.md)
+- **Project:** [Contributing](CONTRIBUTING.md) · [Third-party licenses](THIRD_PARTY_LICENSES.md)
+
+## Security note
+
+Anyone holding `MUSELAB_TOKEN` can operate on files under `MUSELAB_ROOT` and drive approved Codex tools. Keep `MUSELAB_HOST=127.0.0.1` by default. For remote access, add HTTPS and another access-control layer. Never commit `.env`, `CODEX_HOME`, or a real workspace.
+
+## Project status
+
+The current version is `0.1.0a1`. The core Codex-native path is operational, while the protocol compatibility baseline will continue to track Codex CLI releases.
+
+This repository evolves independently from muselab and retains its MIT license; it is not a GitHub fork.
 
 [MIT](LICENSE)

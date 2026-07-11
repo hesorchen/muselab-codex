@@ -374,12 +374,12 @@
       <div class="filelist-wrap" x-show="!searchMode">
         <div class="filelist-sticky-root"
              :class="{ 'drag-over': dragOverRoot }"
-             :title="contextInfo.archive_root || ''"
+             :title="contextInfo.workspace_root || ''"
              @dragover.prevent="onTreeRootDragOver($event)"
              @dragleave="dragOverRoot = false"
              @drop.prevent="onTreeRootDrop($event)">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
-          <span class="path" x-text="contextInfo.archive_root || '—'"></span>
+          <span class="path" x-text="contextInfo.workspace_root || '—'"></span>
           <!-- Root-level quick actions. Same doNewFile/doNewDir the per-dir
                "+" and ctx menu use — both already handle path:'' (root), so
                these are pure entry points, no new write paths. @click.stop
@@ -1024,13 +1024,13 @@
           <span x-text="t('pane.chat')"></span>
         </span>
         <span class="spacer"></span>
-        <!-- CLAUDE.md status chip — only shown when MISSING (intake creates it
+        <!-- AGENTS.md status chip — only shown when MISSING (intake creates it
              by default, so the "present" state is implicit). When missing,
              clicking opens a help dialog with how-to-fix instructions. -->
         <span class="ctx-chip warn"
-              x-show="contextInfo._fetched && !contextInfo.claude_md_exists"
-              :title="claudeMdChipTitle()"
-              @click="openClaudeMdHelp()">
+              x-show="contextInfo._fetched && !contextInfo.instructions_exists"
+              :title="agentsChipTitle()"
+              @click="openAgentsHelp()">
           <svg class="ctx-chip-icon"><use href="#i-alert-triangle"/></svg>
           <span x-text="lang==='zh' ? '未配档案' : 'no archive'"></span>
         </span>
@@ -1056,7 +1056,7 @@
         </button>
 
         <!-- Set up / refresh profile — opens a dedicated chat session
-             where Muse walks the user through CLAUDE.md interactively,
+             where Muse walks the user through AGENTS.md interactively,
              one or two questions at a time, Edit-ing the file as
              answers come in. Distinct from the ctx-chip warning: the
              chip flags the missing state, this button is the
@@ -1064,16 +1064,16 @@
              entry point.
 
              Deliberately NOT a "raw edit" button — direct editing of
-             CLAUDE.md works (it's just a file) but is a worse UX:
+             AGENTS.md works (it's just a file) but is a worse UX:
              nobody wants to stare at a 9-section form. -->
         <!-- 2026-05-23: 「设置档案」按钮已并入「整理档案」。整理档案 workflow
-             现在同时覆盖 archive 整理 + CLAUDE.md profile 补全（curator prompt
+             现在同时覆盖 archive 整理 + AGENTS.md profile 补全（curator prompt
              第 3 步 3b 节）。两个按钮职责重合 + 移动端 toolbar 拥挤，合并为一。
              历史 startProfileIntake / /sessions/profile-intake 端点保留做向后
              兼容，外部 API 调用不会断；但 UI 不再暴露独立入口。-->
         <!-- Organize archive — creates a curator-mode session that walks
              Muse through scan → suggest → confirm-per-item → execute,
-             AND walks the user through any blank CLAUDE.md profile
+             AND walks the user through any blank AGENTS.md profile
              sections conversationally. Sits next to the scheduled-tasks
              bell because both are "agent-driven background work" entry
              points. -->
@@ -1140,15 +1140,15 @@
         <button @click="openSettings()" class="icon-btn" :title="t('btn.settings')"><svg><use href="#i-settings"/></svg></button>
       </header>
 
-      <!-- Context breakdown popup — shows SDK get_context_usage() output
+      <!-- Context breakdown popup — shows app-server token usage
            with per-category token counts so the user can see which slice
-           (system prompt / tools / memory / messages / mcp) is dominating. -->
+           (input / cache / output / reasoning) is dominating. -->
       <div x-show="ctxBreakdown.show"
            @click.outside="ctxBreakdown.show = false"
            x-transition.opacity
            class="ctx-breakdown-pop">
         <div class="ctx-breakdown-head">
-          <span x-text="lang==='zh' ? 'Context 拆分（SDK 真值）' : 'Context breakdown'"></span>
+          <span x-text="lang==='zh' ? 'Context 拆分（Codex 真值）' : 'Context breakdown'"></span>
           <button class="icon-btn sm"
                   :title="lang==='zh' ? '关闭' : 'Close'"
                   @click="ctxBreakdown.show = false">×</button>
@@ -1200,12 +1200,12 @@
               </template>
             </template>
             <div class="ctx-breakdown-hint"
-                 x-text="lang==='zh' ? '说明：tools / system prompt 是 Claude Code CLI 内置；memoryFiles 是 CLAUDE.md union；messages 含所有历史 + tool_result' : 'Note: tools / system_prompt are CLI built-in; memoryFiles is CLAUDE.md union; messages include full history + tool results'"></div>
+                 x-text="lang==='zh' ? '数据来自 Codex app-server 的原生 token usage；Codex 当前不单独公开 system prompt 与工具定义的 token 明细。' : 'Data comes from native Codex app-server token usage; Codex does not currently expose separate token counts for the system prompt and tool definitions.'"></div>
           </div>
         </template>
       </div>
 
-      <!-- Tab strip — like VS Code Claude. Each tab is an open session;
+      <!-- Editor-style tab strip. Each tab is an open session;
            click switches, double-click renames inline, right-click opens
            the context menu (rename / edit prompt / close / delete).
            The picker on the right is the "history" entry point: clicking a
@@ -1392,7 +1392,8 @@
                strip (middle) + new (right)". Removed current-session chip
                (redundant once strip is visible) and outline button (moved
                to chat-pane FAB that aligns with .jump-bottom). -->
-          <button class="chat-tab-new" @click="newSession()"
+          <button class="chat-tab-new" @click="newSession()" :disabled="_creatingSession"
+                  :aria-busy="_creatingSession"
                   :title="t('btn.new_session')">+</button>
         </div>
       </div>
@@ -1448,21 +1449,11 @@
               · <span x-text="t('chat.runs_on')"></span> <span x-text="currentModelLabel()"></span>
             </div>
 
-            <!-- Provider warn — first-priority blocker. Stays visible until
-                 the user enables at least one provider in Settings. -->
-            <template x-if="contextInfo._fetched && !contextInfo.has_any_provider">
-              <div class="onboard-card warn">
-                <div class="onboard-card-title" x-text="t('onboard.no_provider_title')"></div>
-                <div class="onboard-card-body" x-text="t('onboard.no_provider_body')"></div>
-                <button class="btn-primary" @click="openSettings()" x-text="t('onboard.no_provider_cta')"></button>
-              </div>
-            </template>
-
             <!-- ★ Muse opener — UI-only first bubble, state-aware (see
                  museOpener() in app.js). Doesn't go into session history,
                  doesn't cost tokens. Hides the moment the user starts
                  typing so it never competes with their own first message. -->
-            <template x-if="contextInfo._fetched && contextInfo.has_any_provider && museOpener() && !input">
+            <template x-if="contextInfo._fetched && museOpener() && !input">
               <div class="muse-opener" x-transition.opacity.duration.300ms>
                 <span class="muse-mascot sm">
                   <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
@@ -1481,7 +1472,7 @@
                  when the user has a profile but no docs yet. Distinct from
                  the Muse opener (which is conversational); these are a
                  visual map of "where to drop your stuff". -->
-            <template x-if="contextInfo.has_any_provider && contextInfo.claude_md_meaningfully_filled && contextInfo.archive_empty">
+            <template x-if="contextInfo.has_any_provider && contextInfo.instructions_meaningfully_filled && contextInfo.archive_empty">
               <div class="onboard-card calm onboard-subdirs-card">
                 <div class="onboard-card-body" x-text="t('onboard.empty_archive_body')"></div>
                 <div class="onboard-subdirs">
@@ -1582,19 +1573,13 @@
                to hide the avatar on all but the FIRST assistant-side
                msg in a run — visually the same "one avatar per turn"
                result without a derived data structure. -->
-          <!-- P1 (chat-perf-redesign): per-tab DOM persistence. One message
-               list is rendered per OPEN tab; switching toggles x-show instead
-               of swapping the array backing a single x-for (which forced a
-               full Alpine teardown+rebuild of the whole subtree on every
-               switch). The single message template below is UNCHANGED — it's
-               just wrapped in a per-tab pane and bound to paneMessages(tid).
-               For the visible pane paneMessages(currentId) === this.messages
-               by identity, so every `messages`-reading binding inside stays
-               correct; hidden panes are display:none so their (stale)
-               result is never seen. -->
-          <template x-for="tid in residentPaneIds()" :key="tid">
-          <div class="msg-pane" x-show="tid === currentId">
-          <template x-for="(m, i) in paneMessages(tid)" :key="m._k || m.uuid || ('m-' + i)">
+          <!-- Render only the active conversation. The former nested
+               residentPaneIds → paneMessages x-for kept multiple hidden
+               message trees alive, but concurrent history/queue updates
+               corrupted Alpine's keyed lookup and stopped the render before
+               tool/code-edit cards. The initial window is already bounded,
+               so one flat keyed list is both faster and reliable. -->
+          <template x-for="(m, i) in messages" :key="m._k || m.uuid || ('m-' + i)">
             <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
                  :data-uuid="m.uuid || ''"
                  :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
@@ -1830,6 +1815,10 @@
                       <summary x-text="t('subagent.prompt_toggle')"></summary>
                       <pre x-text="m.task && m.task.prompt"></pre>
                     </details>
+                    <a class="subagent-task-open" href="#"
+                       x-show="m.task && m.task.thread_id"
+                       @click.prevent="openCollabThread(m.task && m.task.thread_id)"
+                       x-text="lang === 'zh' ? '打开子 agent 会话' : 'Open subagent thread'"></a>
                     <!-- SDK-native background-task status (run_in_background=
                          true). The task_started/progress/notification SSE
                          handlers stamp m.task_status via tool_use_id. Renders
@@ -1937,6 +1926,20 @@
                     <template x-if="!toolFilePath(m) && !(m.name && m.name.startsWith('mcp__'))">
                       <span class="tool-arg" x-text="m.summary"></span>
                     </template>
+                    <!-- Persisted Codex transcripts include the exact tool
+                         input (shell orchestration / apply_patch source).
+                         Keep it collapsed by default so history stays
+                         scannable while code edits remain inspectable after
+                         refresh instead of disappearing entirely. -->
+                    <details class="tool-input-details"
+                             x-show="hasToolInput(m)"
+                             x-data="{ inputOpen: false }"
+                             @toggle="inputOpen = $el.open">
+                      <summary x-text="lang==='zh' ? '查看调用内容' : 'Show input'"></summary>
+                      <template x-if="inputOpen">
+                        <pre x-text="toolInputText(m)"></pre>
+                      </template>
+                    </details>
                     <!-- SDK-native background-task status for non-subagent
                          tools (Bash run_in_background=true). Same task_status
                          contract as the subagent card: task_started/progress/
@@ -2187,23 +2190,20 @@
                   <div class="ask-question">
                     <div class="ask-header">
                       <span class="ask-title" x-text="t('ask.title')"></span>
+                      <span x-show="m.server" class="ask-server" x-text="m.server"></span>
                       <span x-show="m.submitted" class="ask-submitted-tag" x-text="t('ask.submitted')"></span>
                     </div>
-                    <template x-for="(q, qIdx) in (m.questions || [])" :key="qIdx">
+                    <div x-show="m.prompt" class="ask-prompt" x-text="m.prompt"></div>
+                    <template x-for="(q, qIdx) in (m.questions || [])" :key="q.id || qIdx">
                       <div class="ask-question-block">
                         <div class="ask-question-head">
                           <span x-show="q.header" class="ask-question-chip" x-text="q.header"></span>
                           <span class="ask-question-text" x-text="q.question"></span>
                           <span x-show="q.multiSelect" class="ask-multi-tag" x-text="t('ask.multi')"></span>
                         </div>
-                        <!-- Render normalized options. The label is computed
-                             via askOptionLabel() instead of `opt.label` directly
-                             so an old backend (pre-normalize) that forwarded
-                             raw model output as `["a","b"]` / `[{text:"a"}]`
-                             still produces clickable buttons. New backends
-                             normalize this in ask_user_question.py — this is
-                             belt+suspenders for "user is running new frontend
-                             against old backend" scenarios. -->
+                        <!-- App-server emits `{label, description}` options.
+                             The helper also keeps inherited transcript cards
+                             usable while the old runtime is being removed. -->
                         <div class="ask-options">
                           <!-- role="button" instead of <button> tag because
                                the option may contain a markdown <div> preview;
@@ -2220,11 +2220,11 @@
                                  role="button"
                                  :tabindex="m.submitted ? -1 : 0"
                                  :aria-disabled="m.submitted"
-                                 :aria-pressed="isAskOptionPicked(m, qIdx, askOptionLabel(opt))"
-                                 :class="{ picked: isAskOptionPicked(m, qIdx, askOptionLabel(opt)), disabled: m.submitted, 'has-preview': !!(opt && opt.preview) }"
-                                 @click="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt)))"
-                                 @keydown.enter.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt)))"
-                                 @keydown.space.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionLabel(opt)) : pickAskOption(m, qIdx, askOptionLabel(opt)))">
+                                 :aria-pressed="isAskOptionPicked(m, qIdx, askOptionValue(opt))"
+                                 :class="{ picked: isAskOptionPicked(m, qIdx, askOptionValue(opt)), disabled: m.submitted, 'has-preview': !!(opt && opt.preview) }"
+                                 @click="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt)))"
+                                 @keydown.enter.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt)))"
+                                 @keydown.space.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt)))">
                               <div class="ask-option-label" x-text="askOptionLabel(opt)"></div>
                               <div x-show="askOptionDesc(opt)" class="ask-option-desc" x-text="askOptionDesc(opt)"></div>
                               <!-- Optional preview (markdown / mockup / code).
@@ -2238,42 +2238,43 @@
                             </div>
                           </template>
                         </div>
-                      </div>
-                    </template>
-                    <div x-show="(m.questions || []).some(q => q.multiSelect) && !m.submitted && !m.askOtherOpen" class="ask-submit-row">
-                      <button class="btn-primary" @click="submitAskAnswers(m)" x-text="t('ask.submit')"></button>
-                    </div>
-                    <!-- Free-text fallback. The MCP tool only lets the model
-                         offer 2-4 fixed options; sometimes none fit and the
-                         user wants to say something else. Claude Code's
-                         AskUserQuestion has an implicit "Other" for the same
-                         reason — without it the question is a forced choice
-                         and the user has to either pick a wrong-ish option
-                         or wait 10 min for the 600 s timeout to bail. Click
-                         "其他" → inline textarea → submit routes the text
-                         through /api/chat/answer the same way the buttons do,
-                         so the model sees it as a normal tool result. -->
-                    <div class="ask-other-section" x-show="!m.submitted">
-                      <button x-show="!m.askOtherOpen"
-                              class="ask-other-toggle"
-                              @click="openAskOther(m)"
-                              x-text="lang==='zh' ? '其他（自由输入）' : 'Other (custom answer)'"></button>
-                      <div x-show="m.askOtherOpen" class="ask-other-form">
-                        <textarea x-model="m.askOtherText"
-                                  class="ask-other-textarea"
-                                  rows="3"
-                                  :placeholder="lang==='zh' ? '直接写你的回复…' : 'Type your reply…'"
-                                  @keydown.escape.stop="cancelAskOther(m)"
-                                  @keydown.meta.enter.prevent="submitAskOther(m)"
-                                  @keydown.ctrl.enter.prevent="submitAskOther(m)"></textarea>
-                        <div class="ask-other-actions">
-                          <button class="ask-other-cancel" @click="cancelAskOther(m)"
-                                  x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
-                          <button class="btn-primary" @click="submitAskOther(m)"
-                                  :disabled="!(m.askOtherText || '').trim()"
-                                  x-text="lang==='zh' ? '提交' : 'Submit'"></button>
+                        <div class="ask-other-section" x-show="!m.submitted">
+                          <button x-show="!m.askOtherOpen[askQuestionKey(q)]"
+                                  class="ask-other-toggle"
+                                  @click="openAskOther(m, q)"
+                                  x-text="t('ask.other')"></button>
+                          <div x-show="m.askOtherOpen[askQuestionKey(q)]" class="ask-other-form">
+                            <input x-show="q.isSecret"
+                                   x-model="m.askOtherText[askQuestionKey(q)]"
+                                   type="password"
+                                   autocomplete="off"
+                                   class="ask-other-textarea"
+                                   :placeholder="t('ask.placeholder')"
+                                   @keydown.escape.stop="cancelAskOther(m, q)"
+                                   @keydown.enter.prevent="submitAskOther(m, q)">
+                            <textarea x-show="!q.isSecret"
+                                      x-model="m.askOtherText[askQuestionKey(q)]"
+                                      class="ask-other-textarea"
+                                      rows="3"
+                                      :placeholder="t('ask.placeholder')"
+                                      @keydown.escape.stop="cancelAskOther(m, q)"
+                                      @keydown.meta.enter.prevent="submitAskOther(m, q)"
+                                      @keydown.ctrl.enter.prevent="submitAskOther(m, q)"></textarea>
+                            <div class="ask-other-actions">
+                              <button x-show="(q.options || []).length"
+                                      class="ask-other-cancel"
+                                      @click="cancelAskOther(m, q)"
+                                      x-text="t('ask.cancel')"></button>
+                              <button class="btn-primary" @click="submitAskOther(m, q)"
+                                      :disabled="!(m.askOtherText[askQuestionKey(q)] || '').trim()"
+                                      x-text="t('ask.submit')"></button>
+                            </div>
+                          </div>
                         </div>
                       </div>
+                    </template>
+                    <div x-show="((m.questions || []).some(q => q.multiSelect) || m.kind === 'mcp_form') && !m.submitted" class="ask-submit-row">
+                      <button class="btn-primary" @click="submitAskAnswers(m)" x-text="t('ask.submit')"></button>
                     </div>
                   </div>
                 </div>
@@ -2295,8 +2296,7 @@
                          icon) was hero-treatment overkill — especially in
                          bypass mode where the card lands in the stream
                          already resolved and the user doesn't need a big
-                         decision prompt. See plan
-                         ~/.claude/plans/permission-claude-smooth-codd.md. -->
+                         decision prompt. -->
                     <div class="perm-body">
                       <div class="perm-tool">
                         <span class="perm-tool-name" x-text="m.tool"></span>
@@ -2305,11 +2305,15 @@
                               x-text="t('perm.decision_' + m.decision)"></span>
                       </div>
                       <pre class="perm-summary" x-text="m.summary"></pre>
+                      <a x-show="m.kind === 'mcp_url' && m.url" :href="m.url"
+                         target="_blank" rel="noopener noreferrer" class="perm-url"
+                         x-text="m.url"></a>
                     </div>
                     <div class="perm-actions" x-show="!m.resolved">
                       <button class="btn-deny" @click="decidePermission(m, 'deny')" x-text="t('perm.deny')"></button>
                       <button class="btn-allow" @click="decidePermission(m, 'allow')" x-text="t('perm.allow')"></button>
-                      <button class="btn-always" @click="decidePermission(m, 'always')" x-text="t('perm.always')"></button>
+                      <button class="btn-always" x-show="m.kind !== 'mcp_url'"
+                              @click="decidePermission(m, 'always')" x-text="t('perm.always')"></button>
                     </div>
                   </div>
                 </div>
@@ -2363,12 +2367,6 @@
               </div>
             </div>
           </template>
-          </div>
-          </template>
-          <!-- /P1 per-tab message panes. Siblings below (pending bubble,
-               pending queue, banners) stay single-instance with active-tab
-               semantics — they read currentId / this.messages / streaming,
-               which already track the active tab. -->
           <!-- Pending "Muse 正在思考" bubble — only while we're waiting for
                the very first chunk. Once a streaming assistant message has
                started accumulating text (its bubble is already rendered
@@ -2642,7 +2640,7 @@
             </div>
           </template>
         </div>
-        <!-- VSCode-Claude–style layout:
+        <!-- Editor-style layout:
              row 1: textarea (full width, no neighbors)
              row 2: bottom toolbar with all controls — attach / model /
                     permission / thinking / ctx chip / send -->
@@ -2657,27 +2655,19 @@
                a clear toast instead of being hidden in the picker. -->
           <input type="file" x-ref="attachInput"
                  multiple style="display:none" @change="onAttachPicked($event)" />
-          <!-- No-provider gate banner: when no model is configured the
-               composer below is disabled (every send would 401 + lock the
-               session to an unreachable model). Point the user at Settings
-               so a provider is configured before any turn can fire. -->
-          <!-- Two distinct empty states, same `!availableModels.length` gate:
-               · has_any_provider=false → genuinely nothing configured.
-               · has_any_provider=true  → a provider IS configured (e.g. a
-                 third-party key) but no model is ready yet — credentials
-                 incomplete or still validating. The old single copy ("配置一个
-                 provider") misled users who *had* configured one (2026-06-06).
-               No "switch model" CTA here: availableModels is empty, so there's
-               nothing to switch to — the fix is to check credentials. -->
           <div class="chat-input-noprov" x-show="!availableModels.length" x-cloak>
-            <span x-text="(contextInfo && contextInfo.has_any_provider)
-                            ? (lang==='zh'
-                                ? '已配置 provider，但当前没有可用模型 —— 凭证可能未填全或仍在校验，打开设置检查一下'
-                                : 'A provider is configured, but no model is ready yet — credentials may be incomplete or still validating. Open Settings to check.')
-                            : (lang==='zh'
-                                ? '还没有可用模型 —— 先配置一个 provider 才能开始对话'
-                                : 'No model available — configure a provider to start chatting')"></span>
-            <button class="btn-primary" @click="openSettings()"
+            <span x-show="modelsLoading"
+                  x-text="lang==='zh'
+                            ? '正在连接 Codex 并读取可用模型…'
+                            : 'Connecting to Codex and loading available models…'"></span>
+            <span x-show="!modelsLoading"
+                  x-text="lang==='zh'
+                            ? '未能读取可用模型。确认已执行 codex login，然后重试。'
+                            : 'Could not load available models. Confirm codex login, then retry.'"></span>
+            <button class="btn-primary" x-show="!modelsLoading"
+                    @click="_fetchModels({ retries: 2 })"
+                    x-text="lang==='zh' ? '重试' : 'Retry'"></button>
+            <button class="btn-ghost" x-show="!modelsLoading" @click="openSettings()"
                     x-text="lang==='zh' ? '打开设置' : 'Open Settings'"></button>
           </div>
           <!-- 包一个 noop form：iOS 17+ AutoFill 会用"页面上下文"决定要不要在
@@ -2744,21 +2734,13 @@
             <!-- Permission mode -->
             <select x-model="permission" class="chat-toolbar-select chat-toolbar-permission"
                     :title="t('set.label.default_permission')">
-              <option value="bypassPermissions">bypass</option>
-              <option value="acceptEdits">acceptEdits</option>
-              <option value="default">default</option>
-              <option value="plan">plan</option>
+              <option value="default" x-text="lang==='zh' ? '按需询问' : 'Ask as needed'"></option>
+              <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
+              <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
             </select>
-            <!-- Reasoning effort. Empty = SDK adaptive default (Opus 4.7's
-                 adaptive thinking picks per turn). Overrides apply session-
-                 wide and trigger a client rebuild on next turn.
-
-                 Options visibility tracks current model/provider metadata:
-                 Claude models always show it; non-Claude providers show it
-                 only when /api/chat/providers marks supports_effort=true
-                 (currently Codex Gateway). xhigh remains Opus-only — SDK
-                 falls back to high elsewhere, so we hide rather than mislead.
-                 See _supportsEffort / _effortAllowed in app.js. -->
+            <!-- Reasoning effort is discovered from Codex model/list. Empty
+                 means the model catalog's native default; explicit values are
+                 sent as turn/start.effort and persist for later turns. -->
             <select x-model="effort" @change="onEffortChange()"
                     x-show="_supportsEffort(model)"
                     class="chat-toolbar-select chat-toolbar-effort"
@@ -2788,10 +2770,9 @@
                 <label class="chat-toolbar-more-field">
                   <span x-text="t('set.label.default_permission')"></span>
                   <select x-model="permission">
-                    <option value="bypassPermissions">bypass</option>
-                    <option value="acceptEdits">acceptEdits</option>
-                    <option value="default">default</option>
-                    <option value="plan">plan</option>
+                    <option value="default" x-text="lang==='zh' ? '按需询问' : 'Ask as needed'"></option>
+                    <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
+                    <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
                   </select>
                 </label>
                 <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
@@ -2813,11 +2794,9 @@
                  (provider-level supports_thinking from /api/chat/providers) —
                  hidden only for vendors that reject it (e.g. Qianfan), where
                  the switch would be a no-op. -->
-            <!-- HIDDEN 2026-05-31: the bundled CLI (2.1.150, what the SDK
-                 actually runs — NOT the system claude on PATH) doesn't honor
-                 `--thinking disabled` on current-gen models — Opus 4.7+ and
-                 DeepSeek reason adaptively regardless — so the toggle had no
-                 visible effect. Backend plumbing + JS left intact; flip
+            <!-- Hidden because the runtime does not consistently honor a
+                 disabled thinking mode across current models. Backend plumbing
+                 and JS remain intact; flip
                  x-show back to `_supportsThinking(model)` to restore once the
                  CLI/model actually supports turning thinking off. -->
             <label class="chat-toolbar-think"
@@ -2848,9 +2827,8 @@
                         transform="rotate(-90 10 10)"/>
               </svg>
             </button>
-            <!-- Subscription quota badge. Claude uses SDK rate_limit events.
-                 Codex Gateway has no authoritative provider quota feed here,
-                 so it is hidden like other third-party / API-key providers. -->
+            <!-- Subscription quota badge is shown only when native account
+                 usage is available; API-key providers remain hidden. -->
             <span class="chat-toolbar-rl"
                   x-show="currentQuotaBadge()"
                   :class="{ warn: currentQuotaBadge() && currentQuotaBadge().warn && !currentQuotaBadge().crit,
@@ -2937,7 +2915,8 @@
                 :title="lang==='zh' ? '关闭 (Esc)' : 'Close (Esc)'">×</button>
       </div>
       <ul class="msg-outline-list">
-        <template x-for="(m, i) in outlineMessages()" :key="m.uuid || m._k || ('o-' + i)">
+        <template x-for="(m, i) in outlineMessages()"
+                  :key="(m.uuid || m._k || 'outline') + '-' + i">
           <li @click="_scrollToUserMsg(m); msgOutlineOpen = false"
               :title="m.text || m.body || ''">
             <span class="msg-outline-idx" x-text="'#' + (i + 1)"></span>
@@ -3207,8 +3186,8 @@
             <span class="settings-menu-title" x-text="t('set.sec.lang')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='provider'"
-              :class="{ active: settings.activePage==='provider' }">
+          <li class="settings-menu-item" x-show="runtimeKind === 'codex'" @click="openSettingsPage('native-providers')"
+              :class="{ active: settings.activePage==='native-providers' }">
             <span class="settings-menu-icon"><svg><use href="#i-key"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.provider')"></span>
             <span class="settings-menu-chevron">›</span>
@@ -3232,19 +3211,19 @@
             <span class="settings-menu-title" x-text="t('set.sec.defaults')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='skills'"
+          <li class="settings-menu-item" @click="openSettingsPage('skills')"
               :class="{ active: settings.activePage==='skills' }">
             <span class="settings-menu-icon"><svg><use href="#i-puzzle"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.skills')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='mcp'"
+          <li class="settings-menu-item" @click="openSettingsPage('mcp')"
               :class="{ active: settings.activePage==='mcp' }">
             <span class="settings-menu-icon"><svg><use href="#i-plug"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.mcp')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" @click="settings.activePage='versions'"
+          <li class="settings-menu-item" @click="openSettingsPage('versions')"
               :class="{ active: settings.activePage==='versions' }">
             <span class="settings-menu-icon"><svg><use href="#i-tool"/></svg></span>
             <span class="settings-menu-title"
@@ -3287,274 +3266,37 @@
           </div>
         </div>
 
-        <div class="settings-section" data-page="provider"
-             x-show="settings.activePage === 'provider'">
+        <div class="settings-section" data-page="native-providers"
+             x-show="runtimeKind === 'codex' && settings.activePage === 'native-providers'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.provider')"></span>
-            <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
+            <span class="settings-save-mode live" x-text="lang==='zh' ? '即时生效' : 'Live'"></span>
           </div>
-
-          <!-- Claude Auth — first-class OAuth provider, no API key field.
-               Distinct UX from the generic provider rows: shows identity
-               (email/plan/expiry) when connected, Connect button when not. -->
-          <div class="claude-auth-card">
-            <div class="claude-auth-head">
-              <div class="claude-auth-title-wrap">
-                <div class="claude-auth-title" x-text="t('claude_auth.title')"></div>
-                <div class="claude-auth-subtitle" x-text="t('claude_auth.subtitle')"></div>
+          <div class="settings-hint"
+               x-text="lang==='zh' ? '这些模型直接使用 Codex 原生 model_providers 配置。启用前请在 Codex 环境变量中提供对应 API Key；密钥不会经过网页。' : 'These models use Codex-native model_providers configuration. Set the matching API key in the Codex environment before enabling; keys never pass through this page.'"></div>
+          <template x-for="provider in settings.nativeProviders" :key="provider.id">
+            <div class="settings-row provider-row">
+              <div>
+                <label>
+                  <span x-text="provider.name"></span>
+                  <code style="margin-left:6px" x-text="provider.env_key"></code>
+                </label>
+                <div class="settings-hint" style="margin:5px 0 0"
+                     x-text="(provider.models || []).map(m => m.label + ' · ' + m.id).join('，')"></div>
+                <div class="settings-hint" style="margin:5px 0 0;color:var(--fg-soft)"
+                     x-text="provider.web_search ? (lang==='zh' ? '已验证 Web 搜索可用' : 'Web search verified') : (lang==='zh' ? '为兼容性，Web 搜索在此提供方中已关闭。' : 'Web search is disabled for compatibility on this provider.')"></div>
               </div>
-              <!-- In-flight: backend hasn't responded yet. Without this,
-                   the head row stays empty during the fetch and visually
-                   matches "未连接" — users assume the worst. -->
-              <span x-show="!claudeAuth.loaded" class="settings-badge"
-                    x-text="lang==='zh' ? '检测中…' : 'Checking…'"></span>
-              <span x-show="claudeAuth.logged_in" class="settings-badge ok"
-                    x-text="t('claude_auth.status_connected')"></span>
-              <span x-show="claudeAuth.loaded && !claudeAuth.logged_in" class="settings-badge"
-                    x-text="t('claude_auth.status_disconnected')"></span>
-            </div>
-
-            <!-- Connected: identity panel + action buttons -->
-            <div x-show="claudeAuth.logged_in" class="claude-auth-connected">
-              <div class="claude-auth-field">
-                <span class="claude-auth-label" x-text="t('claude_auth.email_label')"></span>
-                <span class="claude-auth-value" x-text="claudeAuth.email || '—'"></span>
+              <div class="settings-input-wrap">
+                <label class="switch sm">
+                  <input type="checkbox" :checked="provider.enabled"
+                         @change="setNativeProvider(provider, $event.target.checked)">
+                  <span class="switch-slider"></span>
+                </label>
+                <span class="settings-badge" :class="{ok: provider.enabled}"
+                      x-text="provider.enabled ? (lang==='zh' ? '已启用' : 'Enabled') : (lang==='zh' ? '未启用' : 'Disabled')"></span>
               </div>
-              <div class="claude-auth-field">
-                <span class="claude-auth-label" x-text="t('claude_auth.plan_label')"></span>
-                <span class="claude-auth-value" x-text="claudeAuthPlanLabel()"></span>
-              </div>
-              <div class="claude-auth-field">
-                <span class="claude-auth-label" x-text="t('claude_auth.expires_label')"></span>
-                <span class="claude-auth-value" x-text="claudeAuthExpiresHuman()"></span>
-              </div>
-              <div class="claude-auth-actions">
-                <button class="btn-ghost sm" @click="reauthClaude()"
-                        x-text="t('claude_auth.reauth_btn')"></button>
-                <button class="btn-ghost sm danger" @click="disconnectClaudeAuth()"
-                        x-text="t('claude_auth.disconnect_btn')"></button>
-              </div>
-            </div>
-
-            <!-- Not connected: Connect button + CLI install hint if missing -->
-            <div x-show="claudeAuth.loaded && !claudeAuth.logged_in" class="claude-auth-disconnected">
-              <div x-show="!claudeAuth.cli_installed" class="claude-auth-cli-warn">
-                <span x-text="t('claude_auth.cli_missing')"></span>
-                <code x-text="t('claude_auth.cli_install_cmd')"></code>
-              </div>
-              <!-- Surface `reason` so the user can self-debug a wrong
-                   "未连接" verdict (e.g. cli-timeout, not-logged-in,
-                   cli-bad-json, token-expired). Hidden when reason is null.
-                   `token-expired` gets a friendly amber treatment because
-                   it's the common "session went stale" case, not an error. -->
-              <div x-show="claudeAuth.reason"
-                   :class="claudeAuth.reason === 'token-expired' ? 'claude-auth-reason expired' : 'claude-auth-reason'"
-                   :style="claudeAuth.reason === 'token-expired'
-                           ? 'font-size:13px;color:#b45309;background:#fffbeb;border:1px solid #fde68a;border-radius:6px;padding:8px 10px;'
-                           : 'font-size:12px;color:var(--fg-soft,#6b7280);'">
-                <template x-if="claudeAuth.reason === 'token-expired'">
-                  <span x-text="lang==='zh' ? '登录已过期，请重新连接。' : 'Session expired — please reconnect.'"></span>
-                </template>
-                <template x-if="claudeAuth.reason !== 'token-expired'">
-                  <span>
-                    <span x-text="lang==='zh' ? '探测原因：' : 'Probe reason: '"></span>
-                    <code x-text="claudeAuth.reason"></code>
-                  </span>
-                </template>
-              </div>
-              <div class="claude-auth-actions" style="border-top:none;padding-top:0;">
-                <button class="btn-primary" @click="openClaudeAuthModal()"
-                        x-text="t('claude_auth.connect_btn')"></button>
-                <button class="btn-ghost sm" @click="loadClaudeAuthStatus()"
-                        x-text="lang==='zh' ? '重新检测' : 'Recheck'"></button>
-              </div>
-            </div>
-          </div>
-
-          <div class="settings-hint" x-text="lang==='zh' ? '填入新值并保存即可生效；留空表示不修改。' : 'Enter new value and save to apply; leave blank to keep existing.'"></div>
-          <template x-for="(p, idx) in settings.providers" :key="p.id || idx">
-            <div class="settings-row provider-row" x-data="{ editing: false }">
-
-              <!-- ===== Anthropic / non-editable: simple api-key row ===== -->
-              <template x-if="!p.editable">
-                <div>
-                  <label x-text="localizeProviderDisplay(p.display) + ' (' + p.env_key + ')'"></label>
-                  <div class="settings-input-wrap">
-                    <input x-show="!p.configured || editing"
-                           type="password" class="settings-input"
-                           :placeholder="editing ? t('set.key_edit_placeholder') : t('set.placeholder_key')"
-                           x-model="settings.draftKeys[p.env_key]" />
-                    <span x-show="p.configured && !editing" class="settings-badge ok" x-text="t('set.key_set')"></span>
-                    <button x-show="!p.configured || editing" class="btn-primary sm"
-                            :disabled="!(settings.draftKeys[p.env_key] || '').trim()"
-                            @click="(async () => { if (await saveProviderKey(p.env_key)) editing = false })()"
-                            x-text="t('btn.save')"></button>
-                    <button x-show="p.configured && editing" class="btn-ghost sm"
-                            @click="editing = false; settings.draftKeys[p.env_key] = ''"
-                            x-text="t('set.key_cancel')"></button>
-                    <button x-show="p.configured && !editing" class="btn-ghost sm"
-                            @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
-                            x-text="t('set.probe')"></button>
-                    <button x-show="p.configured && !editing" class="btn-ghost sm"
-                            @click="editing = true"
-                            x-text="t('set.key_edit')"></button>
-                  </div>
-                  <div x-show="PROVIDER_HELP[p.env_key]" class="provider-help">
-                    <span x-text="PROVIDER_HELP[p.env_key]?.[lang]"></span>
-                    <a x-show="PROVIDER_HELP[p.env_key]?.url"
-                       :href="PROVIDER_HELP[p.env_key]?.url"
-                       target="_blank" rel="noopener"
-                       x-text="PROVIDER_HELP[p.env_key]?.url?.startsWith('docs/')
-                         ? (lang==='zh' ? '打开文档 ↗' : 'Open docs ↗')
-                         : (lang==='zh' ? '打开控制台 ↗' : 'Open console ↗')"></a>
-                  </div>
-                  <div x-show="settings.probeResults[p.probe_model]"
-                       class="probe-result"
-                       :class="{ ok: settings.probeResults[p.probe_model]?.ok,
-                                  err: !settings.probeResults[p.probe_model]?.ok }">
-                    <svg class="probe-result-icon ok" x-show="settings.probeResults[p.probe_model]?.ok"><use href="#i-check-circle"/></svg>
-                    <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
-                    <span x-text="settings.probeResults[p.probe_model]?.text"></span>
-                  </div>
-
-                  <!-- Claude model list — the one editable knob on the
-                       otherwise special-auth Anthropic row. Auth (above)
-                       stays OAuth/key; this just curates the picker list. -->
-                  <label x-show="p.models_editable" style="grid-column:1;align-self:center"
-                         x-text="lang==='zh' ? 'Claude 模型' : 'Claude models'"></label>
-                  <div x-show="p.models_editable" class="settings-input-wrap" style="grid-column:2;margin-top:0">
-                    <button class="btn-ghost sm" @click="toggleAnthropicModels(p)"
-                            x-text="settings.providerDrafts[p.id]?.open ? t('btn.cancel') : (lang==='zh' ? '编辑模型列表' : 'Edit models')"></button>
-                    <span x-show="p.is_overridden" class="provider-meta-tag edited"
-                          x-text="lang==='zh' ? '已改' : 'edited'"></span>
-                  </div>
-                  <div x-show="p.models_editable && settings.providerDrafts[p.id]?.open" class="provider-editor">
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.models')"></label>
-                      <textarea class="settings-input mono" rows="4"
-                                x-model="settings.providerDrafts[p.id].models"
-                                :placeholder="t('set.prov.models_ph')"></textarea>
-                    </div>
-                    <div class="settings-hint"
-                         x-text="lang==='zh' ? '每行一个 Claude 模型 id（如 claude-opus-4-8）。认证沿用上方的 OAuth / API key，端点固定为 Anthropic。' : 'One Claude model id per line (e.g. claude-opus-4-8). Auth uses the OAuth / API key above; endpoint is fixed to Anthropic.'"></div>
-                    <div class="settings-row provider-editor-actions">
-                      <button class="btn-primary sm" @click="saveAnthropicModels(p)" x-text="t('btn.save')"></button>
-                      <button class="btn-ghost sm" @click="toggleAnthropicModels(p)" x-text="t('btn.cancel')"></button>
-                      <button x-show="p.is_overridden" class="btn-ghost sm"
-                              @click="restoreProvider(p)" x-text="t('set.prov.restore')"></button>
-                    </div>
-                  </div>
-                </div>
-              </template>
-
-              <!-- ===== Third-party editable provider (full editor) ===== -->
-              <template x-if="p.editable">
-                <div>
-                  <label>
-                    <span x-text="localizeProviderDisplay(p.display)"></span>
-                    <span x-show="p.is_builtin && p.is_overridden" class="provider-meta-tag edited"
-                          x-text="lang==='zh' ? '已改' : 'edited'"></span>
-                    <span x-show="!p.is_builtin" class="provider-meta-tag custom"
-                          x-text="lang==='zh' ? '自定义' : 'custom'"></span>
-                  </label>
-                  <div class="settings-input-wrap">
-                    <label class="switch sm" :title="p.disabled ? (lang==='zh' ? '关掉 → 不出现在模型菜单' : 'Off → hidden from model picker') : (lang==='zh' ? '开启 → 出现在模型菜单' : 'On → shown in model picker')">
-                      <input type="checkbox" :checked="!p.disabled"
-                             @change="toggleProvider(p.id, !$event.target.checked)" />
-                      <span class="switch-slider"></span>
-                    </label>
-                    <span x-show="p.configured" class="settings-badge ok" x-text="t('set.key_set')"></span>
-                    <span x-show="!p.configured" class="settings-badge" x-text="lang==='zh' ? '未配置' : 'No key'"></span>
-                    <button x-show="p.configured" class="btn-ghost sm"
-                            @click="probeProvider(p.env_key, p.probe_model)" :title="t('set.probe_tip')"
-                            x-text="t('set.probe')"></button>
-                    <button class="btn-ghost sm"
-                            @click="toggleProviderEditor(p)"
-                            x-text="settings.providerDrafts[p.id]?.open ? t('btn.cancel') : t('set.key_edit')"></button>
-                  </div>
-
-                  <!-- Expanded editor: endpoint / prefix / models / api-key -->
-                  <div x-show="settings.providerDrafts[p.id]?.open" class="provider-editor">
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.endpoint')"></label>
-                      <input class="settings-input mono" x-model="settings.providerDrafts[p.id].base_url"
-                             :placeholder="t('set.prov.endpoint_ph')" />
-                    </div>
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.prefix')"></label>
-                      <input class="settings-input mono" x-model="settings.providerDrafts[p.id].prefix"
-                             :placeholder="t('set.prov.prefix_ph')" />
-                    </div>
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.models')"></label>
-                      <textarea class="settings-input mono" rows="4"
-                                x-model="settings.providerDrafts[p.id].models"
-                                :placeholder="t('set.prov.models_ph')"></textarea>
-                    </div>
-                    <div class="settings-row">
-                      <label x-text="t('set.prov.apikey')"></label>
-                      <input type="password" class="settings-input"
-                             x-model="settings.providerDrafts[p.id].api_key"
-                             :placeholder="p.configured ? t('set.key_edit_placeholder') : t('set.placeholder_key')" />
-                    </div>
-                    <div class="settings-hint" x-text="t('set.prov.hint')"></div>
-                    <div class="settings-row provider-editor-actions">
-                      <button class="btn-primary sm" @click="saveProvider(p)" x-text="t('btn.save')"></button>
-                      <button class="btn-ghost sm" @click="toggleProviderEditor(p)" x-text="t('btn.cancel')"></button>
-                      <button x-show="p.is_builtin && p.is_overridden" class="btn-ghost sm"
-                              @click="restoreProvider(p)" x-text="t('set.prov.restore')"></button>
-                      <button class="btn-ghost sm danger" @click="deleteProvider(p)"
-                              x-text="p.is_builtin ? t('set.prov.hide') : t('set.prov.delete')"></button>
-                    </div>
-                  </div>
-
-                  <div x-show="settings.probeResults[p.probe_model]"
-                       class="probe-result"
-                       :class="{ ok: settings.probeResults[p.probe_model]?.ok,
-                                  err: !settings.probeResults[p.probe_model]?.ok }">
-                    <svg class="probe-result-icon ok" x-show="settings.probeResults[p.probe_model]?.ok"><use href="#i-check-circle"/></svg>
-                    <svg class="probe-result-icon err" x-show="!settings.probeResults[p.probe_model]?.ok"><use href="#i-alert-circle"/></svg>
-                    <span x-text="settings.probeResults[p.probe_model]?.text"></span>
-                  </div>
-                </div>
-              </template>
-
             </div>
           </template>
-
-          <!-- Add a brand-new provider from scratch -->
-          <div class="settings-row mcp-add-row">
-            <button class="btn-ghost sm" @click="settings.providerNew.show = !settings.providerNew.show"
-                    x-text="settings.providerNew.show ? t('btn.cancel') : t('set.prov.add')"></button>
-          </div>
-          <div x-show="settings.providerNew.show" class="provider-editor">
-            <div class="settings-row">
-              <label x-text="t('set.prov.endpoint')"></label>
-              <input class="settings-input mono" x-model="settings.providerNew.base_url"
-                     :placeholder="t('set.prov.endpoint_ph')" />
-            </div>
-            <div class="settings-row">
-              <label x-text="t('set.prov.prefix')"></label>
-              <input class="settings-input mono" x-model="settings.providerNew.prefix"
-                     :placeholder="t('set.prov.prefix_ph')" />
-            </div>
-            <div class="settings-row">
-              <label x-text="t('set.prov.models')"></label>
-              <textarea class="settings-input mono" rows="4"
-                        x-model="settings.providerNew.models"
-                        :placeholder="t('set.prov.models_ph')"></textarea>
-            </div>
-            <div class="settings-row">
-              <label x-text="t('set.prov.apikey')"></label>
-              <input type="password" class="settings-input"
-                     x-model="settings.providerNew.api_key"
-                     :placeholder="t('set.placeholder_key')" />
-            </div>
-            <div class="settings-hint" x-text="t('set.prov.hint')"></div>
-            <div class="settings-row">
-              <button class="btn-primary sm" @click="addProviderFromDraft()" x-text="t('set.prov.add')"></button>
-            </div>
-          </div>
         </div>
 
         <div class="settings-section" data-page="appearance"
@@ -3587,159 +3329,36 @@
           </div>
         </div>
 
-        <!-- Versions + upgrade — shows current vs latest SDK / CLI, one-click bump. -->
         <div class="settings-section" data-page="versions"
-             x-show="settings.activePage === 'versions'">
+             x-show="settings.activePage === &quot;versions&quot;">
           <div class="settings-section-title">
-            <span x-text="lang==='zh' ? '版本与升级' : 'Versions & upgrade'"></span>
+            <span x-text="lang===&quot;zh&quot; ? &quot;版本&quot; : &quot;Version&quot;"></span>
             <button class="btn-ghost sm" @click="loadVersions()"
                     :disabled="settings.versionsLoading"
-                    x-text="settings.versionsLoading ? (lang==='zh' ? '检查中…' : 'Checking…') : (lang==='zh' ? '检查更新' : 'Check')"></button>
-            <span class="settings-save-mode reload" x-text="t('set.mode.reload')"></span>
+                    x-text="settings.versionsLoading ? (lang===&quot;zh&quot; ? &quot;检查中…&quot; : &quot;Checking…&quot;) : (lang===&quot;zh&quot; ? &quot;刷新&quot; : &quot;Refresh&quot;)"></button>
           </div>
           <template x-if="settings.versions">
-            <div>
-              <table class="version-table">
-                <thead>
-                  <tr>
-                    <th x-text="lang==='zh' ? '组件' : 'Component'"></th>
-                    <th x-text="lang==='zh' ? '已安装' : 'Installed'"></th>
-                    <th x-text="lang==='zh' ? '最新' : 'Latest'"></th>
-                    <th></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr>
-                    <td>claude-agent-sdk</td>
-                    <td><code x-text="settings.versions.current?.sdk || '—'"></code></td>
-                    <td><code x-text="settings.versions.latest?.sdk || '?'"></code></td>
-                    <td>
-                      <span x-show="settings.versions.sdk_upgrade_available" class="upgrade-badge"
-                            x-text="lang==='zh' ? '有更新' : 'update'"></span>
-                      <span x-show="!settings.versions.sdk_upgrade_available && settings.versions.current?.sdk" class="upgrade-badge ok"
-                            x-text="lang==='zh' ? '最新' : 'latest'"></span>
-                      <button x-show="settings.versions.sdk_upgrade_available"
-                              class="btn-ghost xs"
-                              :disabled="settings.upgradeRunning"
-                              @click="runUpgrade('sdk')"
-                              x-text="lang==='zh' ? '升级' : 'Upgrade'"></button>
-                    </td>
-                  </tr>
-                  <tr>
-                    <td>
-                      <span x-text="lang==='zh' ? 'bundled CLI（随 SDK 自动更新）' : 'bundled CLI (auto with SDK)'"></span>
-                    </td>
-                    <td><code x-text="settings.versions.current?.bundled_cli || '—'"></code></td>
-                    <td>—</td>
-                    <td>
-                      <span class="upgrade-badge ok" x-text="lang==='zh' ? '内置' : 'bundled'"></span>
-                    </td>
-                  </tr>
-                  <tr>
-                    <td>
-                      <span x-text="lang==='zh' ? 'system CLI（仅 Pro 登录用）' : 'system CLI (Pro login only)'"></span>
-                    </td>
-                    <td><code x-text="settings.versions.current?.system_cli || (lang==='zh' ? '未安装（可选）' : 'not installed (optional)')"></code></td>
-                    <td><code x-text="settings.versions.latest?.cli || '?'"></code></td>
-                    <td>
-                      <span x-show="settings.versions.system_cli_upgrade_available" class="upgrade-badge"
-                            x-text="lang==='zh' ? '有更新' : 'update'"></span>
-                      <span x-show="!settings.versions.system_cli_upgrade_available && settings.versions.current?.system_cli" class="upgrade-badge ok"
-                            x-text="lang==='zh' ? '最新' : 'latest'"></span>
-                      <span x-show="!settings.versions.current?.system_cli" class="upgrade-badge ok"
-                            x-text="lang==='zh' ? '可不装' : 'optional'"></span>
-                      <button x-show="settings.versions.system_cli_upgrade_available"
-                              class="btn-ghost xs"
-                              :disabled="settings.upgradeRunning"
-                              @click="runUpgrade('cli')"
-                              x-text="lang==='zh' ? '升级' : 'Upgrade'"></button>
-                    </td>
-                  </tr>
-                  <tr>
-                    <td>python</td>
-                    <td><code x-text="settings.versions.current?.python || '—'"></code></td>
-                    <td>—</td>
-                    <td></td>
-                  </tr>
-                </tbody>
-              </table>
-              <div x-show="settings.versions.expected_cli_version && settings.versions.current?.cli &&
-                            settings.versions.expected_cli_version !== settings.versions.current?.cli"
-                   class="settings-hint warn">
-                <svg class="settings-hint-icon"><use href="#i-alert-triangle"/></svg>
-                <span x-text="(lang==='zh' ? 'SDK 期望 CLI 版本 ' : 'SDK expects CLI ') + (settings.versions.expected_cli_version || '?')"></span>
-              </div>
-              <div class="settings-row" style="margin-top: 10px;">
-                <button class="btn-primary sm" @click="runUpgrade()"
-                        :disabled="settings.upgradeRunning ||
-                                    (!settings.versions.sdk_upgrade_available && !settings.versions.system_cli_upgrade_available)"
-                        x-text="settings.upgradeRunning ? (lang==='zh' ? '升级中… (可能需要 30s)' : 'Upgrading… (30s)') : (lang==='zh' ? '一键全部升级' : 'Upgrade all')"></button>
-              </div>
-              <template x-if="settings.upgradeResult">
-                <div class="upgrade-result" :class="{ ok: settings.upgradeResult.ok, err: !settings.upgradeResult.ok }">
-                  <div x-show="settings.upgradeResult.ok" class="upgrade-result-status ok">
-                    <svg class="upgrade-result-icon"><use href="#i-check-circle"/></svg>
-                    <span x-text="lang==='zh' ? '升级完成' : 'Upgrade complete'"></span>
-                  </div>
-                  <div x-show="!settings.upgradeResult.ok" class="upgrade-result-status err">
-                    <svg class="upgrade-result-icon"><use href="#i-alert-circle"/></svg>
-                    <span x-text="lang==='zh' ? '升级失败 — 查看下方步骤' : 'Upgrade failed — see steps below'"></span>
-                  </div>
-                  <div x-show="settings.upgradeResult.needs_restart" class="restart-hint">
-                    <div x-text="lang==='zh' ? '需要重启服务以加载新版 SDK：' : 'Restart service to load new SDK:'"></div>
-                    <div class="restart-actions">
-                      <button class="btn-ghost sm"
-                              :disabled="settings.restarting"
-                              @click="restartService()"
-                              x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '一键重启' : 'Restart now')">
-                      </button>
-                      <span class="settings-hint" style="margin-left:8px"
-                            x-text="lang==='zh' ? '或手动执行：' : 'Or run manually:'"></span>
-                    </div>
-                    <pre x-text="settings.upgradeResult.restart_hint"></pre>
-                  </div>
-                  <details>
-                    <summary x-text="lang==='zh' ? '查看升级日志' : 'View upgrade log'"></summary>
-                    <template x-for="(s, i) in settings.upgradeResult.steps" :key="i">
-                      <div class="upgrade-step">
-                        <div class="upgrade-step-name" x-text="s.step + (s.rc != null ? ' (rc=' + s.rc + ')' : '')"></div>
-                        <pre x-show="s.output" x-text="s.output"></pre>
-                      </div>
-                    </template>
-                  </details>
-                </div>
-              </template>
+            <div class="settings-row">
+              <label>Codex CLI</label>
+              <code x-text="settings.versions.current?.codex_cli || &quot;—&quot;"></code>
             </div>
           </template>
-          <!-- Standalone restart button — useful any time, not just after upgrade.
-               Button + hint wrapped in a single .settings-row-col div so the
-               .settings-row grid (220px label + 1fr content) treats them as
-               ONE cell. Without the wrapper the button was a direct grid
-               item and `justify-self: stretch` (default) blew it up to the
-               full 1fr width = ~700px-wide grey block (2026-05-28 screenshot).
-               The hint was a 3rd grid child that wrapped to (row 2, col 1)
-               and got crushed into the 220px label column. -->
-          <div class="settings-row" style="margin-top:12px; padding-top:12px; border-top:1px solid var(--c-border)">
-            <label x-text="lang==='zh' ? '重启服务' : 'Restart service'"></label>
-            <div class="settings-row-col">
-              <button class="btn-ghost sm"
-                      :disabled="settings.restarting"
-                      @click="restartService()"
-                      x-text="settings.restarting ? (lang==='zh' ? '重启中…' : 'Restarting…') : (lang==='zh' ? '重启' : 'Restart')">
-              </button>
-              <div class="settings-hint"
-                   x-text="lang==='zh' ? '升级 SDK / 修改 .env 后，重启让新配置生效。' : 'Use after upgrading the SDK or editing .env.'"></div>
+          <template x-if="settings.versions?.shared_runtime">
+            <div class="settings-row">
+              <label x-text="lang==='zh' ? '共享当前会话' : 'Share this runtime'"></label>
+              <div class="settings-input-wrap">
+                <code class="settings-command" x-text="settings.versions.cli_resume_command"></code>
+                <button class="btn-ghost sm" @click="copyCliResumeCommand()"
+                        x-text="lang==='zh' ? '复制' : 'Copy'"></button>
+              </div>
             </div>
-          </div>
-          <template x-if="!settings.versions && !settings.versionsLoading">
-            <div class="settings-hint"
-                 x-text="lang==='zh' ? '点击「检查更新」查询 PyPI + npm 上的最新版本。' : 'Click Check to query PyPI + npm for the latest versions.'"></div>
           </template>
+          <div class="settings-hint" x-show="settings.versions?.shared_runtime"
+               x-text="lang==='zh' ? '用上面的命令进入与网页相同的 app-server；直接运行 codex 会启动另一套 runtime。' : 'Use this command to join the same app-server as the browser. Plain codex starts a separate runtime.'"></div>
+          <div class="settings-hint"
+               x-text="lang===&quot;zh&quot; ? &quot;升级由操作者完成；更新后重启服务并运行 doctor。&quot; : &quot;Upgrades are operator-managed; restart the service and run doctor afterwards.&quot;"></div>
         </div>
 
-        <!-- Cost dashboard — aggregated per-turn usage across all sessions.
-             Loads lazily when the user navigates to this section; Codex quota
-             refresh is intentionally tied to that user action. -->
         <div class="settings-section" data-page="cost"
              x-show="settings.activePage === 'cost'">
           <div class="settings-section-title">
@@ -3873,13 +3492,13 @@
                    list (≤ 5 vendors), and the extra section ate vertical
                    space without earning it. -->
               <!-- ===== by_model ===== -->
-              <div class="cost-block-title" x-text="t('set.cost.by_model')"></div>
-              <div class="cost-models">
+              <div class="cost-block-title" x-show="(cost.data.by_model || []).length"
+                   x-text="t('set.cost.by_model')"></div>
+              <div class="cost-models" x-show="(cost.data.by_model || []).length">
                 <template x-for="m in cost.data.by_model" :key="m.model">
                   <div class="cost-model-row">
-                    <!-- Friendly label only; raw model id on title= so power
-                         users can hover to see e.g. "claude-sonnet-4-6"
-                         while the row reads "Sonnet 4.6". Vendor chip + the
+                    <!-- Friendly label only; raw model id stays in title= so
+                         users can inspect the exact identifier. Vendor chip + the
                          by_vendor rollup section were both dropped
                          2026-05-22 — model granularity is what users
                          actually want, vendor totals are easy to mentally
@@ -3917,17 +3536,16 @@
           <div class="settings-row">
             <label x-text="t('set.label.default_permission')"></label>
             <select x-model="settings.draftDefaults.permission" class="settings-input">
-              <option value="bypassPermissions" x-text="lang==='zh' ? 'bypass（无提示）' : 'bypass (no prompts)'"></option>
-              <option value="acceptEdits">acceptEdits</option>
-              <option value="default">default</option>
-              <option value="plan">plan</option>
+              <option value="default" x-text="lang==='zh' ? '按需询问' : 'Ask as needed'"></option>
+              <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
+              <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
             </select>
           </div>
           <div class="settings-hint warn"
                x-show="settings.draftDefaults.permission === 'bypassPermissions'"
                x-text="lang==='zh'
-                 ? '⚠ bypass 模式下 Muse 可以读 / 改 / 删 archive 内任意文件，不会弹窗确认。仅在你充分信任当前对话内容时使用。'
-                 : '⚠ In bypass mode Muse can read / edit / delete any file under your archive without confirmation. Only use it when you fully trust what you ask.'"></div>
+                 ? '⚠ 完全访问会关闭 Codex 审批和沙箱，可读写工作区外文件且不会弹窗确认。仅在充分信任当前任务时使用。'
+                 : '⚠ Full access disables Codex approvals and sandboxing, including access outside the workspace. Use only for trusted tasks.'"></div>
         </div>
 
         <!-- Notifications — single switch (2026-05-28, collapsed from 4
@@ -3973,9 +3591,7 @@
             <span x-text="t('set.sec.skills')"></span>
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
           </div>
-          <!-- Auto-detection notice: tells the user muselab automatically
-               pulled in skills from their Claude Code setup. No setup
-               needed — the SDK already loaded them. -->
+          <!-- app-server is authoritative for discovery and enabled state. -->
           <div class="skills-meta" x-show="settings.skills.length">
             <span class="skills-count" x-text="t('set.skills.count', { n: settings.skills.length })"></span>
             <span class="skills-meta-sep">·</span>
@@ -3986,25 +3602,26 @@
                  x-show="settings.skills.length">
           <div x-show="!settings.skills.length" class="settings-empty"
                x-text="t('set.skills.empty')"></div>
-          <!-- Card grid — no per-skill emoji (skills are dynamic, can't
-               hardcode icons). Single generic 🧩 marker, scope tag tells
-               where it came from. "Try this" pre-fills the chat input
-               with a starter prompt; for the 7 hand-crafted ones we use
-               a concrete demo prompt, others get a generic seed. -->
+          <!-- App-server owns discovery and enable state. Cards use one
+               generic marker; Try prefers the native defaultPrompt and
+               otherwise falls back to a short prompt using the skill name. -->
           <div class="skills-grid">
             <template x-for="sk in filteredSkills()" :key="sk.scope + ':' + sk.name + ':' + (sk.source || '')">
-              <!-- 2026-05-23: scope/source chip removed. 用户反馈"显示来源
-                   反而提升理解成本" —— project/user/plugin/marketplace 这套
-                   分类对普通用户是噪音。如需溯源，hover skill name 的 title
-                   或去 Settings → Skills 看完整路径。-->
-              <div class="skill-card" :title="sk.source || ''">
+              <!-- Scope chips stay hidden to reduce visual noise. The full
+                   app-server path remains available in the card tooltip. -->
+              <div class="skill-card" :class="{'is-disabled': !sk.enabled}"
+                   :title="sk.path || sk.source || ''">
                 <div class="skill-card-head">
                   <span class="skill-card-icon"><svg><use href="#i-puzzle"/></svg></span>
-                  <span class="skill-card-name mono" x-text="sk.name"></span>
+                  <span class="skill-card-name mono" x-text="sk.display_name || sk.name"></span>
                 </div>
                 <div class="skill-card-desc" x-text="sk.description || (lang==='zh' ? '（无描述）' : '(no description)')"></div>
                 <div class="skill-card-actions">
+                  <button class="skill-card-toggle" @click="toggleSkill(sk)"
+                          :disabled="sk._saving"
+                          x-text="sk.enabled ? t('set.skills.disable') : t('set.skills.enable')"></button>
                   <button class="skill-card-try" @click="trySkill(sk)"
+                          :disabled="!sk.enabled"
                           x-text="t('set.skills.try')"></button>
                 </div>
               </div>
@@ -4019,8 +3636,10 @@
             <span class="settings-save-mode live" x-text="t('set.mode.live')"></span>
           </div>
           <div class="settings-hint" x-text="t('set.mcp.hint')"></div>
+          <div class="settings-hint" x-show="mcp.inventory_error"
+               x-text="t('set.mcp.inventory_unavailable')"></div>
 
-          <div x-show="!settings.mcpServers.length && !settings.mcpExamples.length"
+          <div x-show="!settings.mcpServers.length"
                class="settings-empty" x-text="t('set.mcp.empty')"></div>
 
           <template x-for="s in settings.mcpServers" :key="s.name">
@@ -4029,20 +3648,28 @@
                 <div class="mcp-server-name">
                   <span class="mcp-server-dot" :class="{ active: !s.disabled }"></span>
                   <span class="mono" x-text="s.name"></span>
-                  <span class="mcp-server-tag" x-show="s.type === 'http' || s.type === 'sse' || s.url"
+                  <span class="mcp-server-tag" x-show="s.transport === 'http'"
                         x-text="t('set.mcp.transport_remote')"></span>
                   <span class="mcp-server-tag" x-show="s.disabled" x-text="t('set.mcp.disabled')"></span>
+                  <span class="mcp-server-tag" x-text="mcpSourceLabel(s.scope)"></span>
+                  <span class="mcp-server-tag" x-show="s.tool_count"
+                        x-text="s.tool_count + ' ' + t('set.mcp.tools')"></span>
                 </div>
                 <div class="mcp-server-cmd mono"
-                     x-text="(s.type === 'http' || s.type === 'sse' || s.url) ? s.url : (s.command + (s.args.length ? ' ' + s.args.join(' ') : ''))"></div>
+                     x-text="s.transport === 'http' ? s.url : (s.command + (s.args.length ? ' ' + s.args.join(' ') : ''))"></div>
+                <div class="mcp-server-cmd" x-show="s.tools && s.tools.length"
+                     x-text="s.tools.map(tool => tool.name).join(' · ')"></div>
               </div>
               <div class="mcp-server-actions">
-                <label class="switch sm" :title="t('set.mcp.toggle_title')">
+                <button class="btn-ghost sm" x-show="!s.disabled && s.auth_status === 'notLoggedIn'"
+                        @click="loginMcpOauth(s)" x-text="t('set.mcp.authenticate')"></button>
+                <label class="switch sm" :title="s.editable ? t('set.mcp.toggle_title') : t('set.mcp.read_only')">
                   <input type="checkbox" :checked="!s.disabled"
+                         :disabled="!s.editable"
                          @change="toggleMcp(s.name, !$event.target.checked)" />
                   <span class="switch-slider"></span>
                 </label>
-                <button class="icon-btn sm" :title="t('set.mcp.delete')"
+                <button class="icon-btn sm" x-show="s.editable" :title="t('set.mcp.delete')"
                         @click="deleteMcp(s.name)">
                   <svg><use href="#i-trash"/></svg>
                 </button>
@@ -4050,24 +3677,12 @@
             </div>
           </template>
 
-          <div class="mcp-preset-row" x-show="settings.mcpExamples.length">
-            <span class="settings-sub-label" x-text="t('set.mcp.presets')"></span>
-            <template x-for="ex in settings.mcpExamples" :key="ex.name">
-              <button class="mcp-preset-chip"
-                      :disabled="settings.mcpServers.some(s => s.name === ex.name)"
-                      @click="installMcpPreset(ex)">
-                <span class="mono" x-text="ex.name"></span>
-                <span x-show="ex.description" class="mcp-preset-desc" x-text="ex.description"></span>
-              </button>
-            </template>
-          </div>
-
           <div class="settings-row mcp-add-row">
             <button class="btn-ghost sm" @click="settings.mcpDraft.show = !settings.mcpDraft.show"
                     x-text="settings.mcpDraft.show ? t('btn.cancel') : t('set.mcp.add')"></button>
           </div>
           <div x-show="settings.mcpDraft.show" class="mcp-add-form">
-            <!-- Transport: local stdio subprocess vs remote http/sse connector. -->
+            <!-- Transport: local STDIO subprocess or remote Streamable HTTP. -->
             <div class="settings-row">
               <label x-text="t('set.mcp.transport')"></label>
               <div class="seg-toggle">
@@ -4105,12 +3720,12 @@
                 <div class="settings-row">
                   <label x-text="t('set.mcp.url')"></label>
                   <input class="settings-input" x-model="settings.mcpDraft.url"
-                         placeholder="https://mcp.example.com/sse" />
+                         placeholder="https://mcp.example.com/mcp" />
                 </div>
                 <div class="settings-row">
-                  <label x-text="t('set.mcp.auth_header')"></label>
-                  <input class="settings-input" x-model="settings.mcpDraft.authHeader"
-                         placeholder="Bearer sk-…" />
+                  <label x-text="t('set.mcp.bearer_env')"></label>
+                  <input class="settings-input" x-model="settings.mcpDraft.bearerTokenEnvVar"
+                         placeholder="MCP_BEARER_TOKEN" />
                 </div>
                 <p class="settings-hint" x-text="t('set.mcp.remote_hint')"></p>
               </div>
@@ -4228,12 +3843,7 @@
        card pre-fills the input with a seed prompt and focuses the
        textarea — works regardless of whether the user is on the empty
        chat or mid-conversation. -->
-  <!-- MCP drawer — chat-input 🔌 entry point. Read-only list of every MCP
-       server muselab will actually mount on the next turn (merged view:
-       muselab's mcp.json + Claude Code's standard config files). Each row
-       shows source badge (where it came from) + enabled toggle + reconnect
-       button. For full editing (add / delete / edit env), link to Settings.
-       2026-05-23 replaces the top-bar mcp-badge with this richer view. -->
+  <!-- MCP drawer — Codex app-server's effective server and tool inventory. -->
   <div class="skills-drawer-overlay" x-show="mcpDrawerOpen"
        @click.self="mcpDrawerOpen = false"
        @keydown.escape.window="mcpDrawerOpen = false"
@@ -4243,18 +3853,10 @@
         <div>
           <div class="skills-drawer-title"
                x-text="(lang==='zh'?'MCP 服务':'MCP servers') + ' · ' + mcp.servers.length"></div>
-          <!-- Unicode curly apostrophes (U+2019) instead of straight `'`
-               so the JS string literal stays valid inside an HTML double-
-               quoted attribute. Earlier `muselab\\'s` was wrong: HTML
-               doesn't escape backslashes, so JS saw `\\` → literal `\` +
-               then `'` closed the string early → SyntaxError: Unexpected
-               identifier 's'. Lesson: never put straight ASCII apostrophes
-               inside Alpine x-text JS strings — use U+2019 (which is the
-               proper typographic apostrophe anyway). -->
           <div class="skills-drawer-subtitle"
                x-text="lang==='zh'
-                 ? '已合并 muselab 自有配置 + Claude Code 标准配置位置（~/.claude.json / .mcp.json）'
-                 : 'Merged: muselab’s own config + Claude Code’s standard MCP files'"></div>
+                 ? '来自 Codex config.toml 与 app-server 实时工具清单'
+                 : 'From Codex config.toml and the live app-server tool inventory'"></div>
         </div>
         <button class="skills-drawer-close" @click="mcpDrawerOpen = false"
                 :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
@@ -4262,12 +3864,10 @@
       <div class="skills-drawer-body">
         <div x-show="!mcp.servers.length" class="settings-empty"
              x-text="lang==='zh'
-               ? '没有配置 MCP 服务。可去 Settings → MCP 添加，或在 ~/.claude.json mcpServers 里加（会自动合并）。'
-               : 'No MCP servers configured. Add via Settings → MCP, or edit ~/.claude.json mcpServers (auto-merged).'"></div>
+               ? '没有配置 MCP 服务。可去 Settings → MCP 添加，或编辑 Codex config.toml。'
+               : 'No MCP servers configured. Add one in Settings → MCP or edit Codex config.toml.'"></div>
         <div class="skills-grid">
-          <template x-for="s in mcp.servers" :key="s.name + ':' + (s.source || 'muselab')">
-            <!-- Source chip removed 2026-05-23 同 skills 卡片，详细溯源信息
-                 通过外层 div :title 提供给好奇的用户 hover 即可。-->
+          <template x-for="s in mcp.servers" :key="s.name + ':' + (s.source || 'codex')">
             <div class="skill-card" :class="{'is-disabled': s.disabled}"
                  :title="mcpSourceLabel(s.source) + (s.disabled ? (lang==='zh' ? ' · 已禁用' : ' · disabled') : '')">
               <div class="skill-card-head">
@@ -4275,15 +3875,14 @@
                 <span class="skill-card-name mono" x-text="s.name"></span>
               </div>
               <div class="skill-card-desc mono"
-                   x-text="(s.command || '(remote)') + (s.args && s.args.length ? ' ' + s.args.join(' ') : '')"></div>
+                   x-text="s.tools && s.tools.length ? s.tools.map(tool => tool.name).join(' · ') : (s.disabled ? t('set.mcp.disabled') : t('set.mcp.no_tools'))"></div>
               <div class="skill-card-actions">
-                <!-- "Try" mirrors skill cards: pre-fill chat input with a
-                     seed prompt referencing this MCP server's name, so the
-                     model picks an appropriate tool from that server on
-                     the first turn. Disabled MCPs can't be tried — the
-                     SDK won't have mounted them this turn. -->
+                <button class="skill-card-toggle"
+                        x-show="!s.disabled && s.auth_status === 'notLoggedIn'"
+                        @click="loginMcpOauth(s)"
+                        x-text="t('set.mcp.authenticate')"></button>
                 <button class="skill-card-try"
-                        :disabled="s.disabled"
+                        :disabled="s.disabled || !s.tool_count"
                         @click="tryMcp(s)"
                         x-text="t('set.skills.try')"></button>
               </div>
@@ -4316,14 +3915,16 @@
           <template x-for="sk in filteredSkills()" :key="sk.scope + ':' + sk.name + ':' + (sk.source || '')">
             <!-- scope chip removed 2026-05-23, 同 Settings → Skills 卡片 —— 见
                  那段注释。-->
-            <div class="skill-card" :title="sk.source || ''">
+            <div class="skill-card" :class="{'is-disabled': !sk.enabled}"
+                 :title="sk.path || sk.source || ''">
               <div class="skill-card-head">
                 <span class="skill-card-icon"><svg><use href="#i-puzzle"/></svg></span>
-                <span class="skill-card-name mono" x-text="sk.name"></span>
+                <span class="skill-card-name mono" x-text="sk.display_name || sk.name"></span>
               </div>
               <div class="skill-card-desc" x-text="sk.description || (lang==='zh' ? '（无描述）' : '(no description)')"></div>
               <div class="skill-card-actions">
                 <button class="skill-card-try" @click="trySkill(sk)"
+                        :disabled="!sk.enabled"
                         x-text="t('set.skills.try')"></button>
               </div>
             </div>
@@ -4334,56 +3935,6 @@
   </div>
 
   <!-- ============ Modal ============ -->
-  <!-- Claude Auth Connect modal — instructions + polling.
-       Stays open until /status reports logged_in === true, then auto-closes. -->
-  <div class="modal-backdrop" x-show="claudeAuthModal.open"
-       @click.self="closeClaudeAuthModal()"
-       x-transition.opacity.duration.120ms>
-    <div class="modal claude-auth-modal" @keydown.escape.window="closeClaudeAuthModal()"
-         role="dialog" aria-modal="true">
-      <div class="modal-head">
-        <span class="modal-title" x-text="t('claude_auth.modal_title')"></span>
-        <button class="modal-close" @click="closeClaudeAuthModal()"
-                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
-      </div>
-      <div class="modal-body">
-        <!-- Step 1: CLI install command -->
-        <div class="claude-auth-step">
-          <div class="claude-auth-step-text" x-text="t('claude_auth.modal_step1')"></div>
-          <div class="claude-auth-cmd-row">
-            <code class="claude-auth-cmd" x-text="t('claude_auth.cli_install_cmd')"></code>
-            <button class="btn-ghost sm" @click="copyClaudeAuthCmd('install')"
-                    x-text="claudeAuthModal.copyToast === 'install' ? t('claude_auth.copied') : '📋'"></button>
-          </div>
-        </div>
-        <!-- Step 2: claude login -->
-        <div class="claude-auth-step">
-          <div class="claude-auth-step-text" x-text="t('claude_auth.modal_step2')"></div>
-          <div class="claude-auth-cmd-row">
-            <code class="claude-auth-cmd">claude login</code>
-            <button class="btn-ghost sm" @click="copyClaudeAuthCmd('login')"
-                    x-text="claudeAuthModal.copyToast === 'login' ? t('claude_auth.copied') : '📋'"></button>
-          </div>
-        </div>
-        <!-- Step 3: browser auth -->
-        <div class="claude-auth-step">
-          <div class="claude-auth-step-text" x-text="t('claude_auth.modal_step3')"></div>
-        </div>
-        <!-- Polling indicator -->
-        <div class="claude-auth-waiting" x-show="claudeAuthModal.polling">
-          <span class="spinner-sm"></span>
-          <span x-text="t('claude_auth.modal_waiting')"></span>
-        </div>
-        <!-- Docker hint -->
-        <div class="claude-auth-tip" x-text="t('claude_auth.modal_docker_tip')"></div>
-      </div>
-      <div class="modal-foot">
-        <button @click="closeClaudeAuthModal()" class="btn-ghost"
-                x-text="t('claude_auth.modal_close')"></button>
-      </div>
-    </div>
-  </div>
-
   <div class="modal-backdrop confirm-backdrop" x-show="modal.show" @click.self="modal.cancel && modal.cancel()">
     <div class="modal confirm-modal" @keydown.escape.window="modal.cancel && modal.cancel()"
          role="alertdialog" aria-modal="true">

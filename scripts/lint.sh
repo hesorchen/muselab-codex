@@ -5,7 +5,7 @@
 # Checks:
 #   1. Python read_text / write_text without encoding=
 #   2. .thinking class collision (mascot vs message bubble)
-#   3. Personal-data / PII leak — generic patterns (constitution P6 / §6)
+#   3. Personal-data / PII leak — generic patterns
 #   4. Maintainer-identity leak — runtime-derived ($USER, $HOME) + optional
 #      private blacklist file. NO private literal is ever stored in this script.
 set -u
@@ -54,8 +54,8 @@ else
 fi
 echo
 
-# Tracked text files only — this is exactly the "shipped artifacts" surface
-# that constitution P6 governs. `git ls-files` naturally excludes .env /
+# Tracked text files only — this is exactly the "shipped artifacts" surface.
+# `git ls-files` naturally excludes .env /
 # sessions/ (gitignored) and anything not committed. Skip vendored libs,
 # lockfiles and the third-party license dump (legit external names there).
 _tracked_text_files() {
@@ -137,7 +137,7 @@ fi
 if [[ -n "${id_hits// /}" ]]; then
   red "FAIL — maintainer-identity literal found in a tracked (shippable) file:"
   echo "$id_hits" | sed '/^$/d;s/^/  /'
-  echo "  → constitution P6: no real personal data in shipped artifacts."
+  echo "  → no real personal data is allowed in shipped artifacts."
   echo "    Replace with a neutral placeholder (you / alice / \$HOME)."
   fail=1
 else

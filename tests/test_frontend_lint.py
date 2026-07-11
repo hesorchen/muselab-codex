@@ -11,10 +11,43 @@ guard."""
 from __future__ import annotations
 import re
 from collections import Counter
+from html.parser import HTMLParser
 from pathlib import Path
 
 
 FRONTEND = Path(__file__).resolve().parents[1] / "frontend"
+
+
+class _ComposerTemplateGuard(HTMLParser):
+    """Track whether the persistent composer is accidentally inside template."""
+
+    def __init__(self):
+        super().__init__()
+        self.template_depth = 0
+        self.composer_depth: int | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "template":
+            self.template_depth += 1
+        classes = dict(attrs).get("class", "").split()
+        if "chat-input" in classes:
+            self.composer_depth = self.template_depth
+
+    def handle_endtag(self, tag):
+        if tag == "template":
+            self.template_depth -= 1
+
+
+def test_chat_composer_is_not_nested_in_template():
+    """A swallowed template close makes the entire composer non-rendering."""
+    parser = _ComposerTemplateGuard()
+    parser.feed((FRONTEND / "index.html").read_text(encoding="utf-8"))
+
+    assert parser.composer_depth is not None, "chat composer is missing"
+    assert parser.composer_depth == 0, (
+        "chat composer is nested in <template>; check for malformed comments "
+        "or a missing </template> before .chat-input"
+    )
 
 
 # Match top-level method definitions inside the Alpine x-data object:
@@ -104,3 +137,182 @@ def test_image_generation_history_prompt_actions_are_wired():
     assert '@click="copyImageGenPrompt(job)"' in index
     assert '@click="reuseImageGenPrompt(job)"' in index
     assert 'x-ref="imageGenPrompt"' in index
+
+
+def test_slash_compact_uses_native_codex_path():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert 'case "compact": {' in app
+    assert "await this.runCompact(this.currentId);" in app
+    assert "/sessions/${this.currentId}/compact" not in app
+
+
+def test_skills_ui_uses_native_codex_endpoints():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert 'fetch("/api/chat/skills"' in app
+    assert 'fetch("/api/chat/skills?force_reload=true"' in app
+    assert "async toggleSkill(sk)" in app
+    assert "/api/settings/skills" not in app
+    assert '@click="toggleSkill(sk)"' in index
+    assert ':disabled="!sk.enabled"' in index
+    assert 'x-text="sk.display_name || sk.name"' in index
+
+
+def test_mcp_ui_uses_native_codex_endpoints_and_inventory():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert 'fetch("/api/chat/mcp"' in app
+    assert 'fetch("/api/chat/mcp?reload=true"' in app
+    assert "async loginMcpOauth(s)" in app
+    assert "/api/settings/mcp" not in app
+    assert "mcpExamples" not in app
+    assert 'x-text="s.tools.map(tool => tool.name).join(\' · \')"' in index
+    assert ':disabled="s.disabled || !s.tool_count"' in index
+    assert '@click="loginMcpOauth(s)"' in index
+
+
+def test_shared_runtime_and_mcp_elicitation_are_wired():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert '@click="loadVersions()"' in index
+    assert "settings.versions.cli_resume_command" in index
+    assert "copyCliResumeCommand()" in app
+    assert "askOptionValue(opt)" in index
+    assert "m.kind === 'mcp_form'" in index
+    assert "m.kind === 'mcp_url'" in index
+
+
+def test_context_ring_never_invents_a_model_window():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async _refreshCtxMeter()")
+    end = app.index("\n    async showCtxBreakdown()", start)
+    method = app[start:end]
+
+    assert "200000" not in method
+    assert "this.sessionUsage.context_limit" in method
+
+
+def test_native_session_mounts_tab_before_activating_it():
+    """Changing currentId before its keyed pane exists corrupts Alpine DOM state."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async _newServerSession()")
+    end = app.index("\n    newSession()", start)
+    method = app[start:end]
+
+    mount = method.index("this.openTabIds.push(draftId)")
+    activate = method.index("this.currentId = draftId")
+    request = method.index('fetch("/api/chat/sessions"')
+    assert mount < activate < request
+    assert "name: prefix + stamp" not in method
+    assert 'method: "PATCH"' not in method
+    assert "if (meta.auto_named)" in method
+    assert "thread/name/set" in method
+    assert "this.tabState[meta.id] = this.tabState[draftId]" in method
+    assert "await this.$nextTick()" in method
+
+
+def test_default_permission_is_saved_separately_from_current_session():
+    """Settings defaults must not be re-seeded from the active old thread."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    open_start = app.index("openSettings()")
+    open_end = app.index("\n    openSettingsPage", open_start)
+    save_start = app.index("async saveSettings()")
+    save_end = app.index("\n    async deleteSession", save_start)
+
+    assert 'defaultPermission: "default"' in app
+    assert "permission: this.defaultPermission || \"default\"" in app[open_start:open_end]
+    assert "this.defaultPermission = defaults.permission" in app[save_start:save_end]
+    assert "this.savePrefs()" in app[save_start:save_end]
+    assert "defaultPermission: this.defaultPermission" in app
+
+
+def test_send_waits_for_native_id_when_started_from_an_optimistic_draft():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async send(opts = {})")
+    end = app.index("\n    retryFailedMessage", start)
+    method = app[start:end]
+
+    pending = method.index("const pendingCreate")
+    snapshot = method.index("const sendSid = this.currentId")
+    assert pending < snapshot
+    assert "await pendingCreate" in method
+    assert "return this.send(opts)" in method
+
+
+def test_session_poll_is_single_flight_and_saved_tab_keys_are_sanitized():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert "if (this._sessionListPullPromise) return this._sessionListPullPromise" in app
+    assert "async _pullSessionListOnce(" in app
+    assert "[...new Set(p.openTabIds.filter(" in app
+
+
+def test_large_markdown_preview_skips_rich_dom_postprocessing():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_renderPreviewMd(text)")
+    end = app.index("\n    // opts.streaming", start)
+    method = app[start:end]
+
+    assert "this.LARGE_MD_DEFER_CHARS" in method
+    assert "this._mdRenderUncached(body, { streaming: true })" in method
+
+
+def test_open_file_updates_shared_preview_tabs_immutably():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async openFile(n, opts = {})")
+    end = app.index("\n    async openByPath(path)", start)
+    method = app[start:end]
+
+    assert "this.tabs.splice(pi, 1" not in method
+    assert "this.tabs.push({ path: n.path" not in method
+    assert "this.tabs = this.tabs.map((t, i)" in method
+    assert "this.tabs = [...this.tabs, { path: n.path" in method
+
+
+def test_file_tree_keyed_list_never_uses_in_place_splice():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("// ===== file tree =====")
+    end = app.index("\n    // ===== context menu =====", start)
+    tree = app[start:end]
+
+    assert "this.visible.splice(" not in tree
+    assert "_uniqueFileNodes(nodes)" in tree
+
+
+def test_boot_paints_shell_before_deferred_tree_and_stats_work():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async _bootApp()")
+    end = app.index("\n    // Start the always-on background connections", start)
+    boot = app[start:end]
+
+    assert "requestAnimationFrame(() => this._markReady())" in boot
+    assert "this._fetchModels({ retries: 2 })" in boot
+    assert "setTimeout(() => { this.loadRoot().catch(() => {}); }, 150)" in boot
+    assert "setTimeout(() => { this.fetchStats(); }, 300)" in boot
+    assert "await this.fetchContextInfo()" not in boot
+
+
+def test_model_discovery_precedes_optional_rate_limit_and_retries():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async fetchStats()")
+    end = app.index("\n    async fetchCodexRateLimit", start)
+    stats = app[start:end]
+    model_start = app.index("async _fetchModels(opts = {})")
+    model_end = app.index("\n    // Ensure `this.model`", model_start)
+    models = app[model_start:model_end]
+
+    assert stats.index("await this._fetchModels") < stats.index("this.fetchCodexRateLimit()")
+    assert "if (this._modelsFetchPromise) return this._modelsFetchPromise" in models
+    assert "attempt <= retries" in models
+
+
+def test_chat_messages_use_one_flat_keyed_loop():
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert 'x-for="(m, i) in messages"' in index
+    assert 'x-for="tid in residentPaneIds()"' not in index
+    assert "paneMessages(tid)" not in index

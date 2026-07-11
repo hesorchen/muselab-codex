@@ -1,6 +1,6 @@
 # Mobile (PWA)
 
-> [简体中文](mobile_zh.md)
+> [简体中文](mobile_zh.md) · [← Documentation index](README.md)
 
 muselab ships a Web App Manifest and apple-touch-icon. Once deployed to
 your own server, it can be added to the phone home screen and launched
@@ -42,9 +42,13 @@ On Android Chrome, the address bar shows an "Install" prompt directly.
 ## Web Push notifications
 
 Enabled in **Settings → Notifications**. The backend exposes
-`/api/push/{vapid-public,subscribe,unsubscribe}` and provides VAPID keys
-via `.env`. Per-device subscriptions persist in the browser. Long scheduled
-tasks send a push notification upon completion, even if the tab is closed.
+`/api/push/{vapid-public,subscribe,unsubscribe,test}`. It generates VAPID state
+on first use and stores the private key and device subscriptions in
+`<workspace>/.muselab/{vapid.json,push_subs.json}`. Settings can send an
+end-to-end test notification. Automatic scheduler-completion delivery is not
+wired in the current version.
+
+Back up `vapid.json` privately. Replacing it requires every device to subscribe again.
 
 ### iOS limitations
 

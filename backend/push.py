@@ -351,8 +351,9 @@ def send_to_all(title: str, body: str, *, url: str = "/",
 
 
 def init() -> None:
-    """Idempotent — main.py startup hook calls this; we load subs and
-    eagerly generate VAPID so the frontend's first /api/push/vapid-public
-    call doesn't have to wait on key generation."""
-    _ensure_vapid()
-    _load_subs()
+    """Retained startup hook; persistent state is loaded lazily.
+
+    Push is optional, and both subscription access and VAPID access already
+    reload their respective files. Keeping startup free of push filesystem and
+    crypto work prevents this peripheral from delaying application readiness.
+    """

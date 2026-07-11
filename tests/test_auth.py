@@ -17,6 +17,17 @@ def test_good_token_accepted(client, auth):
     assert r.json()["entries"]
 
 
+def test_health_reports_codex_ready_without_workspace_details(client):
+    response = client.get("/api/health")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "version": "0.1.0a1",
+        "runtime": {"state": "ready", "ready": True, "restart_count": 0},
+    }
+
+
 def test_query_token_for_raw_endpoint(client):
     # /raw uses query-string token; missing => 401, present => 200
     bad = client.get("/api/files/raw?path=README.md&token=wrong")

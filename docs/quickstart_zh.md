@@ -1,157 +1,159 @@
-# Quick start
+# 快速入门
 
-> [English](quickstart.md)
+> [English](quickstart.md) · [← 文档索引](README_zh.md)
 
-从克隆到运行，共三条命令。默认仅绑定 `127.0.0.1`，只有本机可访问；远程访问方式见 [VPS 部署](#vps-部署)。
+这份指南带你从空环境到完成一次 Codex 原生文件任务。正式长期运行推荐使用安装脚本；只想开发调试时再手动启动。
 
-## 0. 环境要求
+## 前置条件
 
-### 至少配置一个模型 provider
+| 组件 | 要求 | 用途 |
+|---|---|---|
+| 操作系统 | Linux、macOS；Windows 使用 WSL2 | 用户级服务与本地文件权限 |
+| Python | 3.12+ | FastAPI 后端 |
+| `uv` | 可执行 | Python 依赖和虚拟环境 |
+| Node.js／npm | 可执行 | 安装 Codex CLI |
+| Codex CLI | 测试基线 `0.144.1` | `codex app-server` runtime |
+| Git | 可执行 | 克隆和升级仓库 |
 
-| 你拥有的 | 配置方式 |
-|----------------|-------|
-| **Claude Pro / Max** 订阅 | 安装 [`claude` CLI](https://docs.claude.com/claude-code) 并执行一次 `claude login`，OAuth 凭据存于 `~/.claude/.credentials.json` |
-| 仅想用第三方 key | 从 [DeepSeek](https://platform.deepseek.com) / [智谱 GLM](https://bigmodel.cn) / [MiniMax](https://minimaxi.com) / [Kimi](https://platform.moonshot.cn) / [Qwen](https://dashscope.console.aliyun.com) 任取一个 key，安装完成后填到 Settings，无需 CLI |
-| 两者都有 | Claude 用于高强度推理，DeepSeek 用于日常对话。下拉菜单一键切换 |
-
-未配置任何模型提供商时安装仍然成功，但首次对话会失败，界面提示「未配置模型——请打开设置」。
-
-### 安装 `uv`
-
-```bash
-# Linux / macOS / WSL2
-curl -LsSf https://astral.sh/uv/install.sh | sh
-```
-
-### Windows 用户走 WSL2
-
-Windows 上请通过 WSL2 安装。一次性配置：
-
-```powershell
-# PowerShell（管理员）
-wsl --install            # 装 WSL2 + 默认 Ubuntu
-# 按提示重启 + 创建 Linux 用户名 / 密码
-```
-
-WSL2 默认不开 systemd，muselab 的服务注册需要它。在 WSL 终端里：
+先在宿主机完成 Codex 登录：
 
 ```bash
-sudo tee /etc/wsl.conf >/dev/null <<'EOF'
+npm install -g @openai/codex@0.144.1
+codex login
+codex login status
+```
+
+登录态保存在 Codex 自己的 `CODEX_HOME` 中。muselab-codex 不接管 OAuth 文件。
+
+## 方式一：一行安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab-codex/main/scripts/quick-install.sh | bash
+```
+
+引导脚本会：
+
+1. 检测 Linux／macOS／WSL2；
+2. 检查 Git、curl 和 systemd 条件；
+3. 在缺少时安装 `uv`；
+4. 克隆到 `~/muselab-codex`，或复用已有 checkout；
+5. 转交平台安装脚本创建 `.env` 和用户服务。
+
+它拒绝 root 运行。muselab-codex 应由普通用户启动，Codex 和 MCP 子进程也继承这个用户的权限。
+
+## 方式二：从 checkout 安装
+
+```bash
+git clone https://github.com/hesorchen/muselab-codex
+cd muselab-codex
+codex login
+bash scripts/install-linux.sh        # macOS：scripts/install-macos.sh
+```
+
+首次安装会询问：
+
+- 工作区路径，默认 `~/muselab-workspace`；
+- 本地端口，默认 `8765`。
+
+安装器自动生成随机 token，并以 `MUSELAB_HOST=127.0.0.1` 创建权限为当前用户私有的 `.env`。
+
+## 方式三：开发模式
+
+```bash
+git clone https://github.com/hesorchen/muselab-codex
+cd muselab-codex
+uv sync
+cp .env.example .env
+```
+
+编辑 `.env`：
+
+```dotenv
+MUSELAB_TOKEN=replace-with-at-least-16-random-characters
+MUSELAB_ROOT=/absolute/path/to/a-workspace-you-own
+MUSELAB_PORT=8765
+MUSELAB_HOST=127.0.0.1
+```
+
+工作区必须已经存在，不能指向 `/`、`/home`、`/etc` 等系统或跨用户根目录。
+
+启动：
+
+```bash
+uv run python -m backend.main
+```
+
+开发时如需自动重载，可以使用仓库 `Makefile` 中的开发目标；正式服务不要开启 reload。
+
+## 首次打开
+
+1. 打开 `http://127.0.0.1:8765`；
+2. 输入 `.env` 中的 `MUSELAB_TOKEN`；
+3. 创建一个新会话；
+4. 发送“列出这个工作区的顶层文件”；
+5. 审批界面出现时，根据实际操作决定允许或拒绝；
+6. 再让 Codex 创建一个中性的测试文件，确认写入和预览都正常。
+
+如果工作区还没有 `AGENTS.md`，可以运行：
+
+```bash
+bash scripts/intake.sh
+```
+
+脚本会从 Codex 原生模板创建 `AGENTS.md` 和默认目录；已有文件在覆盖前会备份并要求确认。
+
+## 健康检查
+
+```bash
+curl http://127.0.0.1:8765/api/health
+```
+
+正常响应示例：
+
+```json
+{
+  "status": "ok",
+  "version": "0.1.0a1",
+  "runtime": {
+    "state": "ready",
+    "ready": true,
+    "restart_count": 0
+  }
+}
+```
+
+`status: "starting"` 表示 Web 服务已启动，但 app-server 尚未完成初始化。若持续不变，运行：
+
+```bash
+bash scripts/doctor.sh
+```
+
+## 可选：启用国产模型
+
+把对应密钥加入服务继承的私有环境：
+
+```dotenv
+MINIMAX_API_KEY=...
+DASHSCOPE_API_KEY=...
+XIAOMI_MIMO_API_KEY=...
+```
+
+重启服务，然后在“设置 → 模型”中打开所需 Provider。默认 Codex 登录模型无需在网页配置密钥。
+
+## Windows／WSL2
+
+Windows 用户在 WSL2 的 Linux 环境中安装。`install-linux.sh` 需要可访问的 systemd 用户实例；若未启用，在 `/etc/wsl.conf` 设置：
+
+```ini
 [boot]
 systemd=true
-EOF
 ```
 
-回到 Windows 端 PowerShell，让 `wsl.conf` 生效：
+然后在 Windows PowerShell 执行 `wsl --shutdown`，重新进入 WSL 再安装。
 
-```powershell
-wsl --shutdown
-```
+## 下一步
 
-再次打开 WSL 终端，从下面的一行命令安装。
-
-## 1. 一键安装
-
-登录后自动启动，默认绑定 localhost。普通机器约 3 分钟装好，低配 VPS 可能 10 分钟以上。
-
-### 1a. 一行命令引导（Linux + macOS + WSL2）
-
-自动安装 `uv`，将仓库克隆至 `~/muselab`，再调用平台安装程序完成全部安装。首次安装推荐使用此方式：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh | bash
-```
-
-如需在执行前审查脚本内容，可先下载后再运行：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/hesorchen/muselab/main/scripts/quick-install.sh -o quick-install.sh
-less quick-install.sh   # 看一遍
-bash quick-install.sh
-```
-
-### 1b. 手动安装（逐步执行）
-
-```bash
-# Linux / macOS / WSL2
-git clone https://github.com/hesorchen/muselab && cd muselab
-
-bash scripts/install-macos.sh    # macOS — 用户级 LaunchAgent
-bash scripts/install-linux.sh    # Linux / WSL2 — 用户级 systemd
-```
-
-脚本执行流程：预检查 → `uv sync` → 生成 `.env`（含随机 token）→ 7 个问题写入 CLAUDE.md → 注册自启动 → 等待服务就绪（最多 30 秒）。
-
-## 2. 访问
-
-本机：`http://localhost:8765` → 粘贴 `.env` 里的 token。
-
-### VPS 部署
-
-请勿将端口直接暴露到公网。从本地机器建立 SSH 隧道：
-
-```bash
-ssh -L 8765:127.0.0.1:8765 your-vps-user@your-vps-host
-# 然后在笔记本浏览器访问 http://localhost:8765
-```
-
-或使用 [Tailscale](https://tailscale.com)——效果相同，无需命令行操作。
-
-## 3. 验证
-
-```bash
-bash scripts/doctor.sh        # Linux / macOS / WSL2
-```
-
-`doctor` 会逐项检查（uv / claude CLI / `.env` / 服务状态 / HTTP / token / 模型密钥），出现故障时给出具体建议。
-
-## 重启后会自启动吗？
-
-| OS | 重启 → 重新登录 | 重启 → 不登录 |
-|----|---------------------|------------------------|
-| **macOS** | ✅ 自启 | n/a（Mac 重启必须登录）|
-| **Linux** | ✅ 自启 | ⚠️ 需一次性执行 `sudo loginctl enable-linger $USER` |
-| **WSL2** | ✅ 自启（打开 WSL 终端即触发 systemd-user） | ⚠️ Windows 重启后需手动打开一次 WSL 终端，或参考 [WSL boot 配置](https://learn.microsoft.com/en-us/windows/wsl/wsl-config) |
-
-各 OS 详细指南（验证 / 重启 / tail 日志 / 暴露 LAN / 卸载）：
-[macOS](install-macos_zh.md) · [Linux](install-linux_zh.md)。
-
-## Docker 备选方案
-
-### GHCR 预构建镜像（多架构 amd64 + arm64）
-
-```bash
-docker run -d --name muselab \
-  -p 127.0.0.1:8765:8765 \
-  -e MUSELAB_TOKEN=$(openssl rand -hex 32) \
-  -v $HOME/muselab-archive:/data \
-  -e MUSELAB_ROOT=/data \
-  -v $HOME/.claude:/home/muse/.claude \
-  ghcr.io/hesorchen/muselab:latest
-```
-
-> **绑定地址说明：** 上面示例显式绑定 `127.0.0.1`，服务只在本机可达。直接写 `-p 8765:8765` 会绑到 `0.0.0.0`（所有网卡）——在公网 VPS 上等于把服务挂到互联网上，只靠 token 一道防线。若需 LAN 内访问（如手机连本机），改成 `-p 0.0.0.0:8765:8765`，并务必在前面加防火墙或反向代理。仓库自带的 `docker-compose.yml` 默认绑 `127.0.0.1`，要放开在 `.env` 设 `MUSELAB_BIND=0.0.0.0`。
-
-容器以非 root 用户 `muse`（uid 1000）运行，主目录为 `/home/muse/.claude`。将宿主机的 `~/.claude` 挂载至该路径，即可复用 `claude login` 获取的 OAuth 凭据。
-
-> **宿主机 UID 说明：** 容器内 muse 用户为 uid 1000，大多数单用户 Linux / macOS 主机的账号也是 uid 1000，挂载可直接生效。若宿主机 UID 不同（多用户环境、自定义 macOS 管理员账号等），需在启动容器前执行 `chmod -R go+rX ~/.claude` 及 `chown -R 1000:1000 ~/muselab-archive`；或传入 `--user $(id -u):$(id -g)`，但需接受容器内 `~/.claude` 可能为只读。
-
-指定版本：`ghcr.io/hesorchen/muselab:1.2.3` / `:1.2` / `:sha-abc1234`。
-
-### Docker Compose
-
-```bash
-git clone https://github.com/hesorchen/muselab && cd muselab
-cp .env.example .env && $EDITOR .env    # 填 MUSELAB_TOKEN、ARCHIVE_DIR
-claude login                              # 宿主机执行，容器复用 OAuth
-docker compose up -d
-```
-
-### 原生开发模式（uv，无 service）
-
-```bash
-cd muselab && uv sync
-cp .env.example .env && $EDITOR .env
-claude login
-uv run python -m backend.main             # 绑定到 MUSELAB_HOST:MUSELAB_PORT
-```
+- 理解工作区、`CODEX_HOME` 和 Provider：[配置参考](configuration_zh.md)
+- 日常服务管理：[Linux](install-linux_zh.md)／[macOS](install-macos_zh.md)
+- 手机访问与通知：[移动端 PWA](mobile_zh.md)
+- 故障定位：[排错](troubleshooting_zh.md)

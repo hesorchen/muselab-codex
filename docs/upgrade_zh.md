@@ -1,54 +1,86 @@
 # 升级
 
-> [English](upgrade.md)
+> [English](upgrade.md) · [← 文档索引](README_zh.md)
 
-muselab 依赖两个快速演进的上游组件 —— Claude Agent SDK 和 `claude` CLI。`scripts/upgrade.sh` 会同时升级两者、对结果做冒烟测试，并且不动你的数据。
+升级分为两类：普通应用更新，以及提升 Codex CLI 协议基线。前者是日常运维；后者需要协议验证，不能只执行 npm update。
 
-## 步骤
+## 升级前
+
+1. 备份 `MUSELAB_ROOT`、仓库 `.env` 和 `CODEX_HOME`；
+2. 确认工作区和 Codex 登录态可恢复；
+3. 记录当前 Git revision 与 `codex --version`；
+4. 确认仓库没有需要保留但未提交的代码修改。
+
+## 普通应用更新
 
 ```bash
-cd ~/muselab            # 你的仓库
-git pull                # 拉取最新 muselab 代码
+git pull --ff-only
 bash scripts/upgrade.sh
 ```
 
-它做的事：
+脚本会：
 
-1. 升级 Python 的 `claude-agent-sdk`（`uv lock --upgrade-package …` 后 `uv sync --frozen`）。
-2. 升级 `claude` CLI（`npm install -g @anthropic-ai/claude-code@latest`）。
-3. 跑测试套件（`uv run pytest tests/ -q`）作为冒烟测试。
+- 检查已安装 Codex CLI；
+- 执行 `uv lock` 和 `uv sync --frozen`；
+- 运行 pytest、Ruff、项目 lint 和前端语法检查；
+- 输出 Linux／macOS 重启命令。
 
-若测试**失败**，脚本中止并回滚 Python 依赖（`git checkout uv.lock pyproject.toml && uv sync`）—— 多数情况意味着新版 SDK 改了 muselab 依赖的 API。查看打印的日志并提 issue。
+脚本不会自动提交、修改工作区文件或重启服务。
 
-## 升级之后
-
-脚本**不会**重启服务，也不会提交 lockfile 改动 —— 它会打印出确切命令。重启以让新的 SDK/CLI 生效：
-
-```bash
-# Linux（systemd --user）
-systemctl --user restart muselab
-
-# macOS（launchd）
-launchctl kickstart -k gui/$UID/com.muselab
-```
-
-若你的仓库纳入了 git，检查并提交依赖升级：
+验证通过后：
 
 ```bash
-git diff uv.lock
-git add uv.lock pyproject.toml && git commit -m "chore: bump claude-agent-sdk"
+systemctl --user restart muselab                 # Linux
+launchctl kickstart -k gui/$(id -u)/com.muselab  # macOS
+bash scripts/doctor.sh
 ```
 
-## 保留的内容
+再确认 `/api/health`、新建 thread、历史读取和一次文件工具调用。
 
-升级永远不动 `.env`、`sessions/` 或你的归档。被锁定的 `claude` CLI 版本在 `scripts/versions.env`（并在 Dockerfile 里镜像一份）；`upgrade.sh` 会把你带到最新。没有 schema 迁移步骤 —— JSON 状态文件向前兼容，少数确实存在的迁移（如 VAPID 密钥格式）在后端启动时自动执行。
+## Codex CLI 基线升级
 
-## Docker
+当 `scripts/versions.env` 中的版本变化时，还需要：
 
-拉新镜像并重建容器：
+1. 使用目标 CLI 生成稳定 app-server schema；
+2. 记录版本和 schema digest；
+3. 对照变更更新 fake app-server fixture 与协议测试；
+4. 在临时工作区执行 live thread、turn、工具、审批、Skills 和 MCP 检查；
+5. 同步 Docker build arg、安装测试和架构文档。
+
+不要默认启用 experimental API。只有明确需求、协议测试和 fallback 同时存在时才使用。
+
+## 回滚
+
+应用代码回滚：
 
 ```bash
-docker compose pull && docker compose up -d
+git switch --detach <known-good-revision>
+uv sync --frozen
+systemctl --user restart muselab                 # Linux
 ```
 
-你的归档和 `.env` 是 bind-mount 挂载的，重建后依然保留。
+不要使用会丢失本地工作的 `git reset --hard`。若升级修改了 Codex CLI，也要恢复与该 revision 匹配的版本。
+
+回滚后运行 doctor，并检查旧 thread 是否能 resume。Codex 原生历史和工作区不应依赖 Python 虚拟环境，因此正常回滚不需要迁移用户文件。
+
+## Docker 更新
+
+```bash
+git pull --ff-only
+docker compose build --pull
+docker compose up -d
+docker compose ps
+```
+
+确认工作区和 `CODEX_HOME` 仍挂载到原卷。删除旧容器前不要删除宿主数据目录。
+
+## 数据兼容
+
+muselab-codex 没有应用数据库 schema。需要重点保护的是：
+
+- Codex 管理的 thread／rollout；
+- workspace 附件路径；
+- `.muselab-codex/usage` 数值快照；
+- Provider、Skills 和 MCP 的 Codex 配置。
+
+完整恢复边界见[数据与备份](data-and-backup_zh.md)。
