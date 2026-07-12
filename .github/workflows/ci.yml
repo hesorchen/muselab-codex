@@ -155,6 +155,15 @@ jobs:
           cache-dependency-glob: "uv.lock"
       - name: Set up Python
         run: uv python install 3.12
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+      - name: Install pinned Codex CLI
+        # The real backend lifespan supervises `codex app-server`; without the
+        # binary every browser test dies during fixture setup before Playwright
+        # executes a single assertion. Keep this aligned with AGENTS.md's
+        # protocol baseline so E2E exercises the supported runtime version.
+        run: npm install --global @openai/codex@0.144.1
       - name: Install deps + playwright
         # pytest-playwright pulled ephemerally (not in the frozen dev lock).
         run: uv run --with pytest-playwright playwright install --with-deps chromium
