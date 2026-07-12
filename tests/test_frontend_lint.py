@@ -266,6 +266,16 @@ def test_turn_done_stamps_the_actual_tail_message_for_footer():
     assert "if (m.role !== \"assistant\") continue" not in mark_done
 
 
+def test_stale_permission_card_is_marked_expired_on_404():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async decidePermission(msg, decision)")
+    end = app.index("\n    async togglePinSession", start)
+    method = app[start:end]
+
+    assert "if (r.status === 404)" in method
+    assert 'msg.decision = "expired"' in method
+
+
 def test_send_waits_for_native_id_when_started_from_an_optimistic_draft():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async send(opts = {})")

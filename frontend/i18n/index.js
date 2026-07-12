@@ -363,6 +363,7 @@ window.MUSELAB_STRINGS = {
     "perm.decision_allow": "已允许",
     "perm.decision_deny": "已拒绝",
     "perm.decision_always": "已加白",
+    "perm.decision_expired": "已过期",
     "perm.submit_failed": "提交决定失败",
     // modal generic
     "modal.confirm_delete": "确认删除 {name}？此操作不可恢复。",
@@ -724,6 +725,7 @@ window.MUSELAB_STRINGS = {
     "perm.decision_allow": "Allowed",
     "perm.decision_deny": "Denied",
     "perm.decision_always": "Whitelisted",
+    "perm.decision_expired": "Expired",
     "perm.submit_failed": "Decision failed",
     "modal.confirm_delete": "Delete {name}? This cannot be undone.",
     "modal.input_required": "Input required",

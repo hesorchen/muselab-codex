@@ -15433,7 +15433,14 @@ function portal() {
             body: JSON.stringify({ decision }),
           },
         );
-        if (!r.ok) {
+        if (r.status === 404) {
+          // Approval requests are ephemeral. A page reload, interrupted turn,
+          // runtime restart, or an answer from another tab can leave the
+          // historical card visible after the broker has already closed it.
+          // Treat that as an expired card, not a retryable submit failure.
+          msg.resolved = true;
+          msg.decision = "expired";
+        } else if (!r.ok) {
           msg.resolved = false;
           msg.decision = null;
           this.toast(this.t("perm.submit_failed"), "error", 3000);
