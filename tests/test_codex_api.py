@@ -363,8 +363,10 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
             "id": "client-id-is-not-authoritative",
             "name": "Native thread",
             "model": "gpt-test-codex",
+            "permission": "bypassPermissions",
         })
         assert created.status_code == 200
+        assert created.json()["permission"] == "bypassPermissions"
         thread_id = created.json()["id"]
         assert thread_id.startswith("thread-")
         configured_effort = client.patch(

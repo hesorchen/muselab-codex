@@ -67,6 +67,7 @@ class CreateSessionRequest(BaseModel):
     name: str = ""
     model: str = ""
     model_provider: str = ""
+    permission: str = "default"
     open_ids: list[str] | None = None
 
 
@@ -196,6 +197,8 @@ async def create_session(request: Request, body: CreateSessionRequest) -> dict[s
     # intentionally ignored; the frontend now adopts the returned native id.
     threads, turns = _services(request)
     try:
+        if body.permission not in {"default", "plan", "bypassPermissions"}:
+            raise ValueError("unknown permission mode")
         provider = _native_provider_id(body.model, body.model_provider)
         config = request.app.state.codex_providers.thread_config(provider) if provider else None
         thread = await threads.start(
@@ -206,7 +209,8 @@ async def create_session(request: Request, body: CreateSessionRequest) -> dict[s
         )
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
-    return _session_meta(thread, turns, model=body.model)
+    return _session_meta(
+        thread, turns, model=body.model, permission=body.permission)
 
 
 @router.get("/sessions/{thread_id}", dependencies=[Depends(require_token)])
@@ -1037,6 +1041,7 @@ def _session_meta(
     *,
     model: str = "",
     effort: str | None = None,
+    permission: str | None = None,
 ) -> dict[str, Any]:
     thread_id = str(thread.get("id") or "")
     messages = _thread_messages(thread)
@@ -1073,7 +1078,11 @@ def _session_meta(
         "pinned": False,
         "active": turns.active(thread_id) is not None,
         "effort": effort if effort is not None else str(settings.get("effort") or ""),
-        "permission": str(settings.get("permission") or "default"),
+        "permission": (
+            permission
+            if permission is not None
+            else str(settings.get("permission") or "default")
+        ),
         "thinking": True,
         "parent_thread_id": (
             thread["parentThreadId"]

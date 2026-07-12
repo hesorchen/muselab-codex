@@ -229,6 +229,30 @@ def test_default_permission_is_saved_separately_from_current_session():
     assert "this.savePrefs()" in app[save_start:save_end]
     assert "defaultPermission: this.defaultPermission" in app
 
+    create_start = app.index("async _newServerSession()")
+    create_end = app.index("\n    newSession()", create_start)
+    create = app[create_start:create_end]
+    assert 'const seedPermission = this.defaultPermission || "default"' in create
+    assert "permission: seedPermission" in create
+    assert "meta.permission = meta.permission || seedPermission" in create
+
+
+def test_mobile_session_settings_expose_permission_and_effort_without_clipping():
+    """The gear popover must show both per-session controls above composer."""
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    start = html.index('<div class="chat-toolbar-more">')
+    end = html.index("<!-- Extended-thinking", start)
+    popover = html[start:end]
+
+    assert "t('session.permission')" in popover
+    assert 'x-model="permission"' in popover
+    assert "t('session.intelligence')" in popover
+    assert 'x-model="effort"' in popover
+    assert "'settings-open': composerSettingsOpen" in html
+    assert ".chat-input-wrap.settings-open { overflow: visible; }" in css
+
 
 def test_send_waits_for_native_id_when_started_from_an_optimistic_draft():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")

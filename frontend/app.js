@@ -5713,8 +5713,9 @@ function portal() {
       if (this._creatingSession) return null;
       this._creatingSession = true;
       const seedModel = this.defaultModel || this.model || "";
+      const seedPermission = this.defaultPermission || "default";
       this.model = seedModel;
-      this.permission = this.defaultPermission || "default";
+      this.permission = seedPermission;
       const draftId = "draft-" + this._uuid();
       const now = Date.now() / 1000;
       const draft = {
@@ -5722,6 +5723,7 @@ function portal() {
         name: this.lang === "zh" ? "新会话" : "New chat",
         model: seedModel,
         model_provider: this._modelProvider(seedModel),
+        permission: seedPermission,
         created_at: now,
         updated_at: now,
         message_count: 0,
@@ -5751,6 +5753,7 @@ function portal() {
             // that placeholder an explicit name and mask the native preview.
             model: seedModel,
             model_provider: this._modelProvider(seedModel),
+            permission: seedPermission,
           }),
         });
         if (!response.ok) throw new Error("session " + response.status);
@@ -5759,6 +5762,11 @@ function portal() {
         if (meta.auto_named) {
           meta.name = this.lang === "zh" ? "新会话" : "New chat";
         }
+        // permission is a per-turn setting, but the empty-session metadata
+        // still needs to reflect the default selected for this new chat.
+        // Older backends omitted it and caused the UI to fall back to
+        // "default" immediately after the optimistic draft was replaced.
+        meta.permission = meta.permission || seedPermission;
 
         const draftIndex = this.sessions.findIndex(s => s.id === draftId);
         const nextSessions = this.sessions.filter(
