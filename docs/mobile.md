@@ -45,8 +45,9 @@ Enabled in **Settings → Notifications**. The backend exposes
 `/api/push/{vapid-public,subscribe,unsubscribe,test}`. It generates VAPID state
 on first use and stores the private key and device subscriptions in
 `<workspace>/.muselab/{vapid.json,push_subs.json}`. Settings can send an
-end-to-end test notification. Automatic scheduler-completion delivery is not
-wired in the current version.
+end-to-end test notification. Completed normal and scheduled Codex turns are
+delivered automatically to subscribed phones and tablets when no mobile
+muselab page is currently active. Desktop subscriptions and presence are ignored.
 
 Back up `vapid.json` privately. Replacing it requires every device to subscribe again.
 

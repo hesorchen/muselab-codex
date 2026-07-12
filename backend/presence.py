@@ -1,15 +1,11 @@
-"""User-presence tracking — gates Web Push so a notification doesn't
-fan out to the phone while the user is actively at the desktop.
+"""Mobile-presence tracking for phone-only Web Push suppression.
 
 Why this exists:
-  Each browser/PWA's service worker can only see ITS OWN device's window
-  visibility. Service worker on the phone has no way to know the desktop
-  tab is in foreground — so even with the per-device SW visibility check
-  in sw.js, the user would still hear their phone buzz while typing on
-  the laptop. We fix that by having the frontend POST /api/presence
-  whenever visibility changes (plus a 15s keep-alive while visible); the
-  chat-done push step then asks "is any device foregrounded right now?"
-  and silently skips the push if so.
+  Notifications target phones and tablets only. Desktop activity is ignored;
+  otherwise working at a computer would suppress the very phone notification
+  the user requested. Mobile clients POST /api/presence whenever visibility
+  changes (plus a 15s keep-alive while visible). A completed turn is suppressed
+  only while a mobile muselab page is already in the foreground.
 
 v2 (2026-06-12): per-device records with an explicit hidden signal.
   v1 kept a single shared timestamp and could only let it EXPIRE — after
@@ -26,8 +22,8 @@ v2 (2026-06-12): per-device records with an explicit hidden signal.
 This is a single-user app (one MUSELAB_TOKEN, one archive), so a small
 device_id-keyed dict is enough — device_id is a random UUID the frontend
 mints once into localStorage, purely to tell records apart; it carries
-no auth meaning. Old clients that POST without a body land on the
-"default" id with visible=True — exactly the v1 behavior.
+no auth meaning. Legacy clients without ``device_kind=mobile`` are deliberately
+ignored by the gate so desktop or unknown activity cannot silence the phone.
 
 Thread-safety note: callers run on the event loop (chat.py) and in
 FastAPI's threadpool (the sync /api/presence handler). All mutations are
@@ -52,18 +48,14 @@ GRACE_SECONDS: float = 30.0
 
 def _max_visible_streak() -> float:
     """Phantom-tab guard (2026-06-23). A device that reports `visible`
-    every 15s but NEVER sends a `hidden` signal is almost certainly a
-    desktop tab left foregrounded on an always-on machine — not someone
-    actually watching. Because recently_active() is GLOBAL (any visible
-    device suppresses pushes to ALL devices, including the phone), one
-    such parked tab silently silences phone notifications forever.
+    every 15s but NEVER sends a `hidden` signal may be a mobile PWA left
+    foregrounded by the OS rather than someone actually watching. Without a
+    bound, one such parked client could silence phone notifications forever.
 
     So we stop trusting a continuous `visible` streak once it exceeds
     this many seconds: past that, the device no longer suppresses
-    pushes. A real desktop session almost always breaks visibility
-    within the window — switching tabs, locking the screen, or
-    minimizing all fire visibilitychange→hidden, which resets the
-    streak. Only a genuinely parked tab runs past it.
+    pushes. A real mobile session normally breaks visibility within the window
+    as the user switches apps or locks the screen.
 
     Default 30 min; override with MUSELAB_PRESENCE_MAX_VISIBLE_SEC
     (<=0 disables the guard, restoring the old always-trust behavior)."""
@@ -74,19 +66,25 @@ def _max_visible_streak() -> float:
     return v
 
 
-# device_id -> (last_report_ts, visible, visible_since). visible_since is
+# device_id -> (last_report_ts, visible, visible_since, device_kind).
+# visible_since is
 # the start of the CURRENT uninterrupted visible streak (None when the
 # device's last report was hidden), used by the phantom-tab guard above.
 # Bounded by the user's device count in practice; pruned opportunistically
 # in mark_seen.
-_devices: dict[str, tuple[float, bool, float | None]] = {}
+_devices: dict[str, tuple[float, bool, float | None, str]] = {}
 
 # Entries untouched for this long are dropped — dead device ids (cleared
 # localStorage, retired phone) shouldn't accumulate forever.
 _PRUNE_SECONDS: float = 24 * 3600.0
 
 
-def mark_seen(device_id: str = "default", visible: bool = True) -> None:
+def mark_seen(
+    device_id: str = "default",
+    visible: bool = True,
+    *,
+    device_kind: str = "unknown",
+) -> None:
     """Called by /api/presence on every frontend report.
 
     visible=True  — page is foregrounded (init / 15s keep-alive / refocus)
@@ -94,6 +92,7 @@ def mark_seen(device_id: str = "default", visible: bool = True) -> None:
                     immediately releases this device's push suppression.
     """
     now = time.time()
+    kind = device_kind if device_kind in {"mobile", "desktop"} else "unknown"
     prev = _devices.get(device_id)
     if visible:
         # Continue the streak if the device was already visible; otherwise
@@ -104,15 +103,15 @@ def mark_seen(device_id: str = "default", visible: bool = True) -> None:
             visible_since = now
     else:
         visible_since = None
-    _devices[device_id] = (now, visible, visible_since)
+    _devices[device_id] = (now, visible, visible_since, kind)
     if len(_devices) > 8:  # prune only when the dict has visibly grown
-        for k, (ts, _vis, _vs) in list(_devices.items()):
+        for k, (ts, _vis, _vs, _kind) in list(_devices.items()):
             if now - ts > _PRUNE_SECONDS:
                 _devices.pop(k, None)
 
 
 def recently_active(grace: float = GRACE_SECONDS) -> bool:
-    """True if any device is believed to be foregrounded right now:
+    """True if any mobile device is believed to be foregrounded right now:
     its last report said visible AND arrived within `grace` seconds.
     Push-gate uses this to skip fan-out when the user is at a device.
 
@@ -121,7 +120,9 @@ def recently_active(grace: float = GRACE_SECONDS) -> bool:
     suppresses pushes — see _max_visible_streak() for the rationale."""
     now = time.time()
     max_streak = _max_visible_streak()
-    for ts, vis, vsince in _devices.values():
+    for ts, vis, vsince, kind in _devices.values():
+        if kind != "mobile":
+            continue
         if not vis or (now - ts) >= grace:
             continue
         if max_streak > 0 and vsince is not None \
@@ -140,7 +141,9 @@ def last_seen_age() -> float | None:
     now = time.time()
     max_streak = _max_visible_streak()
     ages = []
-    for ts, vis, vsince in _devices.values():
+    for ts, vis, vsince, kind in _devices.values():
+        if kind != "mobile":
+            continue
         if not vis or (now - ts) >= GRACE_SECONDS:
             continue
         if max_streak > 0 and vsince is not None \

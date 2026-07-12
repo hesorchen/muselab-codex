@@ -4,8 +4,8 @@
                                           passes to PushManager.subscribe)
   POST /api/push/subscribe             — body = browser PushSubscription JSON
   POST /api/push/unsubscribe           — body = { endpoint: str }
-  POST /api/push/test                  — fan a test notification out to every
-                                          subscription; returns the raw
+  POST /api/push/test                  — fan a test notification out to mobile
+                                          subscriptions; returns the raw
                                           {sent, dropped, errors} so the
                                           settings page can self-diagnose
 """
@@ -36,6 +36,7 @@ class _SubscribeIn(BaseModel):
     endpoint: str = Field(min_length=1, max_length=2048)
     keys: _PushKeys
     expirationTime: int | None = None   # PushSubscription field; we don't use it
+    device_kind: str = Field(default="unknown", pattern="^(mobile|desktop|unknown)$")
 
 
 _MAX_SUBS = 64
@@ -62,6 +63,7 @@ def subscribe(sub: _SubscribeIn, request: Request) -> dict:
         push.add_subscription_capped({
             "endpoint": sub.endpoint,
             "keys": {"p256dh": sub.keys.p256dh, "auth": sub.keys.auth},
+            "device_kind": sub.device_kind,
         }, _MAX_SUBS, ua=request.headers.get("user-agent", ""))
     except RuntimeError as e:
         raise HTTPException(429, str(e)) from None
@@ -87,6 +89,7 @@ async def test_push() -> dict:
         tag="push-test",
         force=True,
         context="manual-test",
+        mobile_only=True,
     )
 
 

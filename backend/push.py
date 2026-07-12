@@ -16,7 +16,7 @@ Public API:
   get_vapid_public_key()       — base64 url-safe, ship to the frontend
   add_subscription(sub)        — persist after pushManager.subscribe()
   remove_subscription(endp)    — called on user opt-out
-  send_to_all(title, body, …)  — fire-and-forget; iterates all subs,
+  send_to_all(title, body, …)  — fire-and-forget; iterates selected subs,
                                  drops dead ones (410 / 404 from the
                                  push service) automatically
 """
@@ -249,10 +249,11 @@ def list_subscriptions() -> list[dict]:
 
 def send_to_all(title: str, body: str, *, url: str = "/",
                  tag: str = "muselab-task", force: bool = False,
-                 context: str = "") -> dict:
+                 context: str = "", mobile_only: bool = False) -> dict:
     """Fire a push payload at every subscription. Dead subs (410/404
     from the push service) are dropped from the store. Returns
-    {sent, dropped, errors}.
+    {sent, dropped, errors}. ``mobile_only`` ignores desktop and legacy
+    unclassified subscriptions; the frontend refreshes old records on startup.
 
     force   — payload flag for sw.js: show the notification even when a
               muselab window is visible on the device. Used by the
@@ -288,7 +289,10 @@ def send_to_all(title: str, body: str, *, url: str = "/",
     # end, re-reading disk first so we don't clobber a concurrent add.
     with _subs_lock:
         _load_subs()
-        targets = list(_subs.items())
+        targets = [
+            (endpoint, sub) for endpoint, sub in _subs.items()
+            if not mobile_only or sub.get("device_kind") == "mobile"
+        ]
     sent = 0
     dropped: list[str] = []
     errors: list[str] = []

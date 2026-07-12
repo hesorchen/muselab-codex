@@ -1152,6 +1152,7 @@ function portal() {
       // settings — your phone can vibrate; the desktop tab silently
       // updates the bell badge.
       this.loadNotifyPrefs();
+      if (this.notifyEnabled) this.refreshPushSubscriptionMetadata();
       // Global error capture — when alpine's "Cannot read properties of
       // undefined (reading 'after')" fires we want the FULL story (msg,
       // file, line, stack) printed in one block so the user can copy it
@@ -1680,7 +1681,11 @@ function portal() {
           fetch("/api/presence", {
             method: "POST",
             headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ device_id: deviceId, visible }),
+            body: JSON.stringify({
+              device_id: deviceId,
+              visible,
+              device_kind: this._pushDeviceKind(),
+            }),
             // The hidden report races the browser freezing this page on
             // background-switch; keepalive lets it complete after the
             // page is gone (sendBeacon can't carry our auth header).
@@ -16431,7 +16436,9 @@ function portal() {
         const sr = await fetch("/api/push/subscribe", {
           method: "POST",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
-          body: JSON.stringify(sub.toJSON()),
+          body: JSON.stringify({
+            ...sub.toJSON(), device_kind: this._pushDeviceKind(),
+          }),
         });
         if (!sr.ok) throw new Error("subscribe POST failed: " + sr.status);
         this.toast(this.lang === "zh"
@@ -16457,9 +16464,47 @@ function portal() {
         return false;
       }
     },
+    _pushDeviceKind() {
+      // iPadOS may advertise itself as desktop Safari ("Macintosh"). The
+      // touch-point check keeps those subscriptions in the mobile bucket.
+      const uaMobile = navigator.userAgentData?.mobile;
+      const touchIpad = /Macintosh/i.test(navigator.userAgent || "")
+        && (navigator.maxTouchPoints || 0) > 1;
+      const mobileUa = /Android|iPhone|iPad|iPod|Mobile/i.test(
+        navigator.userAgent || "");
+      return (uaMobile === true || touchIpad || mobileUa) ? "mobile" : "desktop";
+    },
+    async refreshPushSubscriptionMetadata() {
+      // Older subscriptions predate device_kind. Refresh the server record
+      // silently on startup so mobile-only routing works without asking the
+      // user to toggle notifications off and on again.
+      try {
+        if (!("serviceWorker" in navigator)) {
+          this.notifyEnabled = false;
+          this.saveNotifyPrefs();
+          return;
+        }
+        const reg = await navigator.serviceWorker.getRegistration("/sw.js");
+        const sub = reg && await reg.pushManager.getSubscription();
+        if (!sub) {
+          // localStorage can survive an expired/cleared browser subscription.
+          // Never show ON when the device has nothing the server can deliver to.
+          this.notifyEnabled = false;
+          this.saveNotifyPrefs();
+          return;
+        }
+        await fetch("/api/push/subscribe", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...sub.toJSON(), device_kind: this._pushDeviceKind(),
+          }),
+        });
+      } catch (_) { /* best-effort metadata migration */ }
+    },
     async pushTest() {
       // End-to-end self-check: backend fans a force-flagged payload out to
-      // every stored subscription (bypasses the presence gate; sw.js skips
+      // every stored mobile subscription (bypasses the presence gate; sw.js skips
       // its visibility suppression on `force`). Surfaces the raw
       // {sent, dropped, errors} so a zombie subscription or a push-service
       // rejection is visible to the user in 10 seconds instead of a
@@ -16473,8 +16518,8 @@ function portal() {
         const zh = this.lang === "zh";
         if (!d.sent && !errs) {
           this.toast(zh
-            ? "没有任何已订阅设备——先打开上面的通知开关"
-            : "No subscribed devices — enable the switch above first",
+            ? "没有已订阅的手机设备——请先在手机端打开通知开关"
+            : "No subscribed mobile device — enable notifications on your phone first",
             "warn", 4000);
           return;
         }
