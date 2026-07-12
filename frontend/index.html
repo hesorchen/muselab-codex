@@ -3467,7 +3467,9 @@
                                : key === 'all_time' ? t('set.cost.all')
                                : t('set.cost.30d')"></div>
                     <div class="cost-kpi-value"
-                         x-text="fmtTokens(totalTokens(cost.data[key]))"></div>
+                         x-text="key === 'today' && cost.data.today_pending
+                                   ? t('set.cost.pending')
+                                   : fmtTokens(totalTokens(cost.data[key]))"></div>
                   </div>
                 </template>
               </div>
