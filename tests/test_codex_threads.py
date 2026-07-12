@@ -124,6 +124,38 @@ async def test_resume_preserves_persisted_approval_and_sandbox(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_start_inherits_native_codex_permissions_by_default(tmp_path):
+    requester = StubRequester({"thread": {"id": "thread-1"}})
+    service = CodexThreadService(requester, tmp_path)
+
+    await service.start()
+
+    method, params, timeout = requester.calls[0]
+    assert method == "thread/start"
+    assert timeout is None
+    assert params == {
+        "cwd": str(tmp_path.resolve()),
+        "ephemeral": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_start_can_explicitly_override_native_permissions(tmp_path):
+    requester = StubRequester({"thread": {"id": "thread-1"}})
+    service = CodexThreadService(
+        requester,
+        tmp_path,
+        approval_policy="never",
+        sandbox="danger-full-access",
+    )
+
+    await service.start()
+
+    assert requester.calls[0][1]["approvalPolicy"] == "never"
+    assert requester.calls[0][1]["sandbox"] == "danger-full-access"
+
+
+@pytest.mark.asyncio
 async def test_invalid_thread_results_fail_as_protocol_errors(tmp_path):
     service = CodexThreadService(StubRequester({"thread": {}}), tmp_path)
     with pytest.raises(AppServerProtocolError, match="without an id"):

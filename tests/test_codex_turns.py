@@ -79,7 +79,7 @@ class Usage:
 
 
 @pytest.mark.parametrize(("permission", "approval", "sandbox", "mode"), [
-    ("default", "on-request", "workspaceWrite", "default"),
+    ("default", None, None, "default"),
     ("acceptEdits", "untrusted", "workspaceWrite", "default"),
     ("plan", "on-request", "readOnly", "plan"),
     ("bypassPermissions", "never", "dangerFullAccess", "default"),
@@ -89,8 +89,12 @@ def test_permission_modes_map_to_explicit_codex_turn_settings(
 ):
     params = _permission_overrides(permission, "gpt-test", "high")
 
-    assert params["approvalPolicy"] == approval
-    assert params["sandboxPolicy"] == {"type": sandbox}
+    if approval is None:
+        assert "approvalPolicy" not in params
+        assert "sandboxPolicy" not in params
+    else:
+        assert params["approvalPolicy"] == approval
+        assert params["sandboxPolicy"] == {"type": sandbox}
     assert params["collaborationMode"] == {
         "mode": mode,
         "settings": {
@@ -138,8 +142,8 @@ async def test_turn_maps_reasoning_tools_text_and_done_with_replay():
     turn_params = next(params for method, params, _timeout in runtime.calls
                        if method == "turn/start")
     assert turn_params["effort"] == "high"
-    assert turn_params["approvalPolicy"] == "on-request"
-    assert turn_params["sandboxPolicy"] == {"type": "workspaceWrite"}
+    assert "approvalPolicy" not in turn_params
+    assert "sandboxPolicy" not in turn_params
 
     notifications = [
         ("item/reasoning/summaryTextDelta", {"delta": "think"}),

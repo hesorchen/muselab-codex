@@ -236,6 +236,10 @@ def test_default_permission_is_saved_separately_from_current_session():
     assert "permission: seedPermission" in create
     assert "meta.permission = meta.permission || seedPermission" in create
 
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    assert html.count("Codex 默认") == 3
+    assert "'Ask as needed'" not in html
+
 
 def test_mobile_session_settings_expose_permission_and_effort_without_clipping():
     """The gear popover must show both per-session controls above composer."""

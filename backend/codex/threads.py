@@ -40,8 +40,8 @@ class CodexThreadService:
         requester: Requester,
         workspace: Path,
         *,
-        approval_policy: str = "on-request",
-        sandbox: str = "workspace-write",
+        approval_policy: str | None = None,
+        sandbox: str | None = None,
     ):
         self.requester = requester
         self.workspace = Path(workspace).resolve()
@@ -65,10 +65,15 @@ class CodexThreadService:
         self._sync_runtime_generation()
         params: dict[str, Any] = {
             "cwd": str(self.workspace),
-            "approvalPolicy": self.approval_policy,
-            "sandbox": self.sandbox,
             "ephemeral": False,
         }
+        # Codex owns the permission defaults in config.toml.  Only send these
+        # fields when the embedding caller explicitly requests an override;
+        # otherwise app-server inherits the user's native Codex configuration.
+        if self.approval_policy is not None:
+            params["approvalPolicy"] = self.approval_policy
+        if self.sandbox is not None:
+            params["sandbox"] = self.sandbox
         if model:
             params["model"] = model
         if model_provider:
@@ -254,10 +259,12 @@ class CodexThreadService:
         params: dict[str, Any] = {
             "threadId": _thread_id(thread_id),
             "cwd": str(self.workspace),
-            "approvalPolicy": self.approval_policy,
-            "sandbox": self.sandbox,
             "ephemeral": False,
         }
+        if self.approval_policy is not None:
+            params["approvalPolicy"] = self.approval_policy
+        if self.sandbox is not None:
+            params["sandbox"] = self.sandbox
         if last_turn_id:
             params["lastTurnId"] = last_turn_id
         if model:
