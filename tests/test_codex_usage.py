@@ -97,8 +97,24 @@ def test_account_dashboard_uses_native_lifetime_and_daily_buckets(tmp_path):
     assert dashboard["breakdown_available"] is False
     assert dashboard["all_time"]["total_tokens"] == 9000
     assert dashboard["today"]["total_tokens"] == 600
+    assert dashboard["today_pending"] is False
     assert dashboard["last_7d"]["total_tokens"] == 1000
     assert dashboard["by_model"] == []
+
+
+def test_account_dashboard_marks_missing_today_bucket_as_pending(tmp_path):
+    service = CodexUsageService(tmp_path)
+    today = date.today()
+    dashboard = service.account_dashboard({
+        "summary": {"lifetimeTokens": 400},
+        "dailyUsageBuckets": [{
+            "startDate": (today - timedelta(days=1)).isoformat(),
+            "tokens": 400,
+        }],
+    }, days=30, tz_offset_minutes=480)
+
+    assert dashboard["today"]["total_tokens"] == 0
+    assert dashboard["today_pending"] is True
 
 
 def test_usage_root_symlink_cannot_escape_workspace(tmp_path):

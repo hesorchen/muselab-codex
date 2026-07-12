@@ -150,6 +150,10 @@ class CodexUsageService:
             "runtime": "codex",
             "authoritative": True,
             "breakdown_available": False,
+            # Daily account buckets may lag until the day is finalized. Keep
+            # a missing current-day bucket distinct from a real zero-token
+            # bucket so the UI can say "pending" instead of showing 0.
+            "today_pending": today not in parsed,
             "window_days": available_days,
             "today": period(1),
             "last_7d": period(7),

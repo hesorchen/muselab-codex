@@ -5644,6 +5644,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border-color: var(--c-accent);
   background: var(--c-accent-soft);
 }
+/* The mobile session-settings popover is positioned above the toolbar. The
+   wrapper normally clips its children to preserve rounded composer corners;
+   temporarily release that clipping while the gear panel is open. Without
+   this, the panel (and especially its first Permission field) is cut off. */
+.chat-input-wrap.settings-open { overflow: visible; }
 /* No-provider gate banner: shown inside the composer when no model is
    configured. Disabled textarea + this CTA route the user to Settings. */
 .chat-input-noprov {
@@ -5754,7 +5759,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 /* Composer "more" group — gear that collapses permission/effort on mobile.
    Hidden on desktop (the inline selects stay); CSS in the pointer:coarse
    block flips this on and hides the inline selects instead. */
-.chat-toolbar-more { display: none; position: relative; }
+.chat-toolbar-more { display: none; position: relative; z-index: 51; }
 .chat-toolbar-more-pop {
   position: absolute;
   bottom: calc(100% + 8px);   /* pop upward — composer sits at screen bottom */
@@ -5767,6 +5772,13 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   border: 1px solid var(--c-border);
   border-radius: var(--r-lg);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+}
+.chat-toolbar-more-title {
+  padding-bottom: var(--sp-2);
+  border-bottom: 1px solid var(--c-border);
+  color: var(--c-fg-0);
+  font-size: var(--fs-sm);
+  font-weight: 600;
 }
 .chat-toolbar-more-field {
   display: flex; flex-direction: column; gap: 4px;

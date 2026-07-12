@@ -2648,7 +2648,7 @@
              @dragover.prevent="dragHover=true"
              @dragleave="dragHover=false"
              @drop.prevent="dragHover=false; onAttachDrop($event)"
-             :class="{ 'drag-hover': dragHover }">
+             :class="{ 'drag-hover': dragHover, 'settings-open': composerSettingsOpen }">
           <!-- No `accept` filter — lets the user pick any file from the OS
                picker. The classifier (frontend + backend) decides what
                actually gets inlined; unsupported types are rejected with
@@ -2767,8 +2767,9 @@
                    x-show="composerSettingsOpen"
                    x-cloak
                    @click.outside="composerSettingsOpen = false">
+                <div class="chat-toolbar-more-title" x-text="t('session.settings')"></div>
                 <label class="chat-toolbar-more-field">
-                  <span x-text="t('set.label.default_permission')"></span>
+                  <span x-text="t('session.permission')"></span>
                   <select x-model="permission">
                     <option value="default" x-text="lang==='zh' ? '按需询问' : 'Ask as needed'"></option>
                     <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
@@ -2776,7 +2777,7 @@
                   </select>
                 </label>
                 <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
-                  <span x-text="t('effort.title')"></span>
+                  <span x-text="t('session.intelligence')"></span>
                   <select x-model="effort" @change="onEffortChange()">
                     <template x-for="opt in effortChoices(model)" :key="opt.value || 'auto'">
                       <option :value="opt.value" x-text="t(opt.labelKey)"></option>
@@ -3466,7 +3467,9 @@
                                : key === 'all_time' ? t('set.cost.all')
                                : t('set.cost.30d')"></div>
                     <div class="cost-kpi-value"
-                         x-text="fmtTokens(totalTokens(cost.data[key]))"></div>
+                         x-text="key === 'today' && cost.data.today_pending
+                                   ? t('set.cost.pending')
+                                   : fmtTokens(totalTokens(cost.data[key]))"></div>
                   </div>
                 </template>
               </div>

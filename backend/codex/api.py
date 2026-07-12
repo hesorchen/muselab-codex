@@ -67,6 +67,7 @@ class CreateSessionRequest(BaseModel):
     name: str = ""
     model: str = ""
     model_provider: str = ""
+    permission: str = "default"
     open_ids: list[str] | None = None
 
 
@@ -196,6 +197,8 @@ async def create_session(request: Request, body: CreateSessionRequest) -> dict[s
     # intentionally ignored; the frontend now adopts the returned native id.
     threads, turns = _services(request)
     try:
+        if body.permission not in {"default", "plan", "bypassPermissions"}:
+            raise ValueError("unknown permission mode")
         provider = _native_provider_id(body.model, body.model_provider)
         config = request.app.state.codex_providers.thread_config(provider) if provider else None
         thread = await threads.start(
@@ -206,7 +209,8 @@ async def create_session(request: Request, body: CreateSessionRequest) -> dict[s
         )
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
-    return _session_meta(thread, turns, model=body.model)
+    return _session_meta(
+        thread, turns, model=body.model, permission=body.permission)
 
 
 @router.get("/sessions/{thread_id}", dependencies=[Depends(require_token)])
@@ -1037,6 +1041,7 @@ def _session_meta(
     *,
     model: str = "",
     effort: str | None = None,
+    permission: str | None = None,
 ) -> dict[str, Any]:
     thread_id = str(thread.get("id") or "")
     messages = _thread_messages(thread)
@@ -1073,7 +1078,11 @@ def _session_meta(
         "pinned": False,
         "active": turns.active(thread_id) is not None,
         "effort": effort if effort is not None else str(settings.get("effort") or ""),
-        "permission": str(settings.get("permission") or "default"),
+        "permission": (
+            permission
+            if permission is not None
+            else str(settings.get("permission") or "default")
+        ),
         "thinking": True,
         "parent_thread_id": (
             thread["parentThreadId"]
@@ -1109,7 +1118,7 @@ def _thread_messages(
     for turn in turns:
         if not isinstance(turn, dict) or not isinstance(turn.get("items"), list):
             continue
-        for item in turn["items"]:
+        for item in _visible_turn_items(turn["items"]):
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
@@ -1208,7 +1217,7 @@ def _thread_outline(thread: dict[str, Any]) -> list[dict[str, Any]]:
     for turn in turns:
         if not isinstance(turn, dict) or not isinstance(turn.get("items"), list):
             continue
-        for item in turn["items"]:
+        for item in _visible_turn_items(turn["items"]):
             if not isinstance(item, dict) or item.get("type") != "userMessage":
                 continue
             user_ordinal += 1
@@ -1223,6 +1232,31 @@ def _thread_outline(thread: dict[str, Any]) -> list[dict[str, Any]]:
                     thread, item, user_ordinal, user_ids),
             })
     return outline
+
+
+def _visible_turn_items(items: list[Any]) -> list[Any]:
+    """Hide Codex-injected user context from legacy thread/read results.
+
+    Paginated and JSONL history is already normalized by ``_project_turns``.
+    This duplicate-id coalescing keeps the older ``thread/read`` fallback from
+    exposing the same internal context when native item history is unavailable.
+    """
+    visible: list[Any] = []
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "userMessage" and visible:
+            previous = visible[-1]
+            item_id = item.get("id")
+            if (
+                isinstance(previous, dict)
+                and previous.get("type") == "userMessage"
+                and isinstance(item_id, str)
+                and bool(item_id)
+                and item_id == previous.get("id")
+            ):
+                visible[-1] = item
+                continue
+        visible.append(item)
+    return visible
 
 
 def _user_message_uuid(
