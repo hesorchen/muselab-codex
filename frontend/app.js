@@ -14909,12 +14909,11 @@ function portal() {
         }
         // Stamp the tail of the just-finished turn with completion
         // timestamp + total elapsed seconds. A "turn" = contiguous run
-        // of muse-side messages between two user messages; only the tail
-        // assistant TEXT bubble carries .ts / .elapsed so .turn-footer
-        // (HH:MM · 2m50s) renders under the actual reply, not a stray
-        // tool_result row that happened to close the turn. Walk backwards
-        // past tool_use / tool_result / thinking blocks until we hit an
-        // assistant text or hit the user message that started the turn.
+        // of muse-side messages between two user messages. The DOM renders
+        // .turn-footer on the ACTUAL final message in that run, which may be
+        // a hidden tool/task notification appended after the final assistant
+        // text. Stamp that true tail; stamping only the assistant bubble left
+        // the rendered footer empty for tool-heavy Codex turns.
         //
         // elapsed: use the FE-tracked streamElapsed (matches the value
         // the user just watched tick up next to the dots). Backend's
@@ -14926,12 +14925,15 @@ function portal() {
         for (let k = streamState.messages.length - 1; k >= 0; k--) {
           const m = streamState.messages[k];
           if (m.role === "user") break;          // entered the previous turn
-          // Skip tool blocks / standalone thinking; they're not the
-          // "reply" the user reads time off.
-          if (m.role !== "assistant") continue;
-          if (!m.ts) m.ts = _now;                // found the tail text bubble
-          if (!m.elapsed && _elapsed >= 1) m.elapsed = _elapsed;
-          break;                                  // stop after the first one (most recent)
+          // Replace through the reactive array instead of adding ts/elapsed
+          // keys to a raw tool object in place. Alpine then reliably
+          // re-evaluates the footer's x-show expressions on mobile Safari.
+          streamState.messages.splice(k, 1, {
+            ...m,
+            ts: m.ts || _now,
+            elapsed: m.elapsed || (_elapsed >= 1 ? _elapsed : 0),
+          });
+          break;
         }
         if (this.currentId === streamSid) {
           this.streaming = false;

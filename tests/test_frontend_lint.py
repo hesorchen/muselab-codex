@@ -254,6 +254,18 @@ def test_mobile_session_settings_expose_permission_and_effort_without_clipping()
     assert ".chat-input-wrap.settings-open { overflow: visible; }" in css
 
 
+def test_turn_done_stamps_the_actual_tail_message_for_footer():
+    """A trailing tool/task item must not leave completion footer empty."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("const _markDone = (cancelled = false) =>")
+    end = app.index('es.addEventListener("done"', start)
+    mark_done = app[start:end]
+
+    assert "streamState.messages.splice(k, 1" in mark_done
+    assert "ts: m.ts || _now" in mark_done
+    assert "if (m.role !== \"assistant\") continue" not in mark_done
+
+
 def test_send_waits_for_native_id_when_started_from_an_optimistic_draft():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async send(opts = {})")
