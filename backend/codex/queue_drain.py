@@ -32,8 +32,11 @@ class CodexQueueDrainService:
             if item is None:
                 return False
             try:
+                from ..turn_notifications import clear_turn_origin, record_turn_origin
                 prepared = self.attachments.prepare(
                     thread_id, str(item.get("image_ids") or ""))
+                record_turn_origin(
+                    thread_id, str(item.get("source_device_kind") or "unknown"))
                 await self.turns.start(
                     thread_id,
                     str(item.get("text") or ""),
@@ -47,10 +50,12 @@ class CodexQueueDrainService:
                     client_user_message_id=prepared.client_user_message_id,
                 )
             except (TurnAlreadyActive, ValueError):
+                clear_turn_origin(thread_id)
                 self.queue.restore_head(thread_id, item)
                 self.queue.pause(thread_id, True)
                 return False
             except Exception:
+                clear_turn_origin(thread_id)
                 self.queue.restore_head(thread_id, item)
                 self.queue.pause(thread_id, True)
                 return False

@@ -48,6 +48,8 @@ on first use and stores the private key and device subscriptions in
 end-to-end test notification. Completed normal and scheduled Codex turns are
 delivered automatically to subscribed phones and tablets when no mobile
 muselab page is currently active. Desktop subscriptions and presence are ignored.
+Turns started from a desktop are isolated and do not notify the phone; turns
+started from a mobile device still notify after that mobile page goes to the background.
 
 Back up `vapid.json` privately. Replacing it requires every device to subscribe again.
 

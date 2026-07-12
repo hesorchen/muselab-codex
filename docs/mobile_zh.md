@@ -25,6 +25,8 @@ Android Chrome 地址栏会主动提示「安装」。
 
 在**设置 → 通知**中启用。后端暴露 `/api/push/{vapid-public,subscribe,unsubscribe,test}` 接口。首次启动时会生成 VAPID 密钥，并把密钥和设备订阅分别保存到 `<workspace>/.muselab/vapid.json` 与 `push_subs.json`。设置页可以发送端到端测试通知；普通会话和计划任务的 Codex turn 完成后，若当前没有正在使用 muselab 的手机或平板，后端只向已订阅的移动设备发送 Web Push。电脑端订阅和在线状态均会被忽略。
 
+电脑端发起的 turn 与手机通知隔离，完成后不会推送手机；手机端发起的 turn 在手机页面进入后台后仍会正常推送。定时任务不属于某个交互设备，完成后继续按移动端在线状态决定是否推送。
+
 `vapid.json` 含私钥，必须纳入私密备份。若删除或重新生成，所有设备都需要重新订阅。
 
 ### iOS 限制

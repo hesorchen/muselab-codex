@@ -4986,7 +4986,8 @@ function portal() {
                                  permission: this.permission || "default",
                                  model: this.model || "",
                                  model_provider: this._modelProvider(this.model),
-                                 effort: this.effort || "" }),
+                                 effort: this.effort || "",
+                                 source_device_kind: this._pushDeviceKind() }),
         });
         if (r.status === 409) {
           this.toast(this.lang === "zh"
@@ -14416,6 +14417,7 @@ function portal() {
             permission: sendPermission,
             effort: sendEffort,
             image_ids: attachIds.length ? attachIds.join(",") : "",
+            source_device_kind: this._pushDeviceKind(),
           }),
         });
         return tr;
@@ -14431,6 +14433,7 @@ function portal() {
             + "&model_provider=" + encodeURIComponent(this._modelProvider(sendModel))
             + "&permission=" + encodeURIComponent(sendPermission)
             + "&effort=" + encodeURIComponent(sendEffort)
+            + "&source_device_kind=" + encodeURIComponent(this._pushDeviceKind())
             + (attachIds.length ? "&image_ids=" + encodeURIComponent(attachIds.join(",")) : "")
             + "&token=" + encodeURIComponent(this.token);
         } else {

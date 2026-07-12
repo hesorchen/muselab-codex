@@ -35,7 +35,8 @@ async def test_drain_starts_fifo_head_once_when_thread_is_idle():
     queue = CodexQueueService()
     queue.enqueue(
         "thread-1", "first", permission="plan",
-        model="gpt-test", model_provider="openai", effort="high")
+        model="gpt-test", model_provider="openai", effort="high",
+        source_device_kind="desktop")
     queue.enqueue("thread-1", "second")
     turns = Turns()
     drain = CodexQueueDrainService(queue, turns, Attachments())
@@ -48,6 +49,9 @@ async def test_drain_starts_fifo_head_once_when_thread_is_idle():
     assert kwargs["model"] == "gpt-test"
     assert kwargs["model_provider"] == "openai"
     assert kwargs["effort"] == "high"
+    from backend import turn_notifications
+    assert turn_notifications._turn_origins["thread-1"] == "desktop"
+    turn_notifications.clear_turn_origin("thread-1")
     assert [item["text"] for item in queue.get("thread-1")["items"]] == ["second"]
 
 

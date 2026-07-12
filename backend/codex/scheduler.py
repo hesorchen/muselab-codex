@@ -172,6 +172,11 @@ class CodexScheduler:
                         if stored is not None:
                             stored["session_id"] = sid
                             self._save()
+            # Scheduled turns are system-originated, not attached to whichever
+            # browser last used this thread. Explicitly overwrite any stale
+            # interactive origin so scheduler completion keeps its normal push.
+            from ..turn_notifications import record_turn_origin
+            record_turn_origin(sid, "system")
             stream = await self.turns.start(
                 sid, task["prompt"], model=task.get("model") or "",
                 permission="default")

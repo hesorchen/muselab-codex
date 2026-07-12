@@ -16,6 +16,10 @@ Path(os.environ["MUSELAB_ROOT"]).mkdir(parents=True, exist_ok=True)
 from backend import turn_notifications
 
 
+def setup_function():
+    turn_notifications._turn_origins.clear()
+
+
 class Threads:
     async def read(self, thread_id, *, include_turns):
         assert thread_id == "thread-1"
@@ -67,6 +71,62 @@ async def test_completed_turn_skips_push_while_user_is_present(monkeypatch):
     monkeypatch.setattr(turn_notifications.push, "send_to_all", unexpected_push)
     callback = turn_notifications.completed_turn_callback(Threads())
     await callback("thread-1", "completed")
+
+
+@pytest.mark.asyncio
+async def test_desktop_origin_skips_phone_push(monkeypatch):
+    def unexpected_presence_check():
+        raise AssertionError("desktop origin must short-circuit before presence")
+
+    def unexpected_push(**_kwargs):
+        raise AssertionError("desktop-origin turn must not push to phone")
+
+    monkeypatch.setattr(
+        turn_notifications.presence, "recently_active", unexpected_presence_check)
+    monkeypatch.setattr(turn_notifications.push, "send_to_all", unexpected_push)
+    turn_notifications.record_turn_origin("thread-1", "desktop")
+
+    await turn_notifications._notify_completed_turn(Threads(), "thread-1")
+
+    assert "thread-1" not in turn_notifications._turn_origins
+
+
+@pytest.mark.asyncio
+async def test_callback_claims_origin_before_queue_successor_records_its_own(monkeypatch):
+    def unexpected_push(**_kwargs):
+        raise AssertionError("desktop-origin turn must not push to phone")
+
+    monkeypatch.setattr(turn_notifications.push, "send_to_all", unexpected_push)
+    turn_notifications.record_turn_origin("thread-1", "desktop")
+
+    async def start_successor(thread_id, _status):
+        turn_notifications.record_turn_origin(thread_id, "mobile")
+
+    callback = turn_notifications.completed_turn_callback(Threads(), start_successor)
+    await callback("thread-1", "completed")
+
+    assert turn_notifications._turn_origins["thread-1"] == "mobile"
+
+
+@pytest.mark.asyncio
+async def test_mobile_origin_keeps_phone_push_path(monkeypatch):
+    sent = []
+    monkeypatch.setattr(turn_notifications.presence, "recently_active", lambda: False)
+
+    async def run_inline(func, **kwargs):
+        return func(**kwargs)
+
+    monkeypatch.setattr(turn_notifications.asyncio, "to_thread", run_inline)
+    monkeypatch.setattr(
+        turn_notifications.push,
+        "send_to_all",
+        lambda **kwargs: sent.append(kwargs) or {"sent": 1},
+    )
+    turn_notifications.record_turn_origin("thread-1", "mobile")
+
+    await turn_notifications._notify_completed_turn(Threads(), "thread-1")
+
+    assert len(sent) == 1
 
 
 @pytest.mark.asyncio
