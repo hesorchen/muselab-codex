@@ -179,10 +179,10 @@ jobs:
 
   # Builds the Dockerfile on every PR (smoke), and on push to main / tags it
   # publishes a multi-arch image to GitHub Container Registry.
-  #   ghcr.io/<owner>/muselab:latest       — main branch HEAD
-  #   ghcr.io/<owner>/muselab:1.2.3        — git tag v1.2.3
-  #   ghcr.io/<owner>/muselab:1.2          — major.minor of latest tag
-  #   ghcr.io/<owner>/muselab:sha-<short>  — every commit on main
+  #   ghcr.io/<owner>/muselab-codex:latest       — main branch HEAD
+  #   ghcr.io/<owner>/muselab-codex:1.2.3        — git tag v1.2.3
+  #   ghcr.io/<owner>/muselab-codex:1.2          — major.minor of latest tag
+  #   ghcr.io/<owner>/muselab-codex:sha-<short>  — every commit on main
   docker:
     name: docker build + publish
     runs-on: ubuntu-latest
@@ -212,7 +212,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           # Image name lowercased — ghcr is case-sensitive on /<owner>
-          images: ghcr.io/${{ github.repository_owner }}/muselab
+          # Keep the package scoped to this repository. Reusing the legacy
+          # `muselab` package makes GITHUB_TOKEN hit GHCR with 403 because that
+          # package is linked to a different repository.
+          images: ghcr.io/${{ github.repository_owner }}/muselab-codex
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -228,7 +231,7 @@ jobs:
         with:
           context: .
           push: false
-          tags: muselab:ci
+          tags: muselab-codex:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
