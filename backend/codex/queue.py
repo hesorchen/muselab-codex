@@ -23,7 +23,8 @@ class CodexQueueService:
 
     def enqueue(self, thread_id: str, text: str, image_ids: str = "",
                 permission: str = "", *, model: str = "",
-                model_provider: str = "", effort: str = "") -> dict[str, Any]:
+                model_provider: str = "", effort: str = "",
+                source_device_kind: str = "unknown") -> dict[str, Any]:
         sid = _thread_id(thread_id)
         text = text.strip()
         image_ids = image_ids.strip()
@@ -35,6 +36,11 @@ class CodexQueueService:
                 "image_ids": image_ids, "permission": permission,
                 "model": model.strip(), "model_provider": model_provider.strip(),
                 "effort": effort.strip(),
+                "source_device_kind": (
+                    source_device_kind
+                    if source_device_kind in {"mobile", "desktop"}
+                    else "unknown"
+                ),
                 "enqueued_at": time.time()}
         self._items[sid].append(item)
         return dict(item)

@@ -95,6 +95,8 @@ class StreamStartRequest(BaseModel):
     permission: str = "default"
     effort: str = ""
     image_ids: str = ""
+    source_device_kind: str = Field(
+        default="unknown", pattern="^(mobile|desktop|unknown)$")
 
 
 class PermissionDecisionRequest(BaseModel):
@@ -113,6 +115,8 @@ class QueueEnqueueRequest(BaseModel):
     model: str = ""
     model_provider: str = ""
     effort: str = ""
+    source_device_kind: str = Field(
+        default="unknown", pattern="^(mobile|desktop|unknown)$")
 
 
 class QueuePauseRequest(BaseModel):
@@ -423,6 +427,7 @@ async def enqueue_queue(request: Request, thread_id: str,
             model=body.model,
             model_provider=provider,
             effort=body.effort,
+            source_device_kind=body.source_device_kind,
         )
     except OverflowError as exc:
         raise HTTPException(409, str(exc)) from exc
@@ -847,6 +852,7 @@ async def stream_start(body: StreamStartRequest) -> dict[str, str]:
         "permission": body.permission,
         "effort": body.effort,
         "image_ids": body.image_ids,
+        "source_device_kind": body.source_device_kind,
     })
     return {"ticket": ticket}
 
@@ -862,6 +868,7 @@ async def stream(
     permission: str = Query("default"),
     effort: str = Query(""),
     image_ids: str = Query(""),
+    source_device_kind: str = Query("unknown"),
     token: str = Query(""),
 ):
     if ticket:
@@ -876,6 +883,7 @@ async def stream(
         permission = params["permission"]
         effort = params["effort"]
         image_ids = params["image_ids"]
+        source_device_kind = params["source_device_kind"]
     else:
         from ..auth import _token_ok
         if not _token_ok(token):
@@ -885,6 +893,8 @@ async def stream(
 
     _threads, turns = _services(request)
     if prompt.strip() or image_ids.strip():
+        from ..turn_notifications import clear_turn_origin, record_turn_origin
+        record_turn_origin(session_id, source_device_kind)
         try:
             prepared = request.app.state.codex_attachments.prepare(
                 session_id, image_ids)
@@ -904,17 +914,22 @@ async def stream(
                 client_user_message_id=prepared.client_user_message_id,
             )
         except TurnAlreadyActive as exc:
+            clear_turn_origin(session_id)
             return _event_source(_one_event("error", {
                 "error": str(exc),
                 "kind": "turn_busy",
                 "retryable": True,
             }))
         except (AppServerError, ValueError) as exc:
+            clear_turn_origin(session_id)
             return _event_source(_one_event("error", {
                 "error": str(exc),
                 "kind": "turn_start_failed",
                 "retryable": True,
             }))
+        except BaseException:
+            clear_turn_origin(session_id)
+            raise
     else:
         turn_stream = turns.active(session_id)
         if turn_stream is None:
