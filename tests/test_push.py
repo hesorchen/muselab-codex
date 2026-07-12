@@ -193,6 +193,33 @@ def test_send_to_all_no_subscriptions(push_mod):
     assert res == {"sent": 0, "dropped": 0, "errors": []}
 
 
+def test_send_to_all_mobile_only_skips_desktop(push_mod, monkeypatch):
+    push_mod.add_subscription_capped(
+        {**_sub_body("https://push.example.com/phone"), "device_kind": "mobile"},
+        64,
+    )
+    push_mod.add_subscription_capped(
+        {**_sub_body("https://push.example.com/laptop"), "device_kind": "desktop"},
+        64,
+    )
+    delivered = []
+
+    import py_vapid
+    import pywebpush
+
+    monkeypatch.setattr(
+        py_vapid.Vapid, "from_pem", lambda _pem: object())
+    monkeypatch.setattr(
+        pywebpush, "webpush",
+        lambda **kwargs: delivered.append(kwargs["subscription_info"]["endpoint"]),
+    )
+
+    result = push_mod.send_to_all(title="t", body="b", mobile_only=True)
+
+    assert result == {"sent": 1, "dropped": 0, "errors": []}
+    assert delivered == ["https://push.example.com/phone"]
+
+
 def test_send_to_all_drops_dead_subscription(push_mod, temp_root):
     """A 410-Gone push response means the sub is dead → it's removed from
     the store and counted as dropped, not surfaced as an error."""

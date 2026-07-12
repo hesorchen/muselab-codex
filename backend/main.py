@@ -249,8 +249,11 @@ async def _lifespan(app: FastAPI):
     )
     app.state.codex_terminal = CodexTerminalService(
         runtime, app.state.codex_events, ROOT)
-    app.state.codex_turns.on_turn_finished = _drain_after_turn(
-        app.state.codex_queue_drain)
+    from .turn_notifications import completed_turn_callback
+    app.state.codex_turns.on_turn_finished = completed_turn_callback(
+        app.state.codex_threads,
+        _drain_after_turn(app.state.codex_queue_drain),
+    )
     app.state.codex_scheduler = CodexScheduler(
         ROOT, app.state.codex_threads, app.state.codex_turns)
     app.state.codex_compact = CodexCompactService(
@@ -665,13 +668,15 @@ def presence_heartbeat(payload: dict | None = Body(default=None)) -> dict:
                   false the moment the page hides (the "I left" signal
                   that lets the push gate fire without waiting out the
                   grace window)
-    No body → legacy v1 client → treated as visible on the shared
-    "default" device. Gate logic lives in backend/presence.py."""
+      device_kind — mobile or desktop; only mobile presence suppresses pushes
+    Legacy reports without a mobile device kind never suppress phone pushes.
+    Gate logic lives in backend/presence.py."""
     from . import presence as _presence
     p = payload if isinstance(payload, dict) else {}
     device_id = str(p.get("device_id") or "default")[:64]
     visible = bool(p.get("visible", True))
-    _presence.mark_seen(device_id, visible)
+    device_kind = str(p.get("device_kind") or "unknown")
+    _presence.mark_seen(device_id, visible, device_kind=device_kind)
     age = _presence.last_seen_age()
     return {"ok": True, "last_seen_age_sec": age, "grace_sec": _presence.GRACE_SECONDS}
 

@@ -20,8 +20,8 @@ otherwise re-type on a fixed cadence.
   service was stopped are not replayed.
 - A finished run increments an **unread** counter shown as a bell badge;
   opening the drawer acknowledges it back to zero.
-- Completion is recorded in history and increments the unread count. Automatic
-  Web Push delivery for scheduler completion is not wired in the current version.
+- Completion is recorded in history, increments the unread count, and sends the
+  same presence-gated Web Push used by normal completed Codex turns.
 
 ## Schedule kinds
 
