@@ -157,6 +157,14 @@ def _project_turns(items: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
     turns: list[dict[str, Any]] = []
     current: list[dict[str, Any]] = []
     for item in items:
+        if _replaces_injected_user_message(current, item):
+            # Codex persists its runtime context (AGENTS.md, environment,
+            # recommended plugins, and similar prompt layers) as a userMessage
+            # immediately before the browser's real input.  Both projections
+            # carry the same turn id.  The context is model input, not a user
+            # chat bubble, so retain only the final userMessage for that turn.
+            current[-1] = dict(item)
+            continue
         if item.get("type") == "userMessage" and current:
             turns.append({"items": current})
             current = []
@@ -164,3 +172,16 @@ def _project_turns(items: tuple[dict[str, Any], ...]) -> list[dict[str, Any]]:
     if current:
         turns.append({"items": current})
     return turns
+
+
+def _replaces_injected_user_message(
+    current: list[dict[str, Any]], item: dict[str, Any],
+) -> bool:
+    """Identify consecutive user projections belonging to the same turn."""
+    if not current or item.get("type") != "userMessage":
+        return False
+    previous = current[-1]
+    if previous.get("type") != "userMessage":
+        return False
+    item_id = item.get("id")
+    return isinstance(item_id, str) and bool(item_id) and item_id == previous.get("id")

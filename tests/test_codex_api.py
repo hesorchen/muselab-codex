@@ -110,6 +110,28 @@ def test_duplicate_codex_user_ids_get_stable_unique_message_and_outline_ids():
     assert [item["uuid"] for item in outline] == ["turn-1", "turn-1-2"]
 
 
+def test_injected_user_context_is_hidden_inside_one_native_turn():
+    thread = {
+        "id": "thread-injected-context",
+        "turns": [{"items": [
+            {"type": "userMessage", "id": "turn-1", "content": [
+                {"type": "text", "text": "<recommended_plugins>hidden"},
+            ]},
+            {"type": "userMessage", "id": "turn-1", "content": [
+                {"type": "text", "text": "visible prompt"},
+            ]},
+            {"type": "agentMessage", "text": "reply"},
+        ]}],
+    }
+
+    assert [message["text"] for message in _thread_messages(thread)] == [
+        "visible prompt", "reply",
+    ]
+    assert [item["preview"] for item in _thread_outline(thread)] == [
+        "visible prompt",
+    ]
+
+
 def test_projected_tool_items_become_ui_tool_messages():
     thread = {
         "id": "thread-tools",

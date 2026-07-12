@@ -23,6 +23,25 @@ def test_transcript_projection_preserves_user_turn_boundaries():
     ]
 
 
+def test_transcript_projection_hides_injected_context_for_same_turn():
+    turns = _project_turns((
+        {"type": "userMessage", "id": "turn-1", "content": [
+            {"type": "text", "text": "<environment_context>hidden"},
+        ]},
+        {"type": "userMessage", "id": "turn-1", "content": [
+            {"type": "text", "text": "actual question"},
+        ]},
+        {"type": "agentMessage", "text": "answer"},
+        {"type": "userMessage", "id": "turn-2", "content": [
+            {"type": "text", "text": "next question"},
+        ]},
+    ))
+
+    assert len(turns) == 2
+    assert turns[0]["items"][0]["content"][0]["text"] == "actual question"
+    assert turns[1]["items"][0]["content"][0]["text"] == "next question"
+
+
 @pytest.mark.asyncio
 async def test_history_prefers_paginated_native_thread_items():
     class Requester:

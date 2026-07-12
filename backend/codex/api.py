@@ -1118,7 +1118,7 @@ def _thread_messages(
     for turn in turns:
         if not isinstance(turn, dict) or not isinstance(turn.get("items"), list):
             continue
-        for item in turn["items"]:
+        for item in _visible_turn_items(turn["items"]):
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
@@ -1217,7 +1217,7 @@ def _thread_outline(thread: dict[str, Any]) -> list[dict[str, Any]]:
     for turn in turns:
         if not isinstance(turn, dict) or not isinstance(turn.get("items"), list):
             continue
-        for item in turn["items"]:
+        for item in _visible_turn_items(turn["items"]):
             if not isinstance(item, dict) or item.get("type") != "userMessage":
                 continue
             user_ordinal += 1
@@ -1232,6 +1232,31 @@ def _thread_outline(thread: dict[str, Any]) -> list[dict[str, Any]]:
                     thread, item, user_ordinal, user_ids),
             })
     return outline
+
+
+def _visible_turn_items(items: list[Any]) -> list[Any]:
+    """Hide Codex-injected user context from legacy thread/read results.
+
+    Paginated and JSONL history is already normalized by ``_project_turns``.
+    This duplicate-id coalescing keeps the older ``thread/read`` fallback from
+    exposing the same internal context when native item history is unavailable.
+    """
+    visible: list[Any] = []
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "userMessage" and visible:
+            previous = visible[-1]
+            item_id = item.get("id")
+            if (
+                isinstance(previous, dict)
+                and previous.get("type") == "userMessage"
+                and isinstance(item_id, str)
+                and bool(item_id)
+                and item_id == previous.get("id")
+            ):
+                visible[-1] = item
+                continue
+        visible.append(item)
+    return visible
 
 
 def _user_message_uuid(
