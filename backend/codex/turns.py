@@ -315,15 +315,18 @@ def _permission_overrides(
         approval_policy = "on-request"
         sandbox_policy = {"type": "readOnly"}
     elif permission == "default":
-        approval_policy = "on-request"
-        sandbox_policy = {"type": "workspaceWrite"}
+        # Omit permission overrides so the thread keeps the approval and
+        # sandbox policy inherited from the user's native Codex config.
+        approval_policy = None
+        sandbox_policy = None
     else:
         raise ValueError("unknown permission mode")
 
-    result: dict[str, Any] = {
-        "approvalPolicy": approval_policy,
-        "sandboxPolicy": sandbox_policy,
-    }
+    result: dict[str, Any] = {}
+    if approval_policy is not None:
+        result["approvalPolicy"] = approval_policy
+    if sandbox_policy is not None:
+        result["sandboxPolicy"] = sandbox_policy
     if model:
         result["collaborationMode"] = {
             "mode": "plan" if permission == "plan" else "default",

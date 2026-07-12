@@ -2734,7 +2734,7 @@
             <!-- Permission mode -->
             <select x-model="permission" class="chat-toolbar-select chat-toolbar-permission"
                     :title="t('set.label.default_permission')">
-              <option value="default" x-text="lang==='zh' ? '按需询问' : 'Ask as needed'"></option>
+              <option value="default" x-text="lang==='zh' ? 'Codex 默认' : 'Codex default'"></option>
               <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
               <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
             </select>
@@ -2771,7 +2771,7 @@
                 <label class="chat-toolbar-more-field">
                   <span x-text="t('session.permission')"></span>
                   <select x-model="permission">
-                    <option value="default" x-text="lang==='zh' ? '按需询问' : 'Ask as needed'"></option>
+                    <option value="default" x-text="lang==='zh' ? 'Codex 默认' : 'Codex default'"></option>
                     <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
                     <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
                   </select>
@@ -3539,7 +3539,7 @@
           <div class="settings-row">
             <label x-text="t('set.label.default_permission')"></label>
             <select x-model="settings.draftDefaults.permission" class="settings-input">
-              <option value="default" x-text="lang==='zh' ? '按需询问' : 'Ask as needed'"></option>
+              <option value="default" x-text="lang==='zh' ? 'Codex 默认' : 'Codex default'"></option>
               <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
               <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
             </select>
