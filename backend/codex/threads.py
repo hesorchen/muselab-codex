@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable
 from dataclasses import dataclass
+import json
 from pathlib import Path
+import threading
 import time
 from typing import Any, Protocol
 
+from ..settings import atomic_write_text
 from .process import AppServerProtocolError, AppServerResponseError
 
 
@@ -47,6 +50,9 @@ class CodexThreadService:
         self.workspace = Path(workspace).resolve()
         self.approval_policy = approval_policy
         self.sandbox = sandbox
+        self._metadata_path = self.workspace / ".muselab-codex" / "threads.json"
+        self._metadata_lock = threading.RLock()
+        self._pinned = self._load_pinned()
         self._pending: dict[str, dict[str, Any]] = {}
         self._list_cache: dict[
             tuple[str | None, int, bool, str | None],
@@ -94,7 +100,7 @@ class CodexThreadService:
             thread["name"] = name.strip()
         self._pending[thread["id"]] = dict(thread)
         self.invalidate_list_cache()
-        return thread
+        return self._with_local_metadata(thread)
 
     async def list(
         self,
@@ -143,15 +149,18 @@ class CodexThreadService:
             next_cursor = result.get("nextCursor")
             if next_cursor is not None and not isinstance(next_cursor, str):
                 raise AppServerProtocolError("thread/list returned an invalid cursor")
-            materialized_ids = {thread.get("id") for thread in data}
-            for thread_id in materialized_ids:
-                if isinstance(thread_id, str):
-                    self._pending.pop(thread_id, None)
+            listed_ids = {thread.get("id") for thread in data}
+            # A pre-first-turn thread can appear in thread/list while
+            # thread/resume still rejects it with -32600.  Listing alone is
+            # therefore not evidence that Codex has materialized the rollout;
+            # keep the pending marker until read/resume succeeds.
             # Pending empty threads belong only on the first page. Repeating
             # them for every opaque app-server cursor would create duplicates.
-            pending = [] if archived or cursor else self._matching_pending(search_term)
-            combined = pending + [thread for thread in data
-                                  if thread.get("id") not in self._pending]
+            pending = [] if archived or cursor else [
+                thread for thread in self._matching_pending(search_term)
+                if thread.get("id") not in listed_ids
+            ]
+            combined = [self._with_local_metadata(thread) for thread in pending + data]
             combined.sort(key=lambda thread: thread.get("updatedAt", 0), reverse=True)
             page = ThreadPage(data=combined, next_cursor=next_cursor)
             self._list_cache[key] = (time.monotonic(), page)
@@ -178,11 +187,10 @@ class CodexThreadService:
         except AppServerResponseError as exc:
             self._sync_runtime_generation()
             if exc.code == -32600 and clean_id in self._pending:
-                return dict(self._pending[clean_id])
+                return self._with_local_metadata(self._pending[clean_id])
             raise
         thread = _thread_from_result("thread/read", result)
-        self._pending.pop(clean_id, None)
-        return thread
+        return self._with_local_metadata(thread)
 
     async def resume(
         self,
@@ -214,11 +222,20 @@ class CodexThreadService:
         except AppServerResponseError as exc:
             self._sync_runtime_generation()
             if exc.code == -32600 and clean_id in self._pending:
-                return dict(self._pending[clean_id])
+                return self._with_local_metadata(self._pending[clean_id])
             raise
         thread = _thread_from_result("thread/resume", result)
-        self._pending.pop(clean_id, None)
-        return thread
+        return self._with_local_metadata(thread)
+
+    def mark_materialized(self, thread_id: str) -> None:
+        """Forget the empty-thread sidecar after Codex accepts its first turn.
+
+        thread/list, thread/read, and even thread/resume may temporarily
+        succeed for a pre-first-turn thread without creating its rollout.
+        turn/start is the first reliable materialization boundary.
+        """
+        self._pending.pop(_thread_id(thread_id), None)
+        self.invalidate_list_cache()
 
     async def rename(self, thread_id: str, name: str) -> None:
         self._sync_runtime_generation()
@@ -244,6 +261,7 @@ class CodexThreadService:
         })
         _empty_result("thread/delete", result)
         self._pending.pop(clean_id, None)
+        self.set_pinned(clean_id, False)
         self.invalidate_list_cache()
 
     async def fork(
@@ -278,7 +296,31 @@ class CodexThreadService:
         thread = _thread_from_result("thread/fork", result)
         self._pending[thread["id"]] = dict(thread)
         self.invalidate_list_cache()
-        return thread
+        return self._with_local_metadata(thread)
+
+    def set_pinned(self, thread_id: str, pinned: bool) -> None:
+        """Persist application-owned thread presentation metadata.
+
+        Pinning is a muselab UI affordance and is not part of the Codex
+        app-server thread protocol. Keep it in a small workspace sidecar while
+        leaving names, turns, and lifecycle state owned by Codex.
+        """
+        clean_id = _thread_id(thread_id)
+        with self._metadata_lock:
+            changed = clean_id not in self._pinned if pinned else clean_id in self._pinned
+            if not changed:
+                return
+            updated = set(self._pinned)
+            if pinned:
+                updated.add(clean_id)
+            else:
+                updated.discard(clean_id)
+            atomic_write_text(
+                self._metadata_path,
+                json.dumps({"pinned": sorted(updated)}, separators=(",", ":")),
+            )
+            self._pinned = updated
+        self.invalidate_list_cache()
 
     async def children(self, parent_thread_id: str, *, limit: int = 100) -> list[dict[str, Any]]:
         """List materialized subagent threads belonging to one parent thread.
@@ -312,6 +354,26 @@ class CodexThreadService:
         needle = search_term.casefold()
         return [thread for thread in pending
                 if needle in str(thread.get("name") or thread.get("preview") or "").casefold()]
+
+    def _load_pinned(self) -> set[str]:
+        try:
+            payload = json.loads(self._metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return set()
+        values = payload.get("pinned") if isinstance(payload, dict) else None
+        if not isinstance(values, list):
+            return set()
+        return {value.strip() for value in values
+                if isinstance(value, str) and value.strip()}
+
+    def _with_local_metadata(self, thread: dict[str, Any]) -> dict[str, Any]:
+        decorated = dict(thread)
+        thread_id = decorated.get("id")
+        with self._metadata_lock:
+            decorated["pinned"] = (
+                isinstance(thread_id, str) and thread_id in self._pinned
+            )
+        return decorated
 
     def invalidate_list_cache(self) -> None:
         self._list_cache.clear()

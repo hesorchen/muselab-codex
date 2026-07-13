@@ -34,12 +34,43 @@ async def get_settings(request: Request) -> dict[str, Any]:
     models = result.get("data") if isinstance(result, dict) else []
     default = next((item.get("model", "") for item in models
                     if isinstance(item, dict) and item.get("isDefault")), "")
+    try:
+        workspace = str(request.app.state.codex_threads.workspace)
+        config_result = await request.app.state.codex_runtime.request("config/read", {
+            "cwd": workspace,
+            "includeLayers": False,
+        })
+    except (AppServerError, AttributeError):
+        config_result = {}
+    config = config_result.get("config") if isinstance(config_result, dict) else {}
+    effective_permission = _effective_permission(
+        config if isinstance(config, dict) else {})
     return {
         "runtime": "codex",
         "providers": [],
-        "defaults": {"model": default, "permission": "default"},
+        "defaults": {
+            "model": default,
+            # ``default`` remains the protocol value: omit per-thread/turn
+            # overrides and inherit Codex.  Expose the resolved legacy mode
+            # separately so clients can show what that inheritance means
+            # instead of the misleading label "Codex default".
+            "permission": "default",
+            "effective_permission": effective_permission,
+        },
         "params": {},
     }
+
+
+def _effective_permission(config: dict[str, Any]) -> str:
+    approval = config.get("approval_policy")
+    sandbox = config.get("sandbox_mode")
+    if approval == "never" and sandbox == "danger-full-access":
+        return "bypassPermissions"
+    if sandbox == "read-only":
+        return "plan"
+    if sandbox == "workspace-write":
+        return "workspace"
+    return "default"
 
 
 @router.get("/providers", dependencies=[Depends(require_token)])

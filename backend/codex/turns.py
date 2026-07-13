@@ -154,6 +154,7 @@ class CodexTurnService:
             try:
                 result = await self.runtime.request("turn/start", params)
                 turn = _turn_from_result(result)
+                self.threads.mark_materialized(clean_id)
                 stream.turn_id = turn["id"]
                 stream.status = str(turn.get("status") or "inProgress")
             except BaseException:

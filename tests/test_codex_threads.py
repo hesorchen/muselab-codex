@@ -45,10 +45,28 @@ async def test_thread_lifecycle_uses_codex_as_source_of_truth(tmp_path):
         await service.rename("thread-1", "Renamed")
         assert (await service.read("thread-1"))["name"] == "Renamed"
 
+        service.set_pinned("thread-1", True)
+        assert (await service.read("thread-1"))["pinned"] is True
+        assert (await service.list()).data[0]["pinned"] is True
+
         await service.delete("thread-1")
         assert (await service.list()).data == []
     finally:
         await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_thread_pin_metadata_survives_service_restart(tmp_path):
+    requester = StubRequester({"thread": {"id": "thread-1"}})
+    service = CodexThreadService(requester, tmp_path)
+    service.set_pinned("thread-1", True)
+
+    restarted = CodexThreadService(requester, tmp_path)
+    assert (await restarted.read("thread-1"))["pinned"] is True
+
+    restarted.set_pinned("thread-1", False)
+    reloaded = CodexThreadService(requester, tmp_path)
+    assert (await reloaded.read("thread-1"))["pinned"] is False
 
 
 class StubRequester:
@@ -218,6 +236,54 @@ async def test_empty_pre_turn_thread_is_merged_from_pending_sidecar(tmp_path):
 
     await service.delete("pending-1")
     assert (await service.list()).data == []
+
+
+@pytest.mark.asyncio
+async def test_listed_empty_thread_remains_pending_until_resume_succeeds(tmp_path):
+    class ListedPendingRequester(PendingRequester):
+        async def request(self, method, params=None, *, timeout=None):
+            if method == "thread/list":
+                return {"data": [dict(self.thread)], "nextCursor": None}
+            return await super().request(method, params, timeout=timeout)
+
+    requester = ListedPendingRequester(tmp_path.resolve())
+    service = CodexThreadService(requester, tmp_path)
+
+    thread = await service.start()
+    service.set_pinned(thread["id"], True)
+    assert [item["id"] for item in (await service.list()).data] == [thread["id"]]
+
+    # Codex 0.144.1 may list a thread before its first turn creates a rollout.
+    # The expected resume error must still be absorbed after a list refresh.
+    resumed = await service.resume(thread["id"])
+    assert resumed["id"] == thread["id"]
+    assert resumed["pinned"] is True
+
+
+@pytest.mark.asyncio
+async def test_successful_empty_resume_does_not_end_pending_protection(tmp_path):
+    class FlakyEmptyResumeRequester(PendingRequester):
+        def __init__(self, workspace):
+            super().__init__(workspace)
+            self.resume_count = 0
+
+        async def request(self, method, params=None, *, timeout=None):
+            if method == "thread/resume":
+                self.resume_count += 1
+                if self.resume_count == 1:
+                    return {"thread": dict(self.thread)}
+            return await super().request(method, params, timeout=timeout)
+
+    requester = FlakyEmptyResumeRequester(tmp_path.resolve())
+    service = CodexThreadService(requester, tmp_path)
+    thread = await service.start()
+
+    assert (await service.resume(thread["id"]))["id"] == thread["id"]
+    assert (await service.resume(thread["id"]))["id"] == thread["id"]
+
+    service.mark_materialized(thread["id"])
+    with pytest.raises(AppServerResponseError):
+        await service.resume(thread["id"])
 
 
 class LazyStartingPendingRequester(PendingRequester):

@@ -2734,9 +2734,9 @@
             <!-- Permission mode -->
             <select x-model="permission" class="chat-toolbar-select chat-toolbar-permission"
                     :title="t('set.label.default_permission')">
-              <option value="default" x-text="lang==='zh' ? 'Codex 默认' : 'Codex default'"></option>
-              <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
-              <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
+              <option value="default" x-text="permissionLabel('default')"></option>
+              <option value="plan" x-text="permissionLabel('plan')"></option>
+              <option value="bypassPermissions" x-text="permissionLabel('bypassPermissions')"></option>
             </select>
             <!-- Reasoning effort is discovered from Codex model/list. Empty
                  means the model catalog's native default; explicit values are
@@ -2763,17 +2763,24 @@
                       :title="lang==='zh' ? '会话设置（权限 / Effort）' : 'Session settings (permission / effort)'">
                 <svg><use href="#i-cog"/></svg>
               </button>
+              <!-- iOS renders a native select's option sheet outside the
+                   document. click.outside therefore fires when an option is
+                   confirmed, hides this select before its change event, and
+                   leaves the permission unchanged. Pointer-down outside still
+                   closes on a real tap away, without seeing the native
+                   option-sheet confirmation. -->
               <div class="chat-toolbar-more-pop"
                    x-show="composerSettingsOpen"
                    x-cloak
-                   @click.outside="composerSettingsOpen = false">
+                   @pointerdown.outside="composerSettingsOpen = false"
+                   @keydown.escape.window="composerSettingsOpen = false">
                 <div class="chat-toolbar-more-title" x-text="t('session.settings')"></div>
                 <label class="chat-toolbar-more-field">
                   <span x-text="t('session.permission')"></span>
                   <select x-model="permission">
-                    <option value="default" x-text="lang==='zh' ? 'Codex 默认' : 'Codex default'"></option>
-                    <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
-                    <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
+                    <option value="default" x-text="permissionLabel('default')"></option>
+                    <option value="plan" x-text="permissionLabel('plan')"></option>
+                    <option value="bypassPermissions" x-text="permissionLabel('bypassPermissions')"></option>
                   </select>
                 </label>
                 <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
@@ -3387,7 +3394,7 @@
                 <div class="codex-quota-window"
                      :class="{ warn: w.used_percent >= 75 && w.used_percent < 90,
                                crit: w.used_percent >= 90 || w.status === 'rejected' }">
-                  <div class="codex-quota-label" x-text="rateLimitWindowLabel(w.rate_limit_type) || w.key"></div>
+                  <div class="codex-quota-label" x-text="codexLimitWindowLabel(w) || w.key"></div>
                   <div class="codex-quota-value"
                        x-text="(w.remaining_percent ?? '—') + '%'"></div>
                   <div class="codex-quota-sub"
@@ -3539,9 +3546,9 @@
           <div class="settings-row">
             <label x-text="t('set.label.default_permission')"></label>
             <select x-model="settings.draftDefaults.permission" class="settings-input">
-              <option value="default" x-text="lang==='zh' ? 'Codex 默认' : 'Codex default'"></option>
-              <option value="plan" x-text="lang==='zh' ? '计划（只读）' : 'Plan (read-only)'"></option>
-              <option value="bypassPermissions" x-text="lang==='zh' ? '完全访问' : 'Full access'"></option>
+              <option value="default" x-text="permissionLabel('default')"></option>
+              <option value="plan" x-text="permissionLabel('plan')"></option>
+              <option value="bypassPermissions" x-text="permissionLabel('bypassPermissions')"></option>
             </select>
           </div>
           <div class="settings-hint warn"

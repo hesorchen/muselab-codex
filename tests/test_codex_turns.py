@@ -52,10 +52,14 @@ class Runtime:
 class Threads:
     def __init__(self):
         self.calls = []
+        self.materialized = []
 
     async def resume(self, thread_id, *, model=None):
         self.calls.append((thread_id, model))
         return {"id": thread_id, "turns": []}
+
+    def mark_materialized(self, thread_id):
+        self.materialized.append(thread_id)
 
     def invalidate_list_cache(self):
         pass
