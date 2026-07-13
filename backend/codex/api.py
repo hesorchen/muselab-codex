@@ -282,10 +282,7 @@ async def patch_session(
     body: PatchSessionRequest,
 ) -> dict[str, Any]:
     threads, turns = _services(request)
-    unsupported = any(value is not None for value in (
-        body.system_prompt,
-        body.pinned,
-    ))
+    unsupported = body.system_prompt is not None
     if unsupported:
         raise HTTPException(400, "field is not supported by the Codex-native runtime")
     try:
@@ -306,6 +303,9 @@ async def patch_session(
                 config=config or None,
             )
         thread = await threads.read(thread_id, include_turns=False)
+        if body.pinned is not None:
+            threads.set_pinned(thread_id, body.pinned)
+            thread = {**thread, "pinned": body.pinned}
     except AppServerResponseError as exc:
         if exc.code in {-32004, -32600}:
             raise HTTPException(404, "session not found") from exc
@@ -680,25 +680,57 @@ async def codex_rate_limit(request: Request, refresh: bool = False) -> dict[str,
         return {"ok": False, "provider_authoritative": False,
                 "windows": {}, "updated_at": time.time(),
                 "error": str(exc)}
-    snapshot = result.get("rateLimits") if isinstance(result, dict) else None
-    if not isinstance(snapshot, dict):
-        snapshot = {}
-    windows = {}
-    for name, native in (("five_hour", snapshot.get("primary")),
-                         ("seven_day", snapshot.get("secondary"))):
-        if (isinstance(native, dict)
-                and isinstance(native.get("usedPercent"), (int, float))
-                and not isinstance(native.get("usedPercent"), bool)):
+    result = result if isinstance(result, dict) else {}
+    legacy_snapshot = result.get("rateLimits")
+    by_limit_id = result.get("rateLimitsByLimitId")
+    snapshots = (
+        by_limit_id
+        if isinstance(by_limit_id, dict) and by_limit_id
+        else {"codex": legacy_snapshot if isinstance(legacy_snapshot, dict) else {}}
+    )
+    windows: dict[str, dict[str, Any]] = {}
+    plan_type = None
+    for limit_id, snapshot in snapshots.items():
+        if not isinstance(snapshot, dict):
+            continue
+        plan_type = plan_type or snapshot.get("planType")
+        for slot in ("primary", "secondary"):
+            native = snapshot.get(slot)
+            if not (isinstance(native, dict)
+                    and isinstance(native.get("usedPercent"), (int, float))
+                    and not isinstance(native.get("usedPercent"), bool)):
+                continue
+            duration = native.get("windowDurationMins")
+            window_type = _rate_limit_window_type(duration, slot)
+            key = window_type
+            if key in windows:
+                key = f"{limit_id}:{slot}"
             used_percent = max(0, min(100, native["usedPercent"]))
-            windows[name] = {
+            windows[key] = {
+                "rate_limit_type": window_type,
+                "limit_id": str(limit_id),
+                "limit_name": snapshot.get("limitName"),
                 "used_percent": used_percent,
                 "remaining_percent": 100 - used_percent,
                 "resets_at": native.get("resetsAt"),
-                "window_duration_mins": native.get("windowDurationMins"),
+                "window_duration_mins": duration,
             }
     return {"ok": True, "provider_authoritative": bool(windows),
             "windows": windows, "updated_at": time.time(),
-            "plan_type": snapshot.get("planType")}
+            "plan_type": plan_type}
+
+
+def _rate_limit_window_type(duration: Any, slot: str) -> str:
+    """Name a native rolling window by duration, never by array position."""
+    names = {
+        300: "five_hour",
+        1440: "one_day",
+        10_080: "seven_day",
+        43_200: "thirty_day",
+    }
+    if isinstance(duration, int) and not isinstance(duration, bool):
+        return names.get(duration, f"rolling_{duration}_minutes")
+    return slot
 
 
 @router.get("/skills", dependencies=[Depends(require_token)])
@@ -1090,7 +1122,7 @@ def _session_meta(
         "message_count": len(messages),
         "turn_count": len(thread.get("turns") or []),
         "auto_named": explicit_name is None,
-        "pinned": False,
+        "pinned": bool(thread.get("pinned", False)),
         "active": turns.active(thread_id) is not None,
         "effort": effort if effort is not None else str(settings.get("effort") or ""),
         "permission": (

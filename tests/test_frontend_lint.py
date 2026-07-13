@@ -237,7 +237,9 @@ def test_default_permission_is_saved_separately_from_current_session():
     assert "meta.permission = meta.permission || seedPermission" in create
 
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
-    assert html.count("Codex 默认") == 3
+    assert "Codex 默认" not in html
+    assert "Codex default" not in html
+    assert html.count("permissionLabel('default')") == 3
     assert "'Ask as needed'" not in html
 
 
@@ -254,6 +256,11 @@ def test_mobile_session_settings_expose_permission_and_effort_without_clipping()
     assert 'x-model="permission"' in popover
     assert "t('session.intelligence')" in popover
     assert 'x-model="effort"' in popover
+    # Native iOS select sheets dispatch their confirmation click outside the
+    # document. click.outside can hide the select before x-model receives its
+    # change event; pointerdown.outside only sees genuine taps away.
+    assert '@pointerdown.outside="composerSettingsOpen = false"' in popover
+    assert '@click.outside="composerSettingsOpen = false"' not in popover
     assert "'settings-open': composerSettingsOpen" in html
     assert ".chat-input-wrap.settings-open { overflow: visible; }" in css
 
@@ -358,6 +365,19 @@ def test_model_discovery_precedes_optional_rate_limit_and_retries():
     assert stats.index("await this._fetchModels") < stats.index("this.fetchCodexRateLimit()")
     assert "if (this._modelsFetchPromise) return this._modelsFetchPromise" in models
     assert "attempt <= retries" in models
+
+
+def test_codex_quota_labels_distinguish_equal_duration_limits():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    start = app.index("codexLimitWindowLabel(window)")
+    end = app.index("\n    // \"resets in 3h 12m\"", start)
+    labeler = app[start:end]
+
+    assert "window.limit_name" in labeler
+    assert 'limitId === "codex" ? "Codex" : limitId' in labeler
+    assert "`${name} · ${period}`" in labeler
+    assert 'x-text="codexLimitWindowLabel(w) || w.key"' in html
 
 
 def test_chat_messages_use_one_flat_keyed_loop():

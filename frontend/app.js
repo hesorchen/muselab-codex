@@ -456,6 +456,10 @@ function portal() {
     // session.  Keep the Settings → Defaults choice separate so opening an
     // older tab cannot silently replace the permission used by a new chat.
     defaultPermission: "default",
+    // Resolved Codex config behind the internal `default` sentinel.  The UI
+    // uses this to display the actual inherited access level rather than the
+    // implementation detail "Codex default".
+    nativeDefaultPermission: "default",
     // Mobile-only: collapses the per-session settings (permission / effort)
     // behind a gear in the composer toolbar so the row stays single-line on
     // narrow phones. Desktop shows those selects inline and ignores this.
@@ -1456,6 +1460,7 @@ function portal() {
       // file enrichment.  A shared in-flight promise prevents the deferred
       // stats refresh below from issuing a duplicate model/list request.
       this._fetchModels({ retries: 2 });
+      this.fetchNativeSettings();
 
       // Restore the two user-visible working surfaces first and independently.
       // A long transcript must not block the selected file, and vice versa.
@@ -4416,6 +4421,37 @@ function portal() {
       this.fetchCodexRateLimit();
     },
 
+    async fetchNativeSettings() {
+      try {
+        const r = await fetch("/api/settings", { headers: this.hdr(), cache: "no-store" });
+        if (!r.ok) return;
+        const d = await r.json();
+        const effective = d && d.defaults && d.defaults.effective_permission;
+        if (["default", "plan", "workspace", "bypassPermissions"].includes(effective)) {
+          this.nativeDefaultPermission = effective;
+        }
+      } catch (_) { /* optional display enrichment */ }
+    },
+
+    permissionLabel(value) {
+      const zh = this.lang === "zh";
+      if (value === "plan") return zh ? "计划（只读）" : "Plan (read-only)";
+      if (value === "bypassPermissions") return zh ? "完全访问" : "Full access";
+      if (value === "workspace") return zh ? "工作区访问" : "Workspace access";
+      if (value === "default") {
+        const actual = this.nativeDefaultPermission;
+        if (actual === "bypassPermissions") {
+          return zh ? "完全访问（全局）" : "Full access (global)";
+        }
+        if (actual === "plan") return zh ? "计划（全局）" : "Plan (global)";
+        if (actual === "workspace") {
+          return zh ? "工作区访问（全局）" : "Workspace access (global)";
+        }
+        return zh ? "跟随全局权限" : "Use global permissions";
+      }
+      return value || "";
+    },
+
     async fetchCodexRateLimit(opts = {}) {
       try {
         const qs = opts.refresh ? "?refresh=1" : "";
@@ -4509,13 +4545,42 @@ function portal() {
     rateLimitWindowLabel(type) {
       const m = {
         five_hour: "5h",
+        one_day: "1d",
         seven_day: "7d",
+        thirty_day: "30d",
         seven_day_opus: "7d Opus",
         seven_day_sonnet: "7d Sonnet",
         monthly: this.lang === "zh" ? "月" : "mo",
         overage: this.t("rl.overage"),
       };
-      return m[type] || type || "";
+      if (m[type]) return m[type];
+      const rolling = /^rolling_(\d+)_minutes$/.exec(type || "");
+      if (rolling) {
+        const mins = Number(rolling[1]);
+        if (mins % 10_080 === 0) return `${mins / 10_080}w`;
+        if (mins % 1440 === 0) return `${mins / 1440}d`;
+        if (mins % 60 === 0) return `${mins / 60}h`;
+        return `${mins}m`;
+      }
+      return type || "";
+    },
+
+    codexLimitWindowLabel(window) {
+      if (!window) return "";
+      const period = this.rateLimitWindowLabel(window.rate_limit_type || "");
+      const nativeName = typeof window.limit_name === "string"
+        ? window.limit_name.trim()
+        : "";
+      const limitId = typeof window.limit_id === "string"
+        ? window.limit_id.trim()
+        : "";
+      // `codex` is the native id for the regular account allowance. Other
+      // allowances (for example Codex Spark) provide a human-readable name.
+      // Keep the id as a last-resort discriminator so two equal-duration
+      // windows never become indistinguishable again.
+      const name = nativeName || (limitId === "codex" ? "Codex" : limitId);
+      if (name && period) return `${name} · ${period}`;
+      return name || period;
     },
 
     // "resets in 3h 12m" style relative string for the reset epoch (seconds).

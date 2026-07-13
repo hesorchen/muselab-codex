@@ -464,6 +464,12 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         assert renamed.status_code == 200
         assert renamed.json()["name"] == "Renamed"
 
+        pinned = client.patch(
+            f"/api/chat/sessions/{thread_id}", json={"pinned": True})
+        assert pinned.status_code == 200
+        assert pinned.json()["pinned"] is True
+        assert client.get("/api/chat/sessions").json()["sessions"][0]["pinned"] is True
+
         deleted = client.delete(f"/api/chat/sessions/{thread_id}")
         assert deleted.status_code == 200
         assert deleted.json() == {"ok": True}
@@ -497,6 +503,65 @@ def test_codex_rate_limit_includes_remaining_percent():
     assert limits["windows"]["five_hour"]["remaining_percent"] == 85
     assert limits["windows"]["seven_day"]["remaining_percent"] == 97.5
     assert limits["plan_type"] == "prolite"
+
+
+def test_codex_rate_limit_names_primary_window_from_native_duration():
+    class RateLimitRuntime:
+        async def request(self, method, params, timeout):
+            return {"rateLimits": {
+                "primary": {
+                    "usedPercent": 2,
+                    "resetsAt": 1_800_000_000,
+                    "windowDurationMins": 10_080,
+                },
+                "planType": "prolite",
+            }}
+
+    request = SimpleNamespace(app=SimpleNamespace(
+        state=SimpleNamespace(codex_runtime=RateLimitRuntime())))
+    limits = asyncio.run(codex_rate_limit(request))
+
+    assert "five_hour" not in limits["windows"]
+    assert limits["windows"]["seven_day"]["remaining_percent"] == 98
+    assert limits["windows"]["seven_day"]["rate_limit_type"] == "seven_day"
+
+
+def test_codex_rate_limit_preserves_names_for_equal_duration_limits():
+    class RateLimitRuntime:
+        async def request(self, method, params, timeout):
+            return {"rateLimitsByLimitId": {
+                "codex": {
+                    "primary": {
+                        "usedPercent": 5,
+                        "resetsAt": 1_800_000_000,
+                        "windowDurationMins": 10_080,
+                    },
+                    "planType": "prolite",
+                },
+                "codex_bengalfox": {
+                    "primary": {
+                        "usedPercent": 0,
+                        "resetsAt": 1_800_600_000,
+                        "windowDurationMins": 10_080,
+                    },
+                    "limitName": "GPT-5.3-Codex-Spark",
+                    "planType": "prolite",
+                },
+            }}
+
+    request = SimpleNamespace(app=SimpleNamespace(
+        state=SimpleNamespace(codex_runtime=RateLimitRuntime())))
+    limits = asyncio.run(codex_rate_limit(request))
+
+    regular = limits["windows"]["seven_day"]
+    spark = limits["windows"]["codex_bengalfox:primary"]
+    assert regular["limit_id"] == "codex"
+    assert regular["limit_name"] is None
+    assert regular["remaining_percent"] == 95
+    assert spark["limit_id"] == "codex_bengalfox"
+    assert spark["limit_name"] == "GPT-5.3-Codex-Spark"
+    assert spark["remaining_percent"] == 100
+    assert spark["rate_limit_type"] == "seven_day"
 
 
 def test_session_usage_prefers_native_notification_sidecar():
