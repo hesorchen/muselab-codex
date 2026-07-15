@@ -432,8 +432,16 @@ def test_model_switch_is_single_flight_and_locks_session_controls(
     """A native select double-change must not start two model transitions."""
     _login(page, backend_url, auth_token)
     targets = page.evaluate(
-        """() => {
+        """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          // Boot deliberately fetches the model catalog off the first-paint
+          // path, and fetchStats may request it again after 300 ms. Let any
+          // current request settle, then suppress later background refreshes
+          // while this test owns availableModels; otherwise a fast CI runner
+          // can replace the synthetic catalog halfway through the assertion.
+          while (app._modelsFetchPromise) await app._modelsFetchPromise;
+          const realFetchModels = app._fetchModels;
+          app._fetchModels = async () => true;
           const sid = app.currentId;
           const session = app.sessions.find(s => s.id === sid);
           const st = app._ensureTabState(sid);
@@ -462,6 +470,7 @@ def test_model_switch_is_single_flight_and_locks_session_controls(
           window.__restoreModelTest = () => {
             window.fetch = realFetch;
             app.refreshSessions = realRefresh;
+            app._fetchModels = realFetchModels;
           };
           app.model = 'e2e-target-a';
           window.__firstModelChange = app.onModelChange();

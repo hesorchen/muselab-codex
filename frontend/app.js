@@ -10622,7 +10622,10 @@ function portal() {
               this.savePrefs();
             }
             this._ensureValidModel();
-            this._rebindModelSelect();
+            // Loading is not complete until Alpine's select rebind settles.
+            // Leaving this promise detached lets its captured old value land
+            // after a user has already selected another model.
+            await this._rebindModelSelect();
             return true;
           } catch (e) {
             if (attempt < retries) {

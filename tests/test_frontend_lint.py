@@ -753,6 +753,7 @@ def test_model_discovery_precedes_optional_rate_limit_and_retries():
     assert stats.index("await this._fetchModels") < stats.index("this.fetchCodexRateLimit()")
     assert "if (this._modelsFetchPromise) return this._modelsFetchPromise" in models
     assert "attempt <= retries" in models
+    assert "await this._rebindModelSelect()" in models
 
 
 def test_codex_quota_labels_distinguish_equal_duration_limits():
