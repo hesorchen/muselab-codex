@@ -1,6 +1,6 @@
 """Context-meter normalization and persistence tests."""
 
-from datetime import date, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -80,7 +80,8 @@ def test_dashboard_aggregates_native_sidecars(tmp_path):
 
 def test_account_dashboard_uses_native_lifetime_and_daily_buckets(tmp_path):
     service = CodexUsageService(tmp_path)
-    today = date.today()
+    user_tz = timezone(timedelta(minutes=480))
+    today = datetime.now(user_tz).date()
     dashboard = service.account_dashboard({
         "summary": {
             "lifetimeTokens": 9000,
@@ -104,7 +105,8 @@ def test_account_dashboard_uses_native_lifetime_and_daily_buckets(tmp_path):
 
 def test_account_dashboard_marks_missing_today_bucket_as_pending(tmp_path):
     service = CodexUsageService(tmp_path)
-    today = date.today()
+    user_tz = timezone(timedelta(minutes=480))
+    today = datetime.now(user_tz).date()
     dashboard = service.account_dashboard({
         "summary": {"lifetimeTokens": 400},
         "dailyUsageBuckets": [{
