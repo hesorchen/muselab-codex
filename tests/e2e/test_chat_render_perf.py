@@ -212,7 +212,7 @@ def _visible_pane_with_text_snapshot(page: Page, text: str):
           const panes = Array.from(document.querySelectorAll(".msg-pane"))
             .filter(p => getComputedStyle(p).display !== "none");
           const pane = panes.find(p => p.textContent.includes(expected)) || null;
-          // A grid pane also owns persistent compacting / first-token
+          // A session pane also owns persistent compacting / first-token
           // placeholders with the `.msg` class. Only transcript rows carry
           // data-uuid, so count those when asserting keyed history rendering.
           const msgs = pane ? Array.from(pane.querySelectorAll(".msg[data-uuid]")) : [];
@@ -414,7 +414,7 @@ def test_recent_session_switch_reuses_dom_and_restores_scroll(
     )
     page.wait_for_function(
         """() => document.querySelectorAll(
-          '.chat-grid-pane[data-pane-id="perf-warm-a"] .msg[data-uuid]'
+          '.chat-session-pane[data-pane-id="perf-warm-a"] .msg[data-uuid]'
         ).length === 36""",
         timeout=10000,
     )
@@ -428,7 +428,7 @@ def test_recent_session_switch_reuses_dom_and_restores_scroll(
         app._userScrollIntent(arg);
         app.onChatScroll(arg, { currentTarget: body });
         window.__warmPaneA = document.querySelector(
-          `.chat-grid-pane[data-pane-id="${arg}"]`);
+          `.chat-session-pane[data-pane-id="${arg}"]`);
         return { top: body.scrollTop, atBottom: app.tabState[arg].atBottom };
         """,
         ids[0],
@@ -463,7 +463,7 @@ def test_recent_session_switch_reuses_dom_and_restores_scroll(
         page,
         """
         const pane = document.querySelector(
-          `.chat-grid-pane[data-pane-id="${arg}"]`);
+          `.chat-session-pane[data-pane-id="${arg}"]`);
         const body = document.querySelector('.chat-body');
         return {
           sameNode: pane === window.__warmPaneA,
@@ -776,6 +776,128 @@ def test_load_session_reconnects_active_turn_and_renders_live_assistant(
     assert abs(completed_timing["elapsed"] - 8.25) < 0.001
     assert completed_timing["ts"] == 1_700_010_010_250
     assert _app_eval(page, "return app.messagesReady === true && !app.messagesLoading;") is True
+    _assert_no_browser_errors(page, errors)
+
+
+def test_silent_mobile_stream_self_heals_without_manual_reload(
+    page: Page, backend_url, auth_token
+):
+    """A Safari-style open-but-silent EventSource reattaches or reloads."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          clearInterval(app._sessionsSyncTimer);
+          clearInterval(app._presenceTimer);
+          clearInterval(app._connHeartbeat);
+          const sid = app.currentId;
+          const st = app._ensureTabState(sid);
+          const realFetch = window.fetch;
+          const realSend = app.send;
+          const realLoadSession = app.loadSession;
+          const realSyncQueue = app._syncQueueFromServer;
+          const reconnects = [];
+          const loads = [];
+          let active = true;
+          let closeCount = 0;
+
+          window.fetch = async url => {
+            if (String(url).endsWith('/active')) {
+              return new Response(JSON.stringify(active
+                ? {
+                    active: true,
+                    events_so_far: 6,
+                    started_at: 1700010001,
+                    elapsed_seconds: 31,
+                  }
+                : { active: false }), {
+                status: 200,
+                headers: { 'Content-Type': 'application/json' },
+              });
+            }
+            return realFetch.call(window, url);
+          };
+          app.send = async opts => { reconnects.push(opts); };
+          app.loadSession = async (id, opts) => {
+            loads.push({ id, quiet: !!opts?.quiet });
+            return true;
+          };
+          app._syncQueueFromServer = () => {};
+
+          const installZombie = observed => {
+            const es = {
+              readyState: 1,
+              close: () => { closeCount += 1; es.readyState = 2; },
+            };
+            st.es = es;
+            st.streaming = true;
+            st._lastSseActivity = Date.now() - 30_000;
+            st._streamStartedAt = Date.now() - 31_000;
+            st._serverActiveObserved = observed;
+            app.es = es;
+            app.streaming = true;
+          };
+
+          installZombie(false);
+          const reattached = await app._recoverStalledStream(sid);
+          const afterReplay = {
+            reattached,
+            closeCount,
+            reconnects: reconnects.map(x => ({
+              reconnect: x.reconnect,
+              sessionId: x.sessionId,
+              elapsedSeconds: x.elapsedSeconds,
+            })),
+            paneStreaming: st.streaming,
+            rootStreaming: app.streaming,
+          };
+
+          active = false;
+          installZombie(true);
+          const reloaded = await app._recoverStalledStream(sid);
+          const afterCompletion = {
+            reloaded,
+            closeCount,
+            loads,
+            paneStreaming: st.streaming,
+            rootStreaming: app.streaming,
+            paneEs: st.es,
+            rootEs: app.es,
+            pendingExternalUpdate: st._pendingExternalUpdate,
+          };
+
+          window.fetch = realFetch;
+          app.send = realSend;
+          app.loadSession = realLoadSession;
+          app._syncQueueFromServer = realSyncQueue;
+          return { sid, afterReplay, afterCompletion };
+        }"""
+    )
+
+    assert result["afterReplay"] == {
+        "reattached": True,
+        "closeCount": 1,
+        "reconnects": [{
+            "reconnect": True,
+            "sessionId": result["sid"],
+            "elapsedSeconds": 31,
+        }],
+        "paneStreaming": False,
+        "rootStreaming": False,
+    }
+    assert result["afterCompletion"] == {
+        "reloaded": True,
+        "closeCount": 2,
+        "loads": [{"id": result["sid"], "quiet": True}],
+        "paneStreaming": False,
+        "rootStreaming": False,
+        "paneEs": None,
+        "rootEs": None,
+        "pendingExternalUpdate": False,
+    }
     _assert_no_browser_errors(page, errors)
 
 
@@ -1228,7 +1350,7 @@ def test_mobile_keyboard_close_without_viewport_event_restores_full_layout(
 def test_mobile_first_token_pending_stays_beside_prompt(
     page: Page, backend_url, auth_token
 ):
-    """The pending assistant row stays in-pane instead of after a full-height grid."""
+    """The pending assistant row stays inside the transcript pane."""
     errors = _capture_browser_errors(page)
     page.set_viewport_size({"width": 390, "height": 844})
     _install_fake_event_source(page)
@@ -1276,7 +1398,7 @@ def test_mobile_first_token_pending_stays_beside_prompt(
     page.wait_for_function(
         """() => {
           const app = document.querySelector("#app")._x_dataStack[0];
-          const pane = Array.from(document.querySelectorAll('.chat-grid-pane'))
+          const pane = Array.from(document.querySelectorAll('.chat-session-pane'))
             .find(el => getComputedStyle(el).display !== 'none');
           const pending = pane?.querySelector('.first-token-pending');
           return app.streaming === true && pending
@@ -1288,24 +1410,30 @@ def test_mobile_first_token_pending_stays_beside_prompt(
 
     layout = page.evaluate(
         """() => {
-          const pane = Array.from(document.querySelectorAll('.chat-grid-pane'))
+          const pane = Array.from(document.querySelectorAll('.chat-session-pane'))
             .find(el => getComputedStyle(el).display !== 'none');
           const msgPane = pane.querySelector('.msg-pane');
           const prompt = Array.from(msgPane.querySelectorAll('.msg.user'))
             .find(el => el.textContent.includes('FIRST_TOKEN_PENDING_PROMPT'));
           const pending = msgPane.querySelector('.first-token-pending');
+          const avatar = pending.querySelector('.msg-avatar');
           const promptRect = prompt.getBoundingClientRect();
           const pendingRect = pending.getBoundingClientRect();
+          const avatarStyle = getComputedStyle(avatar);
           return {
             gap: pendingRect.top - promptRect.bottom,
             pendingInPane: pending.closest('.msg-pane') === msgPane,
             directBodyPending: document.querySelectorAll(
               '.chat-body > .first-token-pending').length,
+            avatarVisibility: avatarStyle.visibility,
+            avatarWidth: avatar.getBoundingClientRect().width,
           };
         }"""
     )
     assert layout["pendingInPane"] is True
     assert layout["directBodyPending"] == 0
+    assert layout["avatarVisibility"] == "visible"
+    assert layout["avatarWidth"] >= 26
     assert 0 <= layout["gap"] <= 32, layout
 
     page.evaluate(

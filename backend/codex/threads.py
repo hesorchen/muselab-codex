@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Awaitable
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import threading
 import time
@@ -19,6 +20,45 @@ _THREAD_LIST_TIMEOUT_SECONDS = 4.0
 _THREAD_LIST_CACHE_SECONDS = 30.0
 _THREAD_LIST_CACHE_MAX_PAGES = 32
 _PERMISSION_MODES = frozenset({"default", "plan", "bypassPermissions"})
+# ``model/list.serviceTiers`` is the protocol source of truth.  Codex 0.144.1
+# advertises the user-facing Fast tier with the native id ``priority`` while
+# older builds/config examples used ``fast``.  Accept both so existing sidecar
+# state remains readable and the browser can persist the catalog-provided id.
+_SERVICE_TIERS = frozenset({"", "fast", "priority"})
+_WORKSPACE_FORBIDDEN = frozenset({
+    Path("/"), Path("/home"), Path("/root"), Path("/etc"), Path("/usr"),
+    Path("/var"), Path("/boot"),
+})
+_WORKSPACE_BROWSER_DENIED_ROOTS = (
+    Path("/boot"), Path("/dev"), Path("/etc"), Path("/proc"), Path("/root"),
+    Path("/run"), Path("/sys"), Path("/usr"), Path("/var"),
+)
+_WORKSPACE_PROJECT_MARKERS = (
+    (".git", "Git"),
+    ("AGENTS.md", "Codex"),
+    ("pyproject.toml", "Python"),
+    ("package.json", "Node.js"),
+    ("Cargo.toml", "Rust"),
+    ("go.mod", "Go"),
+    (".vscode", "VS Code"),
+)
+_WORKSPACE_BROWSER_LIMIT = 300
+
+
+def normalize_service_tier(value: str | None) -> str | None:
+    """Normalize the service tiers exposed by this UI.
+
+    ``None`` means the caller did not specify an override.  An empty string is
+    intentionally different: it is the explicit Standard tier and must clear
+    a previously selected Fast tier by becoming JSON ``null`` at the native
+    protocol boundary.
+    """
+    if value is None:
+        return None
+    clean = value.strip()
+    if clean not in _SERVICE_TIERS:
+        raise ValueError("unknown service tier")
+    return clean
 
 
 class Requester(Protocol):
@@ -80,9 +120,11 @@ class CodexThreadService:
         model: str | None = None,
         model_provider: str | None = None,
         config: dict[str, Any] | None = None,
+        service_tier: str | None = None,
         cwd: str | Path | None = None,
     ) -> dict[str, Any]:
         self._sync_runtime_generation()
+        clean_service_tier = normalize_service_tier(service_tier)
         params: dict[str, Any] = {
             "cwd": self.resolve_workspace(cwd),
             "ephemeral": False,
@@ -100,6 +142,8 @@ class CodexThreadService:
             params["modelProvider"] = model_provider
         if config:
             params["config"] = config
+        if clean_service_tier is not None:
+            params["serviceTier"] = clean_service_tier or None
         result = await self.requester.request("thread/start", params)
         # The first request may lazily start/restart app-server and advance its
         # runtime generation.  Observe that change before registering this
@@ -113,6 +157,8 @@ class CodexThreadService:
             thread = dict(thread)
             thread["name"] = name.strip()
         self._pending[thread["id"]] = dict(thread)
+        if clean_service_tier is not None:
+            self.remember_service_tier(thread["id"], clean_service_tier)
         self.invalidate_list_cache()
         return self._with_local_metadata(thread)
 
@@ -220,10 +266,12 @@ class CodexThreadService:
         model: str | None = None,
         model_provider: str | None = None,
         config: dict[str, Any] | None = None,
+        service_tier: str | None = None,
         cwd: str | Path | None = None,
     ) -> dict[str, Any]:
         self._sync_runtime_generation()
         clean_id = _thread_id(thread_id)
+        clean_service_tier = normalize_service_tier(service_tier)
         params: dict[str, Any] = {"threadId": clean_id}
         if cwd is not None:
             params["cwd"] = self.resolve_workspace(cwd)
@@ -238,14 +286,20 @@ class CodexThreadService:
             params["modelProvider"] = model_provider
         if config:
             params["config"] = config
+        if clean_service_tier is not None:
+            params["serviceTier"] = clean_service_tier or None
         try:
             result = await self.requester.request("thread/resume", params)
         except AppServerResponseError as exc:
             self._sync_runtime_generation()
             if exc.code == -32600 and clean_id in self._pending:
-                return self._with_local_metadata(self._pending[clean_id])
-            raise
-        thread = _thread_from_result("thread/resume", result)
+                thread = dict(self._pending[clean_id])
+            else:
+                raise
+        else:
+            thread = _thread_from_result("thread/resume", result)
+        if clean_service_tier is not None:
+            self.remember_service_tier(clean_id, clean_service_tier)
         return self._with_local_metadata(thread)
 
     def mark_materialized(self, thread_id: str) -> None:
@@ -293,9 +347,11 @@ class CodexThreadService:
         model: str | None = None,
         model_provider: str | None = None,
         config: dict[str, Any] | None = None,
+        service_tier: str | None = None,
         cwd: str | Path | None = None,
     ) -> dict[str, Any]:
         self._sync_runtime_generation()
+        clean_service_tier = normalize_service_tier(service_tier)
         params: dict[str, Any] = {
             "threadId": _thread_id(thread_id),
             "ephemeral": False,
@@ -314,10 +370,14 @@ class CodexThreadService:
             params["modelProvider"] = model_provider
         if config:
             params["config"] = config
+        if clean_service_tier is not None:
+            params["serviceTier"] = clean_service_tier or None
         result = await self.requester.request("thread/fork", params)
         self._sync_runtime_generation()
         thread = _thread_from_result("thread/fork", result)
         self._pending[thread["id"]] = dict(thread)
+        if clean_service_tier is not None:
+            self.remember_service_tier(thread["id"], clean_service_tier)
         self.invalidate_list_cache()
         return self._with_local_metadata(thread)
 
@@ -327,6 +387,67 @@ class CodexThreadService:
                 WorkspaceEntry(path=path, name=name, primary=path == str(self.workspace))
                 for path, name in self._workspaces.items()
             ]
+
+    def browse_workspace_directories(self, value: str | Path | None = None) -> dict[str, Any]:
+        """List safe server-side folders for the authenticated folder picker.
+
+        File APIs intentionally cannot escape a registered workspace.  Adding
+        one is the single exception, so browsing is bounded to the user's home
+        (when the primary workspace lives there) or to the parent of each
+        already-registered root.  This exposes useful siblings/children while
+        keeping system trees such as /etc, /proc, and /var out of the picker.
+        """
+        path = self._workspace_browser_path(value)
+        with self._workspace_lock:
+            registered = set(self._workspaces)
+
+        try:
+            candidates = sorted(path.iterdir(), key=lambda item: item.name.casefold())
+        except OSError as exc:
+            raise ValueError("directory cannot be read") from exc
+
+        directories: list[dict[str, Any]] = []
+        for candidate in candidates:
+            if candidate.name.startswith("."):
+                continue
+            try:
+                if not candidate.is_dir():
+                    continue
+                clean = candidate.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if not self._workspace_browser_allowed(clean):
+                continue
+            if not os.access(clean, os.R_OK | os.X_OK):
+                continue
+            directories.append({
+                "path": str(clean),
+                "name": candidate.name,
+                "registered": str(clean) in registered,
+                "selectable": self._workspace_selectable(clean),
+                "project": self._workspace_project_hint(clean),
+            })
+
+        # Project-looking folders rise to the top, like an editor's recent /
+        # workspace suggestions, while ordinary directories remain available.
+        directories.sort(key=lambda item: (
+            not bool(item["project"]), str(item["name"]).casefold()))
+        truncated = len(directories) > _WORKSPACE_BROWSER_LIMIT
+        directories = directories[:_WORKSPACE_BROWSER_LIMIT]
+        parent = path.parent
+        if parent == path or not self._workspace_browser_allowed(parent):
+            parent_value = ""
+        else:
+            parent_value = str(parent)
+        return {
+            "path": str(path),
+            "name": path.name or str(path),
+            "parent": parent_value,
+            "registered": str(path) in registered,
+            "selectable": self._workspace_selectable(path),
+            "directories": directories,
+            "truncated": truncated,
+        }
 
     def register_workspace(self, value: str | Path, name: str | None = None) -> WorkspaceEntry:
         path = self._validated_workspace(value)
@@ -393,13 +514,93 @@ class CodexThreadService:
         if not path.is_absolute():
             path = self.workspace / path
         path = path.resolve()
-        forbidden = {Path("/"), Path("/home"), Path("/root"), Path("/etc"),
-                     Path("/usr"), Path("/var"), Path("/boot")}
-        if path in forbidden:
+        if path in _WORKSPACE_FORBIDDEN:
             raise ValueError("workspace path is too broad or sensitive")
         if not path.exists() or not path.is_dir():
             raise ValueError("workspace path must be an existing directory")
         return path
+
+    def _workspace_browser_roots(self) -> tuple[Path, ...]:
+        home = Path.home().resolve()
+        with self._workspace_lock:
+            workspaces = tuple(Path(path) for path in self._workspaces)
+        roots: list[Path] = []
+        for workspace in workspaces:
+            if workspace == home or workspace.is_relative_to(home):
+                root = home
+            else:
+                parent = workspace.parent
+                parent_is_sensitive = any(
+                    parent == denied or parent.is_relative_to(denied)
+                    for denied in _WORKSPACE_BROWSER_DENIED_ROOTS
+                )
+                root = workspace if (
+                    parent in _WORKSPACE_FORBIDDEN or parent_is_sensitive
+                ) else parent
+            if root not in roots:
+                roots.append(root)
+        return tuple(roots)
+
+    def _workspace_browser_allowed(self, path: Path) -> bool:
+        try:
+            clean = path.resolve()
+        except (OSError, RuntimeError):
+            return False
+        roots = self._workspace_browser_roots()
+        matches = [
+            root for root in roots
+            if clean == root or clean.is_relative_to(root)
+        ]
+        if not matches:
+            return False
+        sensitive = next((
+            denied for denied in _WORKSPACE_BROWSER_DENIED_ROOTS
+            if clean == denied or clean.is_relative_to(denied)
+        ), None)
+        if sensitive is None:
+            return True
+        # A workspace already registered inside a normally-sensitive tree
+        # (for example /var/lib/my-project) remains browsable beneath that
+        # exact root, but the picker can never walk upward into /var itself.
+        home = Path.home().resolve()
+        return any(root == home
+                   or (root != sensitive and root.is_relative_to(sensitive))
+                   for root in matches)
+
+    def _workspace_browser_path(self, value: str | Path | None) -> Path:
+        raw = str(value or "").strip()
+        try:
+            path = Path(raw).expanduser().resolve() if raw else self.workspace
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("invalid directory path") from exc
+        if not self._workspace_browser_allowed(path):
+            raise ValueError("directory is outside selectable workspace roots")
+        if not path.exists() or not path.is_dir():
+            raise ValueError("directory must exist")
+        if not os.access(path, os.R_OK | os.X_OK):
+            raise ValueError("directory cannot be read")
+        return path
+
+    def _workspace_selectable(self, path: Path) -> bool:
+        try:
+            self._validated_workspace(path)
+        except ValueError:
+            return False
+        return os.access(path, os.R_OK | os.X_OK)
+
+    @staticmethod
+    def _workspace_project_hint(path: Path) -> str:
+        labels: list[str] = []
+        for marker, label in _WORKSPACE_PROJECT_MARKERS:
+            try:
+                present = (path / marker).exists()
+            except OSError:
+                present = False
+            if present:
+                labels.append(label)
+            if len(labels) >= 2:
+                break
+        return " · ".join(labels)
 
     def _load_workspaces(self) -> dict[str, str]:
         workspaces = {str(self.workspace): self.workspace.name or str(self.workspace)}
@@ -476,6 +677,62 @@ class CodexThreadService:
             self._write_metadata(self._pinned, updated)
             self._settings = updated
         self.invalidate_list_cache()
+
+    def remember_service_tier(self, thread_id: str, service_tier: str) -> None:
+        """Persist an override already accepted by start/resume/fork."""
+        clean_id = _thread_id(thread_id)
+        clean_tier = normalize_service_tier(service_tier)
+        assert clean_tier is not None
+        with self._metadata_lock:
+            current = self._settings.get(clean_id, {})
+            if ("service_tier" in current
+                    and current.get("service_tier") == clean_tier):
+                return
+            updated = {
+                key: dict(value) for key, value in self._settings.items()
+            }
+            updated.setdefault(clean_id, {})["service_tier"] = clean_tier
+            self._write_metadata(self._pinned, updated)
+            self._settings = updated
+        self.invalidate_list_cache()
+
+    async def set_service_tier(self, thread_id: str, service_tier: str) -> None:
+        """Apply and persist the session's Standard/Fast service tier.
+
+        Stable ``thread/list`` and ``thread/read`` responses currently omit the
+        effective tier.  Keep the explicit choice in the same compatibility
+        sidecar as Effort, and also send the native settings update.  Empty
+        pre-first-turn threads may reject ``thread/settings/update`` with
+        ``-32600``; ``turn/start.serviceTier`` applies the sidecar choice when
+        that thread is materialized.
+        """
+        self._sync_runtime_generation()
+        clean_id = _thread_id(thread_id)
+        clean_tier = normalize_service_tier(service_tier)
+        assert clean_tier is not None
+        try:
+            result = await self.requester.request("thread/settings/update", {
+                "threadId": clean_id,
+                "serviceTier": clean_tier or None,
+            })
+            if not isinstance(result, dict):
+                raise AppServerProtocolError(
+                    "thread/settings/update returned an invalid result")
+        except AppServerResponseError as exc:
+            self._sync_runtime_generation()
+            if exc.code != -32600 or clean_id not in self._pending:
+                raise
+        self.remember_service_tier(clean_id, clean_tier)
+
+    def service_tier(self, thread_id: str) -> str | None:
+        """Return an explicit service-tier override, including Standard ``""``."""
+        clean_id = _thread_id(thread_id)
+        with self._metadata_lock:
+            settings = self._settings.get(clean_id, {})
+            if "service_tier" not in settings:
+                return None
+            value = settings.get("service_tier")
+        return value if isinstance(value, str) else None
 
     def set_permission(self, thread_id: str, permission: str) -> None:
         """Persist the browser's next-turn permission profile.
@@ -611,6 +868,12 @@ class CodexThreadService:
                 item["thinking"] = raw["thinking"]
             if raw.get("permission") in _PERMISSION_MODES:
                 item["permission"] = raw["permission"]
+            try:
+                service_tier = normalize_service_tier(raw.get("service_tier"))
+            except (AttributeError, ValueError):
+                service_tier = None
+            if service_tier is not None:
+                item["service_tier"] = service_tier
             if item:
                 settings[thread_id.strip()] = item
         return settings

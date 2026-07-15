@@ -25,7 +25,7 @@ The browser does not create a fourth configuration system. Model, Skill, and MCP
 | `MUSELAB_CODEX_COMPACT_TIMEOUT_SECONDS` | no | `600` | Maximum compact-summary wait |
 | `MUSELAB_VAPID_SUBJECT` | no | `mailto:noreply@muselab.dev` | Web Push VAPID subject; must be a `mailto:` address |
 
-`MUSELAB_ROOT` must exist and cannot be a system root such as `/`, `/home`, or `/etc`. File endpoints additionally reject traversal, escaping symlinks, and credential-shaped files.
+`MUSELAB_ROOT` is the default workspace. It must exist and cannot be a system root such as `/`, `/home`, or `/etc`. Additional existing directories can be registered from the workspace picker; they pass the same broad/sensitive-root validation before file APIs or new threads can use them. File endpoints additionally reject traversal, escaping symlinks, and credential-shaped files inside the selected workspace.
 
 ## Workspace and Codex state
 
@@ -52,10 +52,17 @@ All three use `wire_api = "responses"`. Web Search is disabled for compatibility
 | Provider enablement | Codex `config.toml` `model_providers` |
 | Skill enablement | app-server `skills/config/write` |
 | MCP servers | app-server MCP configuration APIs |
-| Thread model, approval policy, effort | Codex thread/turn state |
+| Thread model, approval policy, effort, Fast tier | Codex thread/turn state; explicit choices omitted by stable reads use a minimal compatibility sidecar |
 | Theme and layout | browser local storage |
 
 The UI does not modify `MUSELAB_ROOT`, listen address, primary token, or provider keys. Deployment changes require a private environment update and restart.
+
+Fast is a native Codex `serviceTier`, not an Effort level. The control appears
+only when the current model advertises a tier named Fast in
+`model/list.serviceTiers`; the native tier id is catalog-driven (`priority` in
+the Codex 0.144.1 catalog), rather than a hard-coded UI value. It generally
+produces output faster while consuming more account credits; Standard/Fast is
+saved per thread and applies from the next turn.
 
 ## Docker
 

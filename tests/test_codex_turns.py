@@ -56,8 +56,9 @@ class Threads:
         self.calls = []
         self.materialized = []
         self.summary = None
+        self.tier = None
 
-    async def resume(self, thread_id, *, model=None):
+    async def resume(self, thread_id, *, model=None, service_tier=None):
         self.calls.append((thread_id, model))
         return {"id": thread_id, "turns": []}
 
@@ -69,6 +70,9 @@ class Threads:
 
     def reasoning_summary(self, _thread_id):
         return self.summary
+
+    def service_tier(self, _thread_id):
+        return self.tier
 
 
 class History:
@@ -142,6 +146,23 @@ def test_unknown_permission_mode_is_rejected():
         _permission_overrides("legacy-mode", "gpt-test", "")
 
 
+@pytest.mark.asyncio
+async def test_explicit_standard_tier_overrides_a_persisted_fast_choice():
+    runtime = Runtime()
+    threads = Threads()
+    threads.tier = "fast"
+    service = CodexTurnService(runtime, Events(), threads, History())
+
+    await service.start("thread-1", "standard", service_tier="")
+    params = next(
+        value for method, value, _timeout in runtime.calls
+        if method == "turn/start"
+    )
+    assert "serviceTier" in params
+    assert params["serviceTier"] is None
+    await service.close()
+
+
 @pytest.mark.parametrize(("item_type", "name"), [
     ("plan", "Plan"),
     ("subAgentActivity", "AgentActivity"),
@@ -169,13 +190,14 @@ async def test_turn_maps_reasoning_tools_text_and_done_with_replay():
     service = CodexTurnService(runtime, events, threads, History())
     stream = await service.start(
         "thread-1", "hello", model="gpt-test", permission="default",
-        effort="high")
+        effort="high", service_tier="priority")
     # Make server-observed elapsed timing deterministic without sleeping.
     stream._started_monotonic = time.monotonic() - 2.5
 
     turn_params = next(params for method, params, _timeout in runtime.calls
                        if method == "turn/start")
     assert turn_params["effort"] == "high"
+    assert turn_params["serviceTier"] == "priority"
     assert "approvalPolicy" not in turn_params
     assert "sandboxPolicy" not in turn_params
 

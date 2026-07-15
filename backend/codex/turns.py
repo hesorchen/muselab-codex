@@ -12,7 +12,7 @@ from .event_router import CodexEventRouter, EventSubscription
 from .history import CodexHistoryService
 from .process import AppServerError, AppServerProtocolError
 from .runtime import CodexRuntime
-from .threads import CodexThreadService
+from .threads import CodexThreadService, normalize_service_tier
 from .usage import CodexUsageService
 
 
@@ -122,6 +122,7 @@ class CodexTurnService:
         config: dict[str, Any] | None = None,
         permission: str = "default",
         effort: str = "",
+        service_tier: str | None = None,
         inputs: list[dict[str, Any]] | None = None,
         user_images: list[dict[str, Any]] | None = None,
         user_docs: list[dict[str, Any]] | None = None,
@@ -134,6 +135,9 @@ class CodexTurnService:
             raise ValueError("thread id cannot be empty")
         if not clean_prompt and not extra_inputs:
             raise ValueError("prompt and attachments cannot both be empty")
+        effective_service_tier = normalize_service_tier(service_tier)
+        if effective_service_tier is None:
+            effective_service_tier = self.threads.service_tier(clean_id)
 
         async with self._lock:
             existing = self._active.get(clean_id)
@@ -154,6 +158,8 @@ class CodexTurnService:
                     resume_kwargs["model_provider"] = model_provider
                 if config:
                     resume_kwargs["config"] = config
+                if effective_service_tier is not None:
+                    resume_kwargs["service_tier"] = effective_service_tier
                 await self.threads.resume(clean_id, **resume_kwargs)
                 self._loaded_generation[clean_id] = generation
             subscription = await self.events.subscribe(clean_id)
@@ -177,6 +183,10 @@ class CodexTurnService:
             reasoning_summary = self.threads.reasoning_summary(clean_id)
             if reasoning_summary is not None:
                 params["summary"] = reasoning_summary
+            if effective_service_tier is not None:
+                # Native ``null`` means Standard and is distinct from omission,
+                # which inherits whatever tier another Codex surface selected.
+                params["serviceTier"] = effective_service_tier or None
             if model:
                 params["model"] = model
             if effort:

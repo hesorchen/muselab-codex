@@ -8,13 +8,43 @@ import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from urllib.parse import unquote
+from fastapi import (
+    APIRouter, Depends, File, Form, Header, HTTPException, Query, Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 from .auth import require_token, require_token_query
 from .settings import ROOT, atomic_write_text, env_int
 
 router = APIRouter(prefix="/api/files", tags=["files"])
+
+
+def _workspace_root(
+    request: Request,
+    workspace: str = Query(""),
+    workspace_header: str = Header("", alias="X-Muselab-Workspace"),
+) -> Path:
+    """Resolve one registered workspace for a file API request.
+
+    Normal fetches send the workspace as an ASCII percent-encoded header;
+    browser-owned resource requests (img/iframe/download) use the query
+    parameter because they cannot attach custom headers. An omitted value
+    preserves the original primary-workspace API contract.
+    """
+    requested = workspace.strip()
+    if not requested and workspace_header.strip():
+        requested = unquote(workspace_header.strip())
+    if not requested:
+        return ROOT.resolve()
+    threads = getattr(request.app.state, "codex_threads", None)
+    if threads is None:
+        raise HTTPException(status_code=503, detail="workspace service unavailable")
+    try:
+        return Path(threads.resolve_workspace(requested)).resolve()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 # ============================================================
 # Trash / dustbin — soft delete moves to <ROOT>/.muselab-dustbin/ instead
@@ -42,11 +72,15 @@ TRASH_DIR_NAME = ".muselab-dustbin"
 _DEST_WRITE_LOCK = threading.Lock()
 
 
-def _trash_dir() -> Path:
-    return ROOT / TRASH_DIR_NAME
+def _root_or_default(root: Path | None) -> Path:
+    return ROOT if root is None else root
 
 
-def _guard_not_trash(target: Path) -> None:
+def _trash_dir(root: Path | None = None) -> Path:
+    return _root_or_default(root) / TRASH_DIR_NAME
+
+
+def _guard_not_trash(target: Path, root: Path | None = None) -> None:
     """Refuse write/upload/rename/copy operations that target the dustbin.
 
     /delete already blocks the dustbin (writes there have dedicated
@@ -55,7 +89,7 @@ def _guard_not_trash(target: Path) -> None:
     files inside .muselab-dustbin, corrupting the soft-delete bookkeeping
     (orphan payloads, manifest mismatch). Apply the same guard everywhere
     for consistency."""
-    trash_root = _trash_dir()
+    trash_root = _trash_dir(root)
     if target == trash_root or trash_root in target.parents:
         raise HTTPException(
             status_code=400,
@@ -63,8 +97,8 @@ def _guard_not_trash(target: Path) -> None:
         )
 
 
-def _ensure_trash_dir() -> Path:
-    d = _trash_dir()
+def _ensure_trash_dir(root: Path | None = None) -> Path:
+    d = _trash_dir(root)
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -105,14 +139,15 @@ def _dir_size(p: Path) -> int:
     return total
 
 
-def _move_to_trash(target: Path) -> dict:
+def _move_to_trash(target: Path, root: Path | None = None) -> dict:
     """Move `target` into the trash, write a manifest, return it.
     Caller is responsible for ensuring `target` exists + is inside ROOT.
     Same-filesystem rename, so atomic + cheap regardless of payload size."""
-    trash = _ensure_trash_dir()
+    root = _root_or_default(root)
+    trash = _ensure_trash_dir(root)
     tid = _gen_trash_id()
     payload = trash / tid
-    original_rel = str(target.relative_to(ROOT))
+    original_rel = str(target.relative_to(root))
     target.rename(payload)
     is_dir = payload.is_dir()
     try:
@@ -136,8 +171,8 @@ def _move_to_trash(target: Path) -> dict:
     return manifest
 
 
-def _read_manifest(tid: str) -> dict | None:
-    mf = _trash_dir() / f"{tid}.json"
+def _read_manifest(tid: str, root: Path | None = None) -> dict | None:
+    mf = _trash_dir(root) / f"{tid}.json"
     if not mf.exists():
         return None
     try:
@@ -146,11 +181,11 @@ def _read_manifest(tid: str) -> dict | None:
         return None
 
 
-def _list_trash() -> list[dict]:
+def _list_trash(root: Path | None = None) -> list[dict]:
     """Manifests of every in-trash item, newest first. Orphans (manifest
     without payload, or vice versa) are skipped — they'd be confusing
     to surface and the user can't usefully act on them anyway."""
-    d = _trash_dir()
+    d = _trash_dir(root)
     if not d.exists():
         return []
     items: list[dict] = []
@@ -185,14 +220,14 @@ def _list_trash() -> list[dict]:
 _TRASH_TTL_DAYS = env_int("MUSELAB_TRASH_TTL_DAYS", 30, min_value=0)
 
 
-def auto_purge_expired_trash() -> int:
+def auto_purge_expired_trash(root: Path | None = None) -> int:
     """Purge trash items whose `deleted_at` is older than _TRASH_TTL_DAYS.
     Returns the count purged. Called once at startup (see backend/main.py)
     and ignores any per-item errors so a single corrupt manifest can't
     block the cleanup of healthy entries. Returns 0 when disabled."""
     if _TRASH_TTL_DAYS <= 0:
         return 0
-    d = _trash_dir()
+    d = _trash_dir(root)
     if not d.exists():
         return 0
     cutoff = time.time() - (_TRASH_TTL_DAYS * 86400)
@@ -207,15 +242,15 @@ def auto_purge_expired_trash() -> int:
         tid = data.get("trash_id")
         if not tid or not _valid_trash_id(tid):
             continue
-        _purge_one(tid)
+        _purge_one(tid, root)
         purged += 1
     return purged
 
 
-def _purge_one(tid: str) -> None:
+def _purge_one(tid: str, root: Path | None = None) -> None:
     """Permanently delete one trash item (manifest + payload).
     Silent no-op if neither exists."""
-    d = _trash_dir()
+    d = _trash_dir(root)
     payload = d / tid
     if payload.exists():
         if payload.is_dir():
@@ -323,7 +358,11 @@ def _is_sensitive(p: Path) -> bool:
     return False
 
 
-def safe_resolve(rel: str, allow_sensitive: bool = False) -> Path:
+def safe_resolve(
+    rel: str,
+    allow_sensitive: bool = False,
+    root: Path | None = None,
+) -> Path:
     """Resolve a path relative to ROOT, blocking traversal outside ROOT and,
     by default, blocking access to credential-shaped filenames.
 
@@ -333,8 +372,9 @@ def safe_resolve(rel: str, allow_sensitive: bool = False) -> Path:
         previously slip through because `.resolve()` follows symlinks. We
         explicitly check the resolved target is still under ROOT.
       - `.env`, `id_rsa`, `*.pem` etc. (SENSITIVE_SUFFIX / SENSITIVE_NAMES)."""
+    root = _root_or_default(root)
     rel = (rel or "").lstrip("/")
-    # NUL byte in a path raises ValueError from (ROOT / rel) and FastAPI
+    # NUL byte in a path raises ValueError from (root / rel) and FastAPI
     # converts that to a 500 with a traceback that leaks internal module
     # paths. Reject early as 400. Same for any string that Python's path
     # layer refuses (control chars trip OS-level checks downstream).
@@ -342,11 +382,11 @@ def safe_resolve(rel: str, allow_sensitive: bool = False) -> Path:
         raise HTTPException(status_code=400, detail="invalid path")
     # First-pass resolve (follows symlinks → catches symlink escape):
     try:
-        target = (ROOT / rel).resolve()
+        target = (root / rel).resolve()
     except (ValueError, OSError):
         raise HTTPException(status_code=400, detail="invalid path") from None
-    # ROOT itself must also be resolved (it might itself be a symlink target).
-    root_real = ROOT.resolve()
+    # The selected root itself might be a symlink target; compare real paths.
+    root_real = root.resolve()
     if root_real != target and root_real not in target.parents:
         raise HTTPException(status_code=400, detail="path escapes root")
     # Block by name regardless of whether the file already exists, so the API
@@ -368,8 +408,12 @@ MAX_LIST_ENTRIES = 500  # safety cap so huge dirs (.git/objects) don't freeze th
 
 
 @router.get("/list", dependencies=[Depends(require_token)])
-def list_dir(path: str = "", show_hidden: bool = False) -> dict:
-    target = safe_resolve(path)
+def list_dir(
+    path: str = "",
+    show_hidden: bool = False,
+    root: Path = Depends(_workspace_root),
+) -> dict:
+    target = safe_resolve(path, root=root)
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
     if not target.is_dir():
@@ -380,7 +424,7 @@ def list_dir(path: str = "", show_hidden: bool = False) -> dict:
     # show_hidden=true) — it has its own dedicated UI surface; mixing it
     # back into the tree would surface deleted files in a confusing
     # context. Only relevant at the root level since trash dir lives there.
-    is_root_listing = (target == ROOT)
+    is_root_listing = (target == root)
     # DirEntry caches d_type/stat data supplied by the OS. The Path-based
     # implementation called is_dir() during sort and then two more times per
     # rendered row, which made large network-mounted directories needlessly
@@ -411,12 +455,12 @@ def list_dir(path: str = "", show_hidden: bool = False) -> dict:
             continue
         entries.append(Entry(
             name=child.name,
-            path=str(Path(child.path).relative_to(ROOT)),
+            path=str(Path(child.path).relative_to(root)),
             is_dir=is_dir,
             size=stat.st_size if not is_dir else 0,
             mtime=stat.st_mtime,
         ).model_dump())
-    return {"root": str(ROOT), "path": path, "entries": entries, "truncated": truncated}
+    return {"root": str(root), "path": path, "entries": entries, "truncated": truncated}
 
 
 # xlsx preview caps. Read-only mode + capped per-sheet rows/cols so a
@@ -430,7 +474,7 @@ XLSX_CELL_MAX_CHARS = 500   # one obnoxious cell shouldn't blow the page
 
 
 @router.get("/xlsx", dependencies=[Depends(require_token)])
-def xlsx_preview(path: str) -> dict:
+def xlsx_preview(path: str, root: Path = Depends(_workspace_root)) -> dict:
     """Read-only xlsx preview as structured JSON.
 
     Returns each sheet's first XLSX_MAX_ROWS×XLSX_MAX_COLS cells as
@@ -439,7 +483,7 @@ def xlsx_preview(path: str) -> dict:
     programmatically without ever being opened in Excel/LibreOffice,
     formula cells will be null and surface as empty strings.
     """
-    target = safe_resolve(path)
+    target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     if target.suffix.lower() not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
@@ -538,7 +582,12 @@ def _csv_total_cache_set(target: Path, mtime_ns: int, size: int, total: int) -> 
 
 
 @router.get("/csv", dependencies=[Depends(require_token)])
-def csv_preview(path: str, offset: int = 0, limit: int = CSV_DEFAULT_LIMIT) -> dict:
+def csv_preview(
+    path: str,
+    offset: int = 0,
+    limit: int = CSV_DEFAULT_LIMIT,
+    root: Path = Depends(_workspace_root),
+) -> dict:
     """Read-only paginated CSV / TSV preview as structured JSON.
 
     Returns rows[offset : offset+limit] from the file, plus the sniffed
@@ -552,7 +601,7 @@ def csv_preview(path: str, offset: int = 0, limit: int = CSV_DEFAULT_LIMIT) -> d
     """
     import csv as _csv  # local import — csv is stdlib, but keep import local
                        # so import overhead stays out of every other route.
-    target = safe_resolve(path)
+    target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     if target.suffix.lower() not in {".csv", ".tsv"}:
@@ -660,8 +709,11 @@ def _clip_cell(value: str) -> str:
 
 
 @router.get("/read", dependencies=[Depends(require_token)])
-def read_file(path: str) -> PlainTextResponse:
-    target = safe_resolve(path)
+def read_file(
+    path: str,
+    root: Path = Depends(_workspace_root),
+) -> PlainTextResponse:
+    target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     suffix = target.suffix.lower()
@@ -698,7 +750,7 @@ def read_file(path: str) -> PlainTextResponse:
 
 
 @router.get("/stat", dependencies=[Depends(require_token)])
-def stat_file(path: str) -> dict:
+def stat_file(path: str, root: Path = Depends(_workspace_root)) -> dict:
     """Lightweight metadata for a single path — name, size, mtime, is_dir.
 
     Powers the preview header's "real path + last-modified" strip: the
@@ -708,14 +760,14 @@ def stat_file(path: str) -> dict:
     re-reading the whole file. 404 when the path is gone — same contract
     as /read, so a stale/phantom tab surfaces honestly instead of showing
     a path that no longer exists."""
-    target = safe_resolve(path)
+    target = safe_resolve(path, root=root)
     try:
         st = target.stat()
     except OSError:
         raise HTTPException(status_code=404, detail="not found") from None
     is_dir = target.is_dir()
     return {
-        "path": str(target.relative_to(ROOT)),
+        "path": str(target.relative_to(root)),
         "name": target.name,
         "is_dir": is_dir,
         "size": 0 if is_dir else st.st_size,
@@ -731,17 +783,41 @@ INLINE_OK_SUFFIX = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
 # same-origin token theft).
 SANDBOXED_INLINE_SUFFIX = {".html", ".htm", ".svg"}
 
-# Click-to-zoom bridge for HTML previews. The preview iframe is sandboxed
-# (opaque origin) so the parent can't reach the framed DOM to intercept image
-# clicks. Instead we inject this tiny script (only when the preview pane asks
-# via ?preview=1) which forwards in-page image clicks to the parent via
-# postMessage — postMessage works fine from a sandboxed origin, so this needs
-# NO sandbox relaxation and leaks nothing (only the clicked image's src/alt).
-# The parent (app.js) validates event.source === the preview iframe before
-# opening its lightbox. Images wrapped in a link are left alone so the link
-# still navigates. CSP allows it: script-src includes 'unsafe-inline'.
-_PREVIEW_IMG_BRIDGE = (
-    "<script>(function(){document.addEventListener('click',function(e){"
+# HTML-preview bridge. The iframe has an opaque sandbox origin, so the parent
+# cannot inspect its document scroll position or intercept image clicks. This
+# script is injected only for preview=1 and uses postMessage for both jobs;
+# neither feature requires relaxing the sandbox. The parent validates
+# event.source against its own preview iframe, while this child accepts restore
+# messages only from its parent. CSP permits this inline bridge.
+_PREVIEW_HTML_BRIDGE = (
+    "<script>(function(){"
+    "var pending=false,behaviorRoot=null,behaviorValue='',behaviorPriority='',behaviorFrame=0;"
+    "function sendScroll(){try{parent.postMessage({__muselab:'preview-scroll',"
+    "top:Math.max(0,window.scrollY||document.documentElement.scrollTop||0),"
+    "left:Math.max(0,window.scrollX||document.documentElement.scrollLeft||0)},'*');}"
+    "catch(_e){}}"
+    "function jump(left,top){var root=document.scrollingElement||document.documentElement;"
+    "left=Math.max(0,Number(left)||0);top=Math.max(0,Number(top)||0);"
+    "if(root&&!behaviorFrame){behaviorRoot=root;"
+    "behaviorValue=root.style.getPropertyValue('scroll-behavior');"
+    "behaviorPriority=root.style.getPropertyPriority('scroll-behavior');}"
+    "if(root)root.style.setProperty('scroll-behavior','auto','important');"
+    "try{scrollTo({left:left,top:top,behavior:'instant'});}catch(_e){scrollTo(left,top);}"
+    "if(root){if(behaviorFrame)cancelAnimationFrame(behaviorFrame);"
+    "behaviorFrame=requestAnimationFrame(function(){"
+    "if(behaviorValue)behaviorRoot.style.setProperty('scroll-behavior',behaviorValue,behaviorPriority);"
+    "else behaviorRoot.style.removeProperty('scroll-behavior');behaviorFrame=0;});}}"
+    "addEventListener('scroll',function(){if(pending)return;pending=true;"
+    "requestAnimationFrame(function(){pending=false;sendScroll();});},{passive:true});"
+    "addEventListener('message',function(e){var d=e.data;"
+    "if(e.source!==parent||!d||d.__muselab!=='preview-scroll-restore')return;"
+    "jump(d.left,d.top);"
+    "requestAnimationFrame(sendScroll);});"
+    "function ready(){try{parent.postMessage({__muselab:'preview-ready'},'*');}"
+    "catch(_e){}sendScroll();}"
+    "if(document.readyState==='loading'){document.addEventListener('DOMContentLoaded',ready,{once:true});}"
+    "else{ready();}"
+    "document.addEventListener('click',function(e){"
     "var t=e.target;var img=t&&t.closest?t.closest('img'):null;"
     "if(!img||img.closest('a'))return;var src=img.currentSrc||img.src;"
     "if(!src)return;e.preventDefault();"
@@ -749,14 +825,13 @@ _PREVIEW_IMG_BRIDGE = (
     "catch(_e){}},true);})();</script>"
 )
 # Cap the in-memory read used for injection. Bigger HTML (e.g. reports with
-# megabytes of base64 images) falls back to streaming untouched — it just
-# won't have click-to-zoom, which is an acceptable degradation.
+# megabytes of base64 images) falls back to streaming untouched — it won't
+# have click-to-zoom or reading-position restoration, an acceptable degradation.
 _PREVIEW_INJECT_MAX_BYTES = 12 * 1024 * 1024
 
 
-def _inject_preview_img_bridge(target: Path) -> str | None:
-    """Return the HTML text with the click-to-zoom bridge injected, or None to
-    signal "fall back to streaming the file untouched" (too big / not utf-8)."""
+def _inject_preview_html_bridge(target: Path) -> str | None:
+    """Return HTML with the preview bridge, or None for untouched streaming."""
     try:
         if target.stat().st_size > _PREVIEW_INJECT_MAX_BYTES:
             return None
@@ -768,15 +843,19 @@ def _inject_preview_img_bridge(target: Path) -> str | None:
     if idx == -1:
         idx = lower.rfind("</html>")
     if idx == -1:
-        return html + _PREVIEW_IMG_BRIDGE
-    return html[:idx] + _PREVIEW_IMG_BRIDGE + html[idx:]
+        return html + _PREVIEW_HTML_BRIDGE
+    return html[:idx] + _PREVIEW_HTML_BRIDGE + html[idx:]
 
 
 @router.get("/raw", dependencies=[Depends(require_token_query)])
-def raw_file(path: str = Query(...), preview: bool = Query(False)):
+def raw_file(
+    path: str = Query(...),
+    preview: bool = Query(False),
+    root: Path = Depends(_workspace_root),
+):
     """Stream raw file (images, PDF, sandboxed HTML, etc.). Token via query.
     Everything outside the whitelists is forced to download as octet-stream."""
-    target = safe_resolve(path)
+    target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     suffix = target.suffix.lower()
@@ -825,11 +904,11 @@ def raw_file(path: str = Query(...), preview: bool = Query(False)):
                 "base-uri 'none'; form-action 'none'"
             ),
         }
-        # Preview pane requests ?preview=1 for HTML so we can inject the
-        # click-to-zoom bridge. SVG and the top-level/download paths never
+        # Preview pane requests ?preview=1 for HTML so we can inject the image
+        # and scroll-position bridge. SVG and top-level/download paths never
         # get it (no preview flag) and stream untouched.
         if preview and suffix in (".html", ".htm"):
-            injected = _inject_preview_img_bridge(target)
+            injected = _inject_preview_html_bridge(target)
             if injected is not None:
                 return HTMLResponse(content=injected, headers=sandbox_headers)
         return FileResponse(target, headers=sandbox_headers)
@@ -841,8 +920,11 @@ def raw_file(path: str = Query(...), preview: bool = Query(False)):
 
 
 @router.get("/download", dependencies=[Depends(require_token_query)])
-def download_file(path: str = Query(...)) -> FileResponse:
-    target = safe_resolve(path)
+def download_file(
+    path: str = Query(...),
+    root: Path = Depends(_workspace_root),
+) -> FileResponse:
+    target = safe_resolve(path, root=root)
     if not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="not a file")
     from urllib.parse import quote
@@ -865,13 +947,13 @@ MAX_WRITE_BYTES = 10 * 1024 * 1024
 
 
 @router.put("/write", dependencies=[Depends(require_token)])
-def write_file(req: WriteReq) -> dict:
+def write_file(req: WriteReq, root: Path = Depends(_workspace_root)) -> dict:
     """Overwrite a file at `path` with `content`. Atomic (tmpfile + rename),
     so a crash mid-write leaves the previous content intact instead of a
     truncated half-file. Capped at MAX_WRITE_BYTES to prevent the editor
     from accidentally serving as an unbounded ingest path."""
-    target = safe_resolve(req.path)
-    _guard_not_trash(target)
+    target = safe_resolve(req.path, root=root)
+    _guard_not_trash(target, root)
     if target.exists() and target.is_dir():
         raise HTTPException(status_code=400, detail="path is a directory")
     # Two-stage size gate. Each char is 1-4 UTF-8 bytes, so the upper
@@ -905,9 +987,13 @@ UPLOAD_BLOCKED_SUFFIX = {
 
 
 @router.post("/upload", dependencies=[Depends(require_token)])
-async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
-    target_dir = safe_resolve(path)
-    _guard_not_trash(target_dir)
+async def upload(
+    path: str = Form(""),
+    file: UploadFile = File(...),
+    root: Path = Depends(_workspace_root),
+) -> dict:
+    target_dir = safe_resolve(path, root=root)
+    _guard_not_trash(target_dir, root)
     if not target_dir.exists() or not target_dir.is_dir():
         raise HTTPException(status_code=400, detail="target dir invalid")
     safe_name = Path(file.filename or "upload.bin").name
@@ -967,7 +1053,7 @@ async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
                             status_code=409,
                             detail=f"a directory named {safe_name!r} already exists here",
                         )
-                    trashed = _move_to_trash(dest)
+                    trashed = _move_to_trash(dest, root)
                 tmp_path.rename(dest)
                 return trashed
         trashed = await asyncio.to_thread(_finalize)
@@ -979,7 +1065,7 @@ async def upload(path: str = Form(""), file: UploadFile = File(...)) -> dict:
         raise
     return {
         "ok": True,
-        "path": str(dest.relative_to(ROOT)),
+        "path": str(dest.relative_to(root)),
         "size": dest.stat().st_size,
         # Non-null when an existing same-name file was moved to trash so the
         # frontend can surface "replaced (old version in trash)".
@@ -992,7 +1078,11 @@ class DeleteReq(BaseModel):
 
 
 @router.delete("/delete", dependencies=[Depends(require_token)])
-def delete(req: DeleteReq, permanent: bool = Query(default=False)) -> dict:
+def delete(
+    req: DeleteReq,
+    permanent: bool = Query(default=False),
+    root: Path = Depends(_workspace_root),
+) -> dict:
     """Soft delete by default: move into <ROOT>/.muselab-dustbin/. The
     previous "must be empty for dirs" guard is dropped because the
     operation is now reversible — Restore moves the payload back to its
@@ -1001,10 +1091,10 @@ def delete(req: DeleteReq, permanent: bool = Query(default=False)) -> dict:
     Refuses to delete the trash dir itself or anything inside it via this
     route — those operations have dedicated /trash/* endpoints with a
     different mental model."""
-    target = safe_resolve(req.path)
+    target = safe_resolve(req.path, root=root)
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
-    trash_root = _trash_dir()
+    trash_root = _trash_dir(root)
     if target == trash_root or trash_root in target.parents:
         raise HTTPException(
             status_code=400,
@@ -1022,7 +1112,7 @@ def delete(req: DeleteReq, permanent: bool = Query(default=False)) -> dict:
             except OSError:
                 pass
         return {"ok": True, "permanent": True}
-    manifest = _move_to_trash(target)
+    manifest = _move_to_trash(target, root)
     return {"ok": True, "permanent": False,
             "trash_id": manifest["trash_id"], "manifest": manifest}
 
@@ -1031,7 +1121,7 @@ def delete(req: DeleteReq, permanent: bool = Query(default=False)) -> dict:
 # Trash management endpoints
 # ============================================================
 @router.get("/trash/list", dependencies=[Depends(require_token)])
-def trash_list() -> dict:
+def trash_list(root: Path = Depends(_workspace_root)) -> dict:
     """All trash items, newest first. Each item: trash_id, original_path,
     original_name, deleted_at (unix sec, float), kind ('file'|'dir'), size.
 
@@ -1039,7 +1129,7 @@ def trash_list() -> dict:
     bytes) and ``ttl_days`` (auto-purge horizon — 0 means disabled) so
     the UI can surface "Trash · 142 MB · auto-purged after 30 days"
     without a separate roundtrip."""
-    items = _list_trash()
+    items = _list_trash(root)
     return {
         "items": items,
         "total_size": sum(int(i.get("size") or 0) for i in items),
@@ -1052,16 +1142,16 @@ class TrashIdReq(BaseModel):
 
 
 @router.post("/trash/restore", dependencies=[Depends(require_token)])
-def trash_restore(req: TrashIdReq) -> dict:
+def trash_restore(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dict:
     """Move the payload back to its original path. Fails 409 if that path
     is now occupied — user has to rename / clear it before restoring.
     Manifest is removed on success."""
     if not _valid_trash_id(req.trash_id):
         raise HTTPException(status_code=400, detail="invalid trash_id")
-    data = _read_manifest(req.trash_id)
+    data = _read_manifest(req.trash_id, root)
     if not data:
         raise HTTPException(status_code=404, detail="trash item not found")
-    payload = _trash_dir() / req.trash_id
+    payload = _trash_dir(root) / req.trash_id
     if not payload.exists():
         raise HTTPException(status_code=404, detail="trash payload missing")
     orig_rel = data.get("original_path") or ""
@@ -1071,7 +1161,7 @@ def trash_restore(req: TrashIdReq) -> dict:
     # apply to restoration as to any other write. allow_sensitive=True
     # because the user already had this file in-place before deletion;
     # blocking restore would leave their data stranded in trash.
-    orig = safe_resolve(orig_rel, allow_sensitive=True)
+    orig = safe_resolve(orig_rel, allow_sensitive=True, root=root)
     # Atomic check+rename — same TOCTOU shape as /rename: a concurrent
     # write landing at `orig` between the probe and the rename would be
     # silently replaced by the restored payload.
@@ -1083,7 +1173,7 @@ def trash_restore(req: TrashIdReq) -> dict:
             )
         orig.parent.mkdir(parents=True, exist_ok=True)
         payload.rename(orig)
-    mf = _trash_dir() / f"{req.trash_id}.json"
+    mf = _trash_dir(root) / f"{req.trash_id}.json"
     if mf.exists():
         try:
             mf.unlink()
@@ -1093,27 +1183,27 @@ def trash_restore(req: TrashIdReq) -> dict:
 
 
 @router.delete("/trash/purge", dependencies=[Depends(require_token)])
-def trash_purge(req: TrashIdReq) -> dict:
+def trash_purge(req: TrashIdReq, root: Path = Depends(_workspace_root)) -> dict:
     """Permanently delete one trash item. Irreversible."""
     if not _valid_trash_id(req.trash_id):
         raise HTTPException(status_code=400, detail="invalid trash_id")
-    d = _trash_dir()
+    d = _trash_dir(root)
     if not (d / f"{req.trash_id}.json").exists() and not (d / req.trash_id).exists():
         raise HTTPException(status_code=404, detail="trash item not found")
-    _purge_one(req.trash_id)
+    _purge_one(req.trash_id, root)
     return {"ok": True}
 
 
 @router.delete("/trash/empty", dependencies=[Depends(require_token)])
-def trash_empty() -> dict:
+def trash_empty(root: Path = Depends(_workspace_root)) -> dict:
     """Permanently delete every trash item. Irreversible."""
-    d = _trash_dir()
+    d = _trash_dir(root)
     if not d.exists():
         return {"ok": True, "purged": 0}
     count = 0
     for mf in list(d.glob("*.json")):
         tid = mf.stem
-        _purge_one(tid)
+        _purge_one(tid, root)
         count += 1
     return {"ok": True, "purged": count}
 
@@ -1123,11 +1213,11 @@ class MkdirReq(BaseModel):
 
 
 @router.post("/mkdir", dependencies=[Depends(require_token)])
-def mkdir(req: MkdirReq) -> dict:
-    target = safe_resolve(req.path)
-    _guard_not_trash(target)
+def mkdir(req: MkdirReq, root: Path = Depends(_workspace_root)) -> dict:
+    target = safe_resolve(req.path, root=root)
+    _guard_not_trash(target, root)
     target.mkdir(parents=True, exist_ok=True)
-    return {"ok": True, "path": str(target.relative_to(ROOT))}
+    return {"ok": True, "path": str(target.relative_to(root))}
 
 
 class RenameReq(BaseModel):
@@ -1136,11 +1226,11 @@ class RenameReq(BaseModel):
 
 
 @router.post("/rename", dependencies=[Depends(require_token)])
-def rename(req: RenameReq) -> dict:
-    src = safe_resolve(req.src)
-    dst = safe_resolve(req.dst)
-    _guard_not_trash(src)
-    _guard_not_trash(dst)
+def rename(req: RenameReq, root: Path = Depends(_workspace_root)) -> dict:
+    src = safe_resolve(req.src, root=root)
+    dst = safe_resolve(req.dst, root=root)
+    _guard_not_trash(src, root)
+    _guard_not_trash(dst, root)
     # Atomic check+rename under the destination lock — without it, two
     # concurrent renames onto the same dst both pass the exists() probe
     # and the later rename silently replaces the earlier file (TOCTOU).
@@ -1151,7 +1241,7 @@ def rename(req: RenameReq) -> dict:
             raise HTTPException(status_code=409, detail="destination already exists")
         dst.parent.mkdir(parents=True, exist_ok=True)
         src.rename(dst)
-    return {"ok": True, "path": str(dst.relative_to(ROOT))}
+    return {"ok": True, "path": str(dst.relative_to(root))}
 
 
 # ============================================================
@@ -1191,9 +1281,9 @@ def _next_bak_name(parent: Path, original_name: str) -> str:
 
 
 @router.post("/copy-bak", dependencies=[Depends(require_token)])
-def copy_bak(req: CopyBakReq) -> dict:
-    src = safe_resolve(req.src)
-    _guard_not_trash(src)
+def copy_bak(req: CopyBakReq, root: Path = Depends(_workspace_root)) -> dict:
+    src = safe_resolve(req.src, root=root)
+    _guard_not_trash(src, root)
     if not src.exists():
         raise HTTPException(status_code=404, detail="source not found")
     # Files only. Directory copy is a different beast (shutil.copytree,
@@ -1202,18 +1292,18 @@ def copy_bak(req: CopyBakReq) -> dict:
     if src.is_dir():
         raise HTTPException(status_code=400, detail="directories not supported")
     if req.dst_dir:
-        parent = safe_resolve(req.dst_dir)
+        parent = safe_resolve(req.dst_dir, root=root)
         if not parent.exists() or not parent.is_dir():
             raise HTTPException(status_code=404, detail="dst_dir not found")
     else:
         parent = src.parent
     new_name = _next_bak_name(parent, src.name)
     dst = parent / new_name
-    _guard_not_trash(dst)
+    _guard_not_trash(dst, root)
     # safe_resolve the final path so the anti-traversal guard fires for
     # the destination too.
-    dst_rel = str(dst.relative_to(ROOT))
-    safe_resolve(dst_rel, allow_sensitive=True)
+    dst_rel = str(dst.relative_to(root))
+    safe_resolve(dst_rel, allow_sensitive=True, root=root)
     # The appended `.bak[.N]` suffix means `_is_sensitive` (exact-name /
     # suffix match) never fires on the destination — `secrets.env.bak`
     # wouldn't match `.env.*`. Strip the trailing `.bak[.N]` chain and
@@ -1346,7 +1436,12 @@ _GREP_GATE = threading.BoundedSemaphore(2)
 
 
 @router.get("/grep", dependencies=[Depends(require_token)])
-def grep(q: str, limit: int = 50, show_hidden: bool = False) -> dict:
+def grep(
+    q: str,
+    limit: int = 50,
+    show_hidden: bool = False,
+    root: Path = Depends(_workspace_root),
+) -> dict:
     """Cross-platform full-text search (pure Python, no grep dependency).
     Uses `_cached_walk` so the directory-listing phase is O(changed-dirs)
     instead of O(all-dirs) — repeat searches on a quiet archive only stat
@@ -1354,12 +1449,18 @@ def grep(q: str, limit: int = 50, show_hidden: bool = False) -> dict:
     if not _GREP_GATE.acquire(blocking=False):
         raise HTTPException(429, "search busy — try again")
     try:
-        return _grep_impl(q, limit, show_hidden)
+        return _grep_impl(q, limit, show_hidden, root)
     finally:
         _GREP_GATE.release()
 
 
-def _grep_impl(q: str, limit: int, show_hidden: bool) -> dict:
+def _grep_impl(
+    q: str,
+    limit: int,
+    show_hidden: bool,
+    root: Path | None = None,
+) -> dict:
+    root = _root_or_default(root)
     q_lower = q.strip().lower()
     # Minimum query length: a single character matches nearly every file
     # and always runs the full archive scan to the 8s time budget while
@@ -1373,9 +1474,9 @@ def _grep_impl(q: str, limit: int, show_hidden: bool) -> dict:
     # ROOT.resolve() is a loop invariant — hoist it out of the per-file loop
     # so the symlink-escape guard doesn't re-resolve ROOT once per candidate
     # file (was N stat-resolves per search).
-    root_real = ROOT.resolve()
+    root_real = root.resolve()
     for dirpath, _dirnames, filenames in _cached_walk(
-            ROOT, SEARCH_IGNORE, show_hidden):
+            root, SEARCH_IGNORE, show_hidden):
         if time.monotonic() - started > MAX_GREP_TIME_SEC:
             timed_out = True
             break
@@ -1408,7 +1509,7 @@ def _grep_impl(q: str, limit: int, show_hidden: bool) -> dict:
                     for i, line in enumerate(f, 1):
                         if q_lower in line.lower():
                             try:
-                                rel = str(full.relative_to(ROOT))
+                                rel = str(full.relative_to(root))
                             except ValueError:
                                 continue
                             hits.append({
@@ -1430,7 +1531,12 @@ def _grep_impl(q: str, limit: int, show_hidden: bool) -> dict:
 
 
 @router.get("/search", dependencies=[Depends(require_token)])
-def search(q: str, limit: int = 100, show_hidden: bool = False) -> dict:
+def search(
+    q: str,
+    limit: int = 100,
+    show_hidden: bool = False,
+    root: Path = Depends(_workspace_root),
+) -> dict:
     """Filename / dirname substring search. Same `_cached_walk` win as
     grep — bigger here in relative terms because search only reads
     names (no file content), so the directory-listing IS the entire
@@ -1441,7 +1547,7 @@ def search(q: str, limit: int = 100, show_hidden: bool = False) -> dict:
         return {"entries": []}
     hits: list[dict] = []
     for dirpath, dirnames, filenames in _cached_walk(
-            ROOT, SEARCH_IGNORE, show_hidden):
+            root, SEARCH_IGNORE, show_hidden):
         for name in dirnames + filenames:
             if q_lower in name.lower():
                 full = Path(dirpath) / name
@@ -1454,7 +1560,7 @@ def search(q: str, limit: int = 100, show_hidden: bool = False) -> dict:
                 is_dir = full.is_dir()
                 hits.append({
                     "name": name,
-                    "path": str(full.relative_to(ROOT)),
+                    "path": str(full.relative_to(root)),
                     "is_dir": is_dir,
                     "size": stat.st_size if not is_dir else 0,
                     "mtime": stat.st_mtime,

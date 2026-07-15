@@ -45,6 +45,7 @@ from backend.codex import (
 from backend.codex.api import (
     QueueEnqueueRequest,
     _session_meta,
+    _stream_ticket_events,
     _thread_messages,
     _thread_outline,
     active_session,
@@ -59,6 +60,22 @@ from backend.codex.settings_api import router as settings_router
 
 FAKE_SERVER = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfixture-image"
+
+
+def test_stream_flushes_ping_before_touching_native_runtime():
+    """The SSE response must open before a slow native turn/start await."""
+
+    async def first_event():
+        generator = _stream_ticket_events(None, {})
+        try:
+            return await anext(generator)
+        finally:
+            await generator.aclose()
+
+    event = asyncio.run(first_event())
+
+    assert event.event == "ping"
+    assert event.data == ""
 
 
 def test_enqueue_can_atomically_drain_when_busy_state_went_stale():
@@ -377,6 +394,21 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         }]
         extra_workspace = tmp_path / "second-project"
         extra_workspace.mkdir()
+        (extra_workspace / "pyproject.toml").write_text(
+            "[project]\nname='fixture'\n", encoding="utf-8")
+        browser = client.get(
+            "/api/chat/workspaces/browse", params={"path": str(tmp_path)})
+        assert browser.status_code == 200
+        candidate = next(
+            item for item in browser.json()["directories"]
+            if item["path"] == str(extra_workspace.resolve()))
+        assert candidate == {
+            "path": str(extra_workspace.resolve()),
+            "name": "second-project",
+            "registered": False,
+            "selectable": True,
+            "project": "Python",
+        }
         registered = client.post("/api/chat/workspaces", json={
             "path": str(extra_workspace), "name": "Second project",
         })
@@ -388,6 +420,13 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         assert models.json()["default_model"] == "gpt-test-codex"
         assert models.json()["runtime"] == "codex"
         assert models.json()["models"][0]["reasoning_efforts"] == ["medium"]
+        assert models.json()["models"][0]["supports_fast"] is True
+        assert models.json()["models"][0]["fast_service_tier"] == "priority"
+        assert models.json()["models"][0]["service_tiers"] == [{
+            "id": "priority",
+            "name": "Fast",
+            "description": "1.5x speed, increased usage",
+        }]
 
         created = client.post("/api/chat/sessions", json={"name": "source"})
         custom_created = client.post("/api/chat/sessions", json={
@@ -397,12 +436,17 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         assert custom_created.json()["cwd"] == str(extra_workspace.resolve())
         forked = client.post(
             f"/api/chat/sessions/{custom_created.json()['id']}/fork",
-            json={"model": "gpt-test-codex", "effort": "medium"},
+            json={
+                "model": "gpt-test-codex",
+                "effort": "medium",
+                "service_tier": "priority",
+            },
         )
         assert forked.status_code == 200
         assert forked.json()["id"] != custom_created.json()["id"]
         assert forked.json()["cwd"] == str(extra_workspace.resolve())
         assert forked.json()["effort"] == "medium"
+        assert forked.json()["service_tier"] == "priority"
 
         context = client.get("/api/chat/context-info")
         assert context.status_code == 200
@@ -522,15 +566,28 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
             "name": "Native thread",
             "model": "gpt-test-codex",
             "permission": "bypassPermissions",
+            "service_tier": "priority",
         })
         assert created.status_code == 200
         assert created.json()["permission"] == "bypassPermissions"
+        assert created.json()["service_tier"] == "priority"
         thread_id = created.json()["id"]
         assert thread_id.startswith("thread-")
         configured_effort = client.patch(
             f"/api/chat/sessions/{thread_id}", json={"effort": "medium"})
         assert configured_effort.status_code == 200
         assert configured_effort.json()["effort"] == "medium"
+        standard_tier = client.patch(
+            f"/api/chat/sessions/{thread_id}", json={"service_tier": ""})
+        assert standard_tier.status_code == 200
+        assert standard_tier.json()["service_tier"] == ""
+        configured_fast = client.patch(
+            f"/api/chat/sessions/{thread_id}", json={"service_tier": "priority"})
+        assert configured_fast.status_code == 200
+        assert configured_fast.json()["service_tier"] == "priority"
+        invalid_tier = client.patch(
+            f"/api/chat/sessions/{thread_id}", json={"service_tier": "turbo"})
+        assert invalid_tier.status_code == 422
         hidden_thinking = client.patch(
             f"/api/chat/sessions/{thread_id}", json={"thinking": False})
         assert hidden_thinking.status_code == 200
@@ -545,6 +602,7 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         listed_session = next(
             item for item in listed.json()["sessions"] if item["id"] == thread_id)
         assert listed_session["effort"] == "medium"
+        assert listed_session["service_tier"] == "priority"
         assert listed_session["thinking"] is False
         assert listed_session["permission"] == "plan"
         assert listed.headers["etag"].startswith('W/"')
@@ -561,11 +619,14 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
             "model": "gpt-test-codex",
             "permission": "bypassPermissions",
             "effort": "medium",
+            "service_tier": "priority",
         })
         assert ticket.status_code == 200
         streamed = client.get(
             "/api/chat/stream", params={"ticket": ticket.json()["ticket"]})
         assert streamed.status_code == 200
+        assert "event: ping" in streamed.text
+        assert streamed.text.index("event: ping") < streamed.text.index("event: thinking")
         assert "event: thinking" in streamed.text
         assert "event: tool_use" in streamed.text
         assert "event: tool_result" in streamed.text
@@ -587,6 +648,7 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
 
         loaded = client.get(f"/api/chat/sessions/{thread_id}?tail=80")
         assert loaded.json()["effort"] == "medium"
+        assert loaded.json()["service_tier"] == "priority"
         assert loaded.json()["thinking"] is False
         assert loaded.status_code == 200
         assert [message["role"] for message in loaded.json()["messages"]] == [
@@ -919,11 +981,40 @@ def test_purge_old_is_server_authoritative_and_cleans_queue(tmp_path):
         ).json()["items"] == []
 
 
+def test_purge_old_can_be_scoped_to_one_workspace(tmp_path):
+    other = tmp_path / "other-project"
+    other.mkdir()
+    app = native_app(tmp_path)
+    with TestClient(app) as client:
+        registered = client.post(
+            "/api/chat/workspaces",
+            json={"path": str(other), "name": "Other"},
+        )
+        assert registered.status_code == 200
+
+        primary = client.post(
+            "/api/chat/sessions", json={"name": "primary old"}).json()
+        secondary = client.post(
+            "/api/chat/sessions",
+            json={"name": "secondary old", "cwd": str(other)},
+        ).json()
+
+        purged = client.post("/api/chat/sessions/purge-old", json={
+            "days": 7,
+            "cwd": str(tmp_path),
+        })
+        assert purged.status_code == 200, purged.text
+        assert purged.json()["ids"] == [primary["id"]]
+        assert client.get(
+            f"/api/chat/sessions/{secondary['id']}"
+        ).status_code == 200
+
+
 def test_model_switch_uses_native_thread_fork():
     app_js = Path("frontend/app.js").read_text(encoding="utf-8")
     assert '"/fork"' in app_js
     # Fork activation now goes through switchSession(), whose shared
-    # _ensureSessionLoaded() path de-duplicates cold loads for grid panes,
+    # _ensureSessionLoaded() path de-duplicates cold loads for resident panes,
     # hover-prefetch and ordinary tab switches.
     fork_block = app_js[app_js.index('"/fork"') :]
     assert "newSt._loaded = false" in fork_block

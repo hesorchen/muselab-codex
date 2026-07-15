@@ -56,12 +56,19 @@ version and schema digest in the change that upgrades the protocol baseline.
 - Python `>=3.12`, FastAPI, and `uv` remain the backend stack.
 - Keep the frontend build-free: plain HTML, Alpine.js, CSS, and vendored browser
   libraries only.
-- Keep chat transcript DOM bounded with keyed panes. Inside a multi-session
-  `tid` loop, pane-relative helpers must take that session id instead of reading
-  root `currentId` or `messages`; preserve each session's follow and scroll
-  state across switches. Session-scoped transient rows such as first-token,
+- Keep chat transcript DOM bounded with keyed resident panes, but expose only
+  the current session; multi-view layouts are intentionally unsupported.
+  Pane-relative helpers must take the pane's session id instead of reading root
+  `currentId` or `messages`, so each session preserves follow and scroll state
+  across tab switches. Session-scoped transient rows such as first-token,
   compaction, and queue placeholders must stay inside that session's
-  `.msg-pane`, not as direct `.chat-body` children outside `.chat-grid`.
+  `.msg-pane`, not as direct `.chat-body` children.
+- Treat the active workspace as one application-level context: session tabs,
+  new-session cwd, file tree, and preview must switch together. Relative file
+  requests may resolve only against a backend-registered workspace; use the
+  validated workspace header for fetches and a validated query parameter for
+  browser-owned raw/download requests. Never let a late response from one
+  workspace update another workspace's tree or preview.
 - Never calculate a duration by subtracting a server epoch from a browser
   epoch. Browser and backend may run on different devices; expose a relative,
   monotonic server duration for reconnect and completion timing, with a local

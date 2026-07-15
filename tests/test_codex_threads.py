@@ -12,9 +12,20 @@ from backend.codex import (
     CodexRuntime,
     CodexThreadService,
 )
+from backend.codex.threads import normalize_service_tier
 
 
 FAKE_SERVER = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
+
+
+@pytest.mark.parametrize(("value", "expected"), [
+    (None, None),
+    ("", ""),
+    ("fast", "fast"),
+    ("priority", "priority"),
+])
+def test_service_tier_normalization_keeps_legacy_and_catalog_ids(value, expected):
+    assert normalize_service_tier(value) == expected
 
 
 def runtime_with_fake_server() -> CodexRuntime:
@@ -63,6 +74,7 @@ async def test_thread_pin_metadata_survives_service_restart(tmp_path):
     service.set_effort("thread-1", "max")
     service.set_permission("thread-1", "bypassPermissions")
     await service.set_thinking("thread-1", False)
+    await service.set_service_tier("thread-1", "priority")
 
     restarted = CodexThreadService(requester, tmp_path)
     restored = await restarted.read("thread-1")
@@ -70,6 +82,8 @@ async def test_thread_pin_metadata_survives_service_restart(tmp_path):
     assert restored["_settings"]["effort"] == "max"
     assert restored["_settings"]["permission"] == "bypassPermissions"
     assert restored["_settings"]["thinking"] is False
+    assert restored["_settings"]["service_tier"] == "priority"
+    assert restarted.service_tier("thread-1") == "priority"
     assert restarted.reasoning_summary("thread-1") == "none"
 
     restarted.set_pinned("thread-1", False)
@@ -79,6 +93,7 @@ async def test_thread_pin_metadata_survives_service_restart(tmp_path):
     assert unpinned["_settings"]["effort"] == "max"
     assert unpinned["_settings"]["permission"] == "bypassPermissions"
     assert unpinned["_settings"]["thinking"] is False
+    assert unpinned["_settings"]["service_tier"] == "priority"
 
     # Empty is an explicit auto override, not absence: it must beat the last
     # rollout's non-empty effort after another process restart.
@@ -88,9 +103,21 @@ async def test_thread_pin_metadata_survives_service_restart(tmp_path):
     assert auto["_settings"]["permission"] == "bypassPermissions"
     assert auto["_settings"]["thinking"] is False
 
+    # Standard is an explicit override too; native receives JSON null while
+    # the sidecar retains an empty string across a restart.
+    await reloaded.set_service_tier("thread-1", "")
+    standard = await CodexThreadService(requester, tmp_path).read("thread-1")
+    assert standard["_settings"]["service_tier"] == ""
+    assert any(
+        method == "thread/settings/update" and params.get("serviceTier") is None
+        for method, params, _timeout in requester.calls
+    )
+
     with pytest.raises(ValueError, match="unknown permission mode"):
         auto_service = CodexThreadService(requester, tmp_path)
         auto_service.set_permission("thread-1", "acceptEdits")
+    with pytest.raises(ValueError, match="unknown service tier"):
+        await reloaded.set_service_tier("thread-1", "turbo")
 
 
 class StubRequester:
@@ -218,6 +245,51 @@ def test_workspace_registration_rejects_unregistered_and_unsafe_paths(tmp_path):
         service.remove_workspace(tmp_path)
 
 
+def test_workspace_browser_lists_safe_project_folders_and_stays_bounded(tmp_path):
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    project = primary / "project-a"
+    project.mkdir()
+    (project / ".git").mkdir()
+    ordinary = primary / "notes"
+    ordinary.mkdir()
+    (primary / "README.md").write_text("not a directory", encoding="utf-8")
+    (primary / ".hidden-project").mkdir()
+    (primary / "system-link").symlink_to("/etc", target_is_directory=True)
+    service = CodexThreadService(StubRequester({}), primary)
+
+    listing = service.browse_workspace_directories(primary)
+
+    assert listing["path"] == str(primary)
+    assert listing["parent"] == str(tmp_path)
+    assert listing["registered"] is True
+    assert listing["selectable"] is True
+    assert listing["truncated"] is False
+    assert listing["directories"] == [
+        {
+            "path": str(project),
+            "name": "project-a",
+            "registered": False,
+            "selectable": True,
+            "project": "Git",
+        },
+        {
+            "path": str(ordinary),
+            "name": "notes",
+            "registered": False,
+            "selectable": True,
+            "project": "",
+        },
+    ]
+
+    service.register_workspace(project)
+    refreshed = service.browse_workspace_directories(primary)
+    assert refreshed["directories"][0]["registered"] is True
+    assert service.browse_workspace_directories(tmp_path)["parent"] == ""
+    with pytest.raises(ValueError, match="outside selectable"):
+        service.browse_workspace_directories(tmp_path.parent)
+
+
 @pytest.mark.asyncio
 async def test_start_inherits_native_codex_permissions_by_default(tmp_path):
     requester = StubRequester({"thread": {"id": "thread-1"}})
@@ -232,6 +304,18 @@ async def test_start_inherits_native_codex_permissions_by_default(tmp_path):
         "cwd": str(tmp_path.resolve()),
         "ephemeral": False,
     }
+
+
+@pytest.mark.asyncio
+async def test_start_applies_and_remembers_native_fast_tier(tmp_path):
+    requester = StubRequester({"thread": {"id": "thread-1"}})
+    service = CodexThreadService(requester, tmp_path)
+
+    thread = await service.start(service_tier="priority")
+
+    assert requester.calls[0][1]["serviceTier"] == "priority"
+    assert thread["_settings"]["service_tier"] == "priority"
+    assert service.service_tier("thread-1") == "priority"
 
 
 @pytest.mark.asyncio
@@ -292,7 +376,7 @@ class PendingRequester:
             return {}
         if method == "thread/list":
             return {"data": [], "nextCursor": None}
-        if method in {"thread/read", "thread/resume"}:
+        if method in {"thread/read", "thread/resume", "thread/settings/update"}:
             raise AppServerResponseError(method, -32600)
         if method == "thread/delete":
             return {}
@@ -310,6 +394,8 @@ async def test_empty_pre_turn_thread_is_merged_from_pending_sidecar(tmp_path):
     assert (await service.list(cursor="next-page")).data == []
     assert (await service.read("pending-1"))["id"] == "pending-1"
     assert (await service.resume("pending-1"))["id"] == "pending-1"
+    await service.set_service_tier("pending-1", "priority")
+    assert (await service.read("pending-1"))["_settings"]["service_tier"] == "priority"
 
     await service.delete("pending-1")
     assert (await service.list()).data == []

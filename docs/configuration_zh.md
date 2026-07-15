@@ -38,14 +38,14 @@ MUSELAB_HOST=127.0.0.1
 
 ## `MUSELAB_ROOT`
 
-后端启动时会解析并校验工作区：
+`MUSELAB_ROOT` 是默认工作目录。后端启动时会解析并校验它：
 
 - 路径必须存在；
 - 不能省略并回退到整个 `$HOME`；
 - 拒绝 `/`、`/etc`、`/root`、`/home`、`/var`、`/usr`、`/boot` 等危险根目录；
 - 文件 API 会再次阻止路径穿越、符号链接逃逸和敏感文件访问。
 
-推荐为 muselab-codex 使用一个明确的子目录，而不是把整个 home 目录暴露给文件工作台。
+还可以从工作目录选择器登记其他已存在目录；它们必须通过相同的危险根目录校验，登记后文件树、预览、会话标签和新 thread 的 cwd 会一起切换。推荐只登记明确的项目子目录，不要把整个 home 目录暴露给文件工作台。
 
 ## `AGENTS.md` 与上下文
 
@@ -93,10 +93,15 @@ Codex 原生 instruction 文件是工作区根目录的 `AGENTS.md`。可以用 
 | 模型 Provider 开关 | Codex `config.toml` 的 `model_providers` |
 | Skills 启用状态 | app-server `skills/config/write` |
 | MCP server | app-server MCP 配置接口 |
-| 会话模型、审批策略、effort | Codex thread／turn 参数 |
+| 会话模型、审批策略、effort、Fast 档位 | Codex thread／turn 参数；稳定读取暂不回传的显式选择保存在最小兼容 sidecar |
 | 主题、布局和部分 UI 偏好 | 浏览器本地存储 |
 
 网页不会修改 `MUSELAB_ROOT`、监听地址、主 token 或 Provider key。部署级配置需要编辑私有环境并重启。
+
+Fast 是 Codex 原生 `serviceTier`，不是 Effort 的一个等级。界面只在当前模型的
+`model/list.serviceTiers` 发布名为 Fast 的档位时展示；原生档位 ID 以目录为准
+（Codex 0.144.1 当前为 `priority`），不是前端写死的值。开启后生成通常更快，
+但会消耗更多账户额度。Standard／Fast 按会话保存，并从下一轮开始生效。
 
 ## Docker 配置
 

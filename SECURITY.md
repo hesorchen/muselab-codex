@@ -4,11 +4,11 @@ muselab-codex is a single-user, self-hosted Codex workspace. It is not a multi-t
 
 ## Threat model
 
-Anyone holding `MUSELAB_TOKEN` can use the authenticated file APIs below `MUSELAB_ROOT`, create Codex threads, and ask Codex to execute tools under the active sandbox and approval policy. Treat the token as a password with authority over the workspace.
+Anyone holding `MUSELAB_TOKEN` can use the authenticated file APIs below `MUSELAB_ROOT` and every registered workspace, create Codex threads, and ask Codex to execute tools under the active sandbox and approval policy. Treat the token as a password with authority over every directory registered in the application.
 
 The main protected assets are:
 
-- files under `MUSELAB_ROOT`;
+- files under `MUSELAB_ROOT` and every registered workspace;
 - `.env`, including the application token and optional provider keys;
 - `CODEX_HOME`, including login state, configuration, Memory, Skills, MCP, and thread history;
 - prompts, transcripts, attachments, and tool outputs;
@@ -22,7 +22,7 @@ The main protected assets are:
 - use HTTPS plus an additional access-control layer for remote access;
 - keep the upstream port unreachable from the public internet;
 - keep `.env`, `CODEX_HOME`, and workspace backups private and encrypted;
-- mount only the intended workspace into a container, never an entire host home directory;
+- mount only the intended workspaces into a container, never an entire host home directory;
 - review MCP servers and Skills as executable extensions with the service user's authority.
 
 ## Security invariants
@@ -35,7 +35,7 @@ Meaningful browser APIs require `MUSELAB_TOKEN`. Standard requests use `X-Auth-T
 
 ### Filesystem containment
 
-File operations resolve below `MUSELAB_ROOT`. The backend rejects path traversal, escaping symlinks, dangerous root workspaces, and credential-shaped internal files. User-visible text writes use atomic replacement, and normal deletion uses a workspace trash area.
+File operations default to `MUSELAB_ROOT` and can target only a workspace explicitly registered and validated by the backend. Each request is contained below that selected root. The backend rejects path traversal, escaping symlinks, dangerous root workspaces, and credential-shaped internal files. User-visible text writes use atomic replacement, and normal deletion uses a per-workspace trash area.
 
 Containment does not make hostile files safe to execute. Codex tools, terminal commands, previews, and MCP servers must still be governed by an appropriate sandbox and approval policy.
 

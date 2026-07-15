@@ -4,7 +4,7 @@
 
 muselab-codex 不使用应用数据库。当前原生运行时的状态分布在三处：
 
-1. `MUSELAB_ROOT` 指向的 workspace；
+1. `MUSELAB_ROOT` 指向的默认工作目录及其他已登记工作目录；
 2. service `.env` 等部署配置；
 3. `$CODEX_HOME`（通常是 `~/.codex`）下的 Codex CLI 状态。
 
@@ -12,7 +12,9 @@ muselab-codex 不使用应用数据库。当前原生运行时的状态分布在
 
 | 路径 | 内容 | 为何重要 |
 |---|---|---|
-| `$MUSELAB_ROOT/` | 你的文件和 muselab-codex workspace 状态 | 这是用户拥有的工作目录 |
+| `$MUSELAB_ROOT/` | 你的文件和 muselab-codex workspace 状态 | 这是默认的用户工作目录 |
+| 每个额外登记的工作目录 | 该目录的文件和 `.muselab-dustbin/` | 独立恢复该工作目录的文件与可恢复回收站内容 |
+| `$MUSELAB_ROOT/.muselab-codex/workspaces.json` | 已登记工作目录的名称和路径 | 恢复工作目录选择器；恢复后对应路径仍须存在 |
 | `$MUSELAB_ROOT/.muselab-codex/attachments/threads/` | 已写入 Codex thread 的附件文件 | 恢复附件预览和 transcript 中本地路径所必需 |
 | `$MUSELAB_ROOT/.muselab-codex/usage/` | 每个 thread 的脱敏数字 token-usage 快照 | 后端重启后继续显示 context meter 所必需 |
 | `$MUSELAB_ROOT/.muselab-codex/scheduler.json` | 计划任务、运行历史和未读数 | 恢复自动任务所必需 |
@@ -37,10 +39,10 @@ muselab-codex 不使用应用数据库。当前原生运行时的状态分布在
 
 1. 安装相同的受支持 Codex CLI 和 muselab-codex 版本。
 2. 停止服务。
-3. 恢复 `$MUSELAB_ROOT`、当前 service 使用的 `.env` 和 `$CODEX_HOME`。
+3. 恢复 `$MUSELAB_ROOT`、需要保留的其他工作目录、当前 service 使用的 `.env` 和 `$CODEX_HOME`。
 4. 检查 `MUSELAB_ROOT`、`HOME` 与可选的 `CODEX_HOME` 是否指向恢复后的目录。
 5. 确认 `codex login status`，然后启动 muselab-codex。
-6. 打开一个近期 thread，分别验证 transcript 和一个附件。
+6. 打开一个近期 thread，切换各个已恢复工作目录，并验证 transcript、一个附件和一个文件预览。
 7. 检查计划任务与推送订阅；发送测试通知验证 VAPID 恢复。
 
 恢复实例时，请使用对应的服务管理与升级说明。

@@ -5,6 +5,9 @@ that aborts, reactive tab state, and editor buffers settle on the right owner.
 """
 from __future__ import annotations
 
+from collections import Counter
+from urllib.parse import parse_qs, urlparse
+
 import pytest
 
 pytest.importorskip("playwright.sync_api",
@@ -138,6 +141,265 @@ def test_rapid_csv_switch_aborts_old_page_and_commits_latest(page: Page,
         "loading": False,
         "offset": 0,
     }
+
+
+def test_preview_tabs_restore_their_own_reading_positions(page: Page,
+                                                           backend_url,
+                                                           auth_token):
+    """Switching files must restore each tab's shared-preview scroll owner."""
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const realFetch = window.fetch;
+          const documents = {
+            'scroll-a.txt': Array.from({length: 700}, (_, i) => `A line ${i}`).join('\\n'),
+            'scroll-b.txt': Array.from({length: 700}, (_, i) => `B line ${i}`).join('\\n'),
+          };
+          const settle = () => new Promise(resolve => setTimeout(resolve, 320));
+          window.fetch = (url, init = {}) => {
+            const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname === '/api/files/read') {
+              const path = parsed.searchParams.get('path');
+              if (Object.prototype.hasOwnProperty.call(documents, path)) {
+                return Promise.resolve(new Response(documents[path], {status: 200}));
+              }
+            }
+            return realFetch(url, init);
+          };
+          try {
+            app.tabs = [];
+            app._clearPreviewState();
+            await app.openFile({path: 'scroll-a.txt', name: 'scroll-a.txt'});
+            await settle();
+            const body = document.querySelector('.pane.preview .preview-body');
+            const maxA = body.scrollHeight - body.clientHeight;
+            body.scrollTop = Math.min(640, maxA);
+            const savedA = body.scrollTop;
+
+            await app.openFile({path: 'scroll-b.txt', name: 'scroll-b.txt'});
+            await settle();
+            const maxB = body.scrollHeight - body.clientHeight;
+            body.scrollTop = Math.min(360, maxB);
+            const savedB = body.scrollTop;
+
+            await app.switchTab('scroll-a.txt');
+            await settle();
+            const restoredA = body.scrollTop;
+            await app.switchTab('scroll-b.txt');
+            await settle();
+            const restoredB = body.scrollTop;
+            return {
+              maxA, maxB, savedA, savedB, restoredA, restoredB,
+              viewA: app.tabs.find(t => t.path === 'scroll-a.txt')?.view?.scrollTop,
+              viewB: app.tabs.find(t => t.path === 'scroll-b.txt')?.view?.scrollTop,
+            };
+          } finally {
+            window.fetch = realFetch;
+          }
+        }"""
+    )
+    assert result["maxA"] > 640
+    assert result["maxB"] > 360
+    assert abs(result["restoredA"] - result["savedA"]) <= 2, result
+    assert abs(result["restoredB"] - result["savedB"]) <= 2, result
+    assert abs(result["viewA"] - result["savedA"]) <= 2, result
+    assert abs(result["viewB"] - result["savedB"]) <= 2, result
+
+
+def test_mobile_preview_restores_after_bottom_nav_and_keeps_tree_tabs(
+    page: Page, backend_url, auth_token,
+):
+    """Mobile pane hiding must not turn a real scroll position into zero."""
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const realFetch = window.fetch;
+          const documents = {
+            'mobile-a.txt': Array.from({length: 700}, (_, i) => `A line ${i}`).join('\\n'),
+            'mobile-b.txt': Array.from({length: 700}, (_, i) => `B line ${i}`).join('\\n'),
+          };
+          const settle = () => new Promise(resolve => setTimeout(resolve, 360));
+          window.fetch = (url, init = {}) => {
+            const parsed = new URL(String(url), location.origin);
+            if (parsed.pathname === '/api/files/read') {
+              const path = parsed.searchParams.get('path');
+              if (Object.prototype.hasOwnProperty.call(documents, path)) {
+                return Promise.resolve(new Response(documents[path], {status: 200}));
+              }
+            }
+            return realFetch(url, init);
+          };
+          try {
+            app.tabs = [];
+            app._clearPreviewState();
+            app.setMobileTab('files');
+            await app.onNodeClick({}, {path: 'mobile-a.txt', name: 'mobile-a.txt'});
+            await settle();
+            const body = document.querySelector('.pane.preview .preview-body');
+            body.scrollTop = 640;
+            const savedA = body.scrollTop;
+
+            app.setMobileTab('files');
+            await settle();
+            const hiddenTop = body.scrollTop;
+            app.setMobileTab('preview');
+            await settle();
+            const restoredAfterNav = body.scrollTop;
+
+            app.setMobileTab('files');
+            await app.onNodeClick({}, {path: 'mobile-b.txt', name: 'mobile-b.txt'});
+            await settle();
+            body.scrollTop = 360;
+            const savedB = body.scrollTop;
+            await app.switchTab('mobile-a.txt');
+            await settle();
+            const restoredA = body.scrollTop;
+            await app.switchTab('mobile-b.txt');
+            await settle();
+            const restoredB = body.scrollTop;
+            return {
+              savedA, savedB, hiddenTop, restoredAfterNav, restoredA, restoredB,
+              tabs: app.tabs.map(t => ({path: t.path, preview: t.preview})),
+            };
+          } finally {
+            window.fetch = realFetch;
+          }
+        }"""
+    )
+    assert result["hiddenTop"] == 0  # proves display:none really clamped the DOM
+    assert result["restoredAfterNav"] == result["savedA"]
+    assert result["restoredA"] == result["savedA"]
+    assert result["restoredB"] == result["savedB"]
+    assert result["tabs"] == [
+        {"path": "mobile-a.txt", "preview": False},
+        {"path": "mobile-b.txt", "preview": False},
+    ]
+
+
+def test_mobile_html_restore_overrides_report_smooth_scroll(
+    page: Page, backend_url, auth_token,
+):
+    """A report's smooth-scroll CSS must not animate tab restoration."""
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          app.setMobileTab('files');
+          await app.onNodeClick({}, {
+            path: 'smooth-preview.html', name: 'smooth-preview.html', is_dir: false,
+          });
+        }"""
+    )
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.selected === 'smooth-preview.html' && app.previewMode === 'html';
+        }"""
+    )
+    frame = page.frame(url=lambda url: "smooth-preview.html" in url)
+    assert frame is not None
+    frame.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(300)
+    frame.evaluate("window.scrollTo({top: 1200, behavior: 'instant'})")
+    page.wait_for_timeout(300)
+    assert frame.evaluate("window.scrollY") == 1200
+
+    page.evaluate("document.querySelector('#app')._x_dataStack[0].setMobileTab('files')")
+    page.wait_for_timeout(80)
+    frame.evaluate("window.scrollTo({top: 0, behavior: 'instant'})")
+    page.wait_for_timeout(80)
+    frame.evaluate(
+        """() => {
+          window.__muselabRestoreTrace = [];
+          addEventListener('scroll', () => {
+            window.__muselabRestoreTrace.push(window.scrollY);
+          }, {passive: true});
+        }"""
+    )
+    page.evaluate("document.querySelector('#app')._x_dataStack[0].setMobileTab('preview')")
+    page.wait_for_timeout(300)
+    result = frame.evaluate(
+        """() => ({y: window.scrollY, trace: window.__muselabRestoreTrace})"""
+    )
+    assert result["y"] == 1200
+    assert result["trace"]
+    assert all(y == 1200 for y in result["trace"]), result
+
+
+def test_html_preview_lru_reuses_four_live_frames_without_refetch(
+    page: Page, backend_url, auth_token,
+):
+    """Recent reports keep their browsing contexts; the fifth evicts the LRU."""
+    raw_requests: list[str] = []
+
+    def record_raw_request(request) -> None:
+        parsed = urlparse(request.url)
+        if parsed.path != "/api/files/raw":
+            return
+        path = parse_qs(parsed.query).get("path", [""])[0]
+        if path.startswith("cache-"):
+            raw_requests.append(path)
+
+    page.on("request", record_raw_request)
+    _login(page, backend_url, auth_token)
+
+    def open_report(path: str) -> None:
+        page.evaluate(
+            """async (path) => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              await app.openFile({path, name: path}, {preview: false});
+            }""",
+            path,
+        )
+        page.wait_for_function(
+            """(path) => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              const frame = Array.from(document.querySelectorAll(
+                'iframe[data-preview-html-path]'
+              )).find(el => el.dataset.previewHtmlPath === path);
+              return app.selected === path && app.previewMode === 'html'
+                && frame && getComputedStyle(frame).display !== 'none';
+            }""",
+            arg=path,
+        )
+        page.wait_for_timeout(120)
+
+    open_report("cache-0.html")
+    first_frame = page.frame(url=lambda url: "path=cache-0.html" in url)
+    assert first_frame is not None
+    first_frame.wait_for_load_state("domcontentloaded")
+    first_frame.locator("input").fill("kept-live-state")
+    first_frame.evaluate("window.scrollTo({top: 700, behavior: 'instant'})")
+
+    open_report("cache-1.html")
+    open_report("cache-0.html")
+    first_frame = page.frame(url=lambda url: "path=cache-0.html" in url)
+    assert first_frame is not None
+    assert first_frame.locator("input").input_value() == "kept-live-state"
+    assert first_frame.evaluate("window.scrollY") == 700
+    assert Counter(raw_requests)["cache-0.html"] == 1
+
+    for i in (2, 3, 4):
+        open_report(f"cache-{i}.html")
+
+    residents = page.evaluate(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .htmlPreviewFrames.map(entry => entry.path)"""
+    )
+    assert residents == ["cache-0.html", "cache-2.html", "cache-3.html", "cache-4.html"]
+    assert Counter(raw_requests)["cache-1.html"] == 1
+
+    open_report("cache-1.html")
+    residents = page.evaluate(
+        """() => document.querySelector('#app')._x_dataStack[0]
+          .htmlPreviewFrames.map(entry => entry.path)"""
+    )
+    assert residents == ["cache-2.html", "cache-3.html", "cache-4.html", "cache-1.html"]
+    assert Counter(raw_requests)["cache-1.html"] == 2
 
 
 def test_tree_refresh_failure_keeps_rows_and_search_ignores_stale_results(

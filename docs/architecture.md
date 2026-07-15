@@ -22,7 +22,7 @@ muselab-codex is a local web workspace for `codex app-server`. Its architecture 
 | Domain | Authority | muselab-codex role |
 |---|---|---|
 | Threads, turns, transcripts | Codex app-server | Map them to HTTP resources and browser views |
-| Models and reasoning controls | Codex configuration and thread state | Display the catalog and submit per-thread choices |
+| Models, reasoning controls, and service tiers | Codex configuration and thread state | Display the catalog and submit per-thread Effort, summary, and catalog-driven Fast choices |
 | Tools, sandbox, approvals | Codex app-server | Surface requests and return the user's decision |
 | Skills, MCP, Memory | Codex app-server and `CODEX_HOME` | Provide controls without recreating discovery rules |
 | File browsing and previews | FastAPI and browser | Safely operate below `MUSELAB_ROOT` |
@@ -77,7 +77,7 @@ App-server notifications share one stream. If every SSE connection called `next_
 ## Threads, turns, and browser tabs
 
 - The Codex thread ID is the session key; Codex-native history is the transcript source of truth.
-- Multiple browser tabs hold independent message and stream state. Desktop users can drag up to four threads into a live chat grid; only the active pane receives the shared composer, while mobile stays single-pane. The composer can create a thread in any explicitly registered working directory without changing the file browser's `MUSELAB_ROOT` boundary.
+- Multiple browser tabs hold independent message and stream state, but the transcript exposes only the selected thread. An application-level workspace switch changes the visible session tabs, new-thread cwd, file tree, and preview together. Every non-default workspace must be explicitly registered and validated by the backend.
 - One thread can have one active turn; additional user messages enter the application queue.
 - Fork uses native thread branching. Compact rewrites the active context of the same thread and records a compaction boundary in its transcript.
 - After an app-server restart, persisted threads are resumed once per runtime generation before a new turn starts.
@@ -103,7 +103,7 @@ CODEX_HOME/              # normally ~/.codex
 
 ## Filesystem boundary
 
-All file APIs resolve below `MUSELAB_ROOT`. Traversal and escaping symlinks are rejected, credential-shaped files are blocked, visible writes are atomic, deletion uses a workspace trash area, and upload/preview endpoints enforce size and type limits.
+File APIs default to `MUSELAB_ROOT` and otherwise resolve below the currently selected backend-registered workspace. Traversal and escaping symlinks are rejected, credential-shaped files are blocked, visible writes are atomic, each workspace has its own trash area, and upload/preview endpoints enforce size and type limits.
 
 This is an application boundary, not multi-tenant isolation. Anyone holding `MUSELAB_TOKEN` can still drive tools within the active Codex sandbox and approval policy.
 

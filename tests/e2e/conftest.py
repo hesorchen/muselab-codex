@@ -41,6 +41,22 @@ def backend_url(tmp_path_factory):
     root = tmp_path_factory.mktemp("e2e-root")
     (root / "README.md").write_text("# muselab e2e fixture\n")
     (root / "notes.md").write_text("scratch\n")
+    (root / "smooth-preview.html").write_text(
+        "<!doctype html><html><head><style>"
+        "html{scroll-behavior:smooth!important}body{margin:0}"
+        ".spacer{height:6000px}"
+        "</style></head><body><h1>Smooth preview</h1>"
+        "<div class='spacer'></div></body></html>",
+        encoding="utf-8",
+    )
+    for i in range(5):
+        (root / f"cache-{i}.html").write_text(
+            "<!doctype html><html><body>"
+            f"<h1>Cache fixture {i}</h1><input value='initial-{i}'>"
+            "<div style='height:4000px'></div>"
+            "</body></html>",
+            encoding="utf-8",
+        )
 
     port = _free_port()
     env = {

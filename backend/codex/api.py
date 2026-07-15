@@ -61,7 +61,7 @@ _SSE_HEADERS = {
 }
 _STREAM_TICKET_TTL = 60.0
 _STREAM_TICKET_LIMIT = 64
-_STREAM_TICKETS: dict[str, tuple[float, dict[str, str]]] = {}
+_STREAM_TICKETS: dict[str, tuple[float, dict[str, Any]]] = {}
 _ORGANIZE_INITIAL_MESSAGE = {
     "zh": (
         "请作为我的档案整理助手开始一次安全整理：先只读扫描当前工作区和 "
@@ -88,6 +88,8 @@ class CreateSessionRequest(BaseModel):
     model: str = ""
     model_provider: str = ""
     permission: str = "default"
+    service_tier: str | None = Field(
+        default=None, pattern=r"^(?:fast|priority)?$")
     open_ids: list[str] | None = None
     cwd: str = ""
 
@@ -97,6 +99,8 @@ class PatchSessionRequest(BaseModel):
     model: str | None = None
     model_provider: str | None = None
     effort: str | None = None
+    service_tier: str | None = Field(
+        default=None, pattern=r"^(?:fast|priority)?$")
     thinking: bool | None = None
     permission: str | None = None
     pinned: bool | None = None
@@ -108,6 +112,8 @@ class ForkSessionRequest(BaseModel):
     model: str = ""
     model_provider: str = ""
     effort: str = ""
+    service_tier: str | None = Field(
+        default=None, pattern=r"^(?:fast|priority)?$")
     cwd: str = ""
 
 
@@ -121,6 +127,7 @@ class OrganizeSessionRequest(BaseModel):
 class PurgeOldRequest(BaseModel):
     days: int = Field(default=7, ge=1, le=3650)
     keep_id: str = ""
+    cwd: str = ""
     dry_run: bool = False
 
 
@@ -136,6 +143,8 @@ class StreamStartRequest(BaseModel):
     model_provider: str = ""
     permission: str = "default"
     effort: str = ""
+    service_tier: str | None = Field(
+        default=None, pattern=r"^(?:fast|priority)?$")
     image_ids: str = ""
     source_device_kind: str = Field(
         default="unknown", pattern="^(mobile|desktop|unknown)$")
@@ -157,6 +166,8 @@ class QueueEnqueueRequest(BaseModel):
     model: str = ""
     model_provider: str = ""
     effort: str = ""
+    service_tier: str | None = Field(
+        default=None, pattern=r"^(?:fast|priority)?$")
     # The browser enqueues only because its last known state was busy. The
     # turn may settle while this POST is in flight; opt in to an immediate
     # idle drain so the item cannot miss the completion callback forever.
@@ -210,6 +221,18 @@ def _services(request: Request) -> tuple[CodexThreadService, CodexTurnService]:
 async def list_workspaces(request: Request) -> dict[str, Any]:
     threads, _ = _services(request)
     return {"workspaces": [entry.__dict__ for entry in threads.list_workspaces()]}
+
+
+@router.get("/workspaces/browse", dependencies=[Depends(require_token)])
+async def browse_workspaces(
+    request: Request,
+    path: str = Query(""),
+) -> dict[str, Any]:
+    threads, _ = _services(request)
+    try:
+        return threads.browse_workspace_directories(path or None)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
 
 
 @router.post("/workspaces", dependencies=[Depends(require_token)])
@@ -311,13 +334,19 @@ async def create_session(request: Request, body: CreateSessionRequest) -> dict[s
             model=body.model or None,
             model_provider=provider or None,
             config=config,
+            service_tier=body.service_tier,
             cwd=body.cwd or None,
         )
         threads.set_permission(thread["id"], body.permission)
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
     return _session_meta(
-        thread, turns, model=body.model, permission=body.permission)
+        thread,
+        turns,
+        model=body.model,
+        permission=body.permission,
+        service_tier=body.service_tier,
+    )
 
 
 @router.post("/sessions/organize", dependencies=[Depends(require_token)])
@@ -359,6 +388,7 @@ async def purge_old_sessions(
     seen_cursors: set[str] = set()
     candidates: list[dict[str, Any]] = []
     try:
+        target_cwd = threads.resolve_workspace(body.cwd) if body.cwd.strip() else ""
         while True:
             page = await threads.list(cursor=cursor, limit=100)
             candidates.extend(page.data)
@@ -388,6 +418,7 @@ async def purge_old_sessions(
         if isinstance(thread.get("id"), str)
         and thread.get("id") != keep_id
         and not bool(thread.get("pinned"))
+        and (not target_cwd or str(thread.get("cwd") or "") == target_cwd)
         and is_old(thread)
     ]
     victims = list(dict.fromkeys(thread_id for thread_id in victims if thread_id))
@@ -592,6 +623,7 @@ async def patch_session(
                 model=(body.model or None) if body.model is not None else None,
                 model_provider=provider or None,
                 config=config or None,
+                service_tier=body.service_tier,
             )
             if body.effort is not None:
                 # Stable app-server thread reads omit resume.config. Keep the
@@ -601,6 +633,9 @@ async def patch_session(
                 threads.set_effort(thread_id, body.effort)
         if body.thinking is not None:
             await threads.set_thinking(thread_id, body.thinking)
+        if (body.service_tier is not None
+                and body.model is None and body.effort is None):
+            await threads.set_service_tier(thread_id, body.service_tier)
         if body.permission is not None:
             threads.set_permission(thread_id, body.permission)
         thread = await threads.read(thread_id, include_turns=False)
@@ -618,6 +653,7 @@ async def patch_session(
         turns,
         model=body.model or "",
         effort=body.effort,
+        service_tier=body.service_tier,
     )
 
 
@@ -661,12 +697,16 @@ async def fork_session(
         # before the confirmation was the reason cancelled switches silently
         # reset Effort to auto.
         config["model_reasoning_effort"] = body.effort or None
+        service_tier = body.service_tier
+        if service_tier is None:
+            service_tier = threads.service_tier(thread_id)
         thread = await threads.fork(
             thread_id,
             last_turn_id=body.last_turn_id or None,
             model=body.model or None,
             model_provider=provider or None,
             config=config or None,
+            service_tier=service_tier,
             cwd=body.cwd or None,
         )
         threads.set_effort(str(thread["id"]), body.effort)
@@ -676,7 +716,13 @@ async def fork_session(
         raise _http_error(exc) from exc
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
-    return _session_meta(thread, turns, model=body.model, effort=body.effort)
+    return _session_meta(
+        thread,
+        turns,
+        model=body.model,
+        effort=body.effort,
+        service_tier=service_tier,
+    )
 
 
 @router.get("/sessions/{thread_id}/children", dependencies=[Depends(require_token)])
@@ -763,6 +809,7 @@ async def enqueue_queue(request: Request, thread_id: str,
             model=body.model,
             model_provider=provider,
             effort=body.effort,
+            service_tier=body.service_tier,
             source_device_kind=body.source_device_kind,
         )
     except OverflowError as exc:
@@ -841,6 +888,22 @@ async def providers(request: Request) -> dict[str, Any]:
         model_id = model["model"]
         if model.get("isDefault"):
             default_model = model_id
+        service_tiers = [
+            {
+                "id": str(item["id"]),
+                "name": str(item.get("name") or item["id"]),
+                "description": str(item.get("description") or ""),
+            }
+            for item in (model.get("serviceTiers") or [])
+            if isinstance(item, dict)
+            and isinstance(item.get("id"), str)
+            and item["id"].strip()
+        ]
+        fast_service_tier = next((
+            item["id"]
+            for item in service_tiers
+            if item["id"] == "fast" or item["name"].strip().casefold() == "fast"
+        ), "")
         models.append({
             "group": "Codex",
             "label": str(model.get("displayName") or model_id),
@@ -852,6 +915,9 @@ async def providers(request: Request) -> dict[str, Any]:
                 for item in model.get("supportedReasoningEfforts", [])
                 if isinstance(item, dict) and item.get("reasoningEffort")
             ],
+            "service_tiers": service_tiers,
+            "fast_service_tier": fast_service_tier,
+            "supports_fast": bool(fast_service_tier),
         })
     configured = await request.app.state.codex_providers.list()
     enabled_ids = {
@@ -1306,6 +1372,7 @@ async def stream_start(body: StreamStartRequest) -> dict[str, str]:
         "model_provider": body.model_provider,
         "permission": body.permission,
         "effort": body.effort,
+        "service_tier": body.service_tier,
         "image_ids": body.image_ids,
         "source_device_kind": body.source_device_kind,
     })
@@ -1320,13 +1387,27 @@ async def stream(
     entry = _STREAM_TICKETS.pop(ticket, None) if ticket else None
     if entry is None or entry[0] <= time.monotonic():
         raise HTTPException(401, "invalid or expired stream ticket")
-    params = entry[1]
+    # Do not await native turn/start before returning the EventSourceResponse.
+    # That handshake can take 5-15 seconds on a warm-resume; until response
+    # headers are flushed, mobile Safari sees a silent pending request and may
+    # abandon it. The generator emits an immediate named ping first, then
+    # starts/attaches the turn and streams its replay/live events.
+    return _event_source(_stream_ticket_events(request, entry[1]))
+
+
+async def _stream_ticket_events(request: Request, params: dict[str, Any]):
+    # First yield intentionally precedes every app-server await. Besides making
+    # EventSource.onopen deterministic, it gives the frontend's liveness clock
+    # a real first packet while Codex resumes/starts the native thread.
+    yield ServerSentEvent(event="ping", data="")
+
     prompt = params["prompt"]
     session_id = params["session_id"]
     model = params["model"]
     model_provider = params["model_provider"]
     permission = params["permission"]
     effort = params["effort"]
+    service_tier = params["service_tier"]
     image_ids = params["image_ids"]
     source_device_kind = params["source_device_kind"]
 
@@ -1347,6 +1428,7 @@ async def stream(
                 config=config,
                 permission=permission,
                 effort=effort,
+                service_tier=service_tier,
                 inputs=prepared.inputs,
                 user_images=prepared.images,
                 user_docs=prepared.docs,
@@ -1354,30 +1436,34 @@ async def stream(
             )
         except TurnAlreadyActive as exc:
             clear_turn_origin(session_id)
-            return _event_source(_one_event("error", {
+            yield ServerSentEvent(event="error", data=json.dumps({
                 "error": str(exc),
                 "kind": "turn_busy",
                 "retryable": True,
-            }))
+            }, ensure_ascii=False, separators=(",", ":")))
+            return
         except (AppServerError, ValueError) as exc:
             clear_turn_origin(session_id)
-            return _event_source(_one_event("error", {
+            yield ServerSentEvent(event="error", data=json.dumps({
                 "error": str(exc),
                 "kind": "turn_start_failed",
                 "retryable": True,
-            }))
+            }, ensure_ascii=False, separators=(",", ":")))
+            return
         except BaseException:
             clear_turn_origin(session_id)
             raise
     else:
         turn_stream = turns.active(session_id)
         if turn_stream is None:
-            return _event_source(_one_event("error", {
+            yield ServerSentEvent(event="error", data=json.dumps({
                 "error": "no active turn",
                 "kind": "no_active_turn",
                 "retryable": False,
-            }))
-    return _event_source(_stream_events(turn_stream))
+            }, ensure_ascii=False, separators=(",", ":")))
+            return
+    async for event in _stream_events(turn_stream):
+        yield event
 
 
 @router.post("/upload-image", dependencies=[Depends(require_token)])
@@ -1493,13 +1579,6 @@ def _event_source(generator) -> EventSourceResponse:
     )
 
 
-async def _one_event(event: str, data: dict[str, Any]):
-    yield ServerSentEvent(
-        event=event,
-        data=json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-    )
-
-
 async def _stream_events(stream: TurnStream):
     queue = stream.subscribe()
     try:
@@ -1522,6 +1601,7 @@ def _session_meta(
     *,
     model: str = "",
     effort: str | None = None,
+    service_tier: str | None = None,
     permission: str | None = None,
 ) -> dict[str, Any]:
     thread_id = str(thread.get("id") or "")
@@ -1560,6 +1640,11 @@ def _session_meta(
         "pinned": bool(thread.get("pinned", False)),
         "active": turns.active(thread_id) is not None,
         "effort": effort if effort is not None else str(settings.get("effort") or ""),
+        "service_tier": (
+            service_tier
+            if service_tier is not None
+            else str(settings.get("service_tier") or "")
+        ),
         "permission": (
             permission
             if permission is not None

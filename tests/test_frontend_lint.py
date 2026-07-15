@@ -332,6 +332,7 @@ def test_session_setting_writes_are_serialized_before_server_persistence():
     assert "const prior = st[tailKey] || Promise.resolve()" in settings
     assert "Promise.resolve(prior).catch(() => {}).then(work)" in settings
     assert '"_effortPatchTail"' in settings
+    assert '"_serviceTierPatchTail"' in settings
     assert '"_permissionPatchTail"' in settings
     assert '"_thinkingPatchTail"' in settings
 
@@ -344,19 +345,24 @@ def test_native_optimistic_session_resets_composer_settings_and_locks_controls()
     method = app[start:end]
 
     assert 'this.effort = ""' in method
+    assert "this.fastModeEnabled = false" in method
     assert "this.thinkingEnabled = true" in method
     assert 'effort: ""' in method
+    assert 'service_tier: ""' in method
     assert "thinking: true" in method
     assert "this.effort = meta.effort || \"\"" in method
+    assert "this.fastModeEnabled = this._isFastServiceTier(" in method
     assert "this.thinkingEnabled = meta.thinking !== false" in method
     assert "_sessionCreatePromises && this._sessionCreatePromises[sid]" in app
     assert "st._modelChanging" in app
     assert "st._effortPatchTail" in app
-    assert html.count(':disabled="_sessionSettingsBusy(currentId)"') >= 7
+    assert html.count(
+        ':disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"'
+    ) >= 7
 
 
-def test_mobile_session_settings_expose_permission_and_effort_without_clipping():
-    """The gear popover must show both per-session controls above composer."""
+def test_mobile_session_settings_expose_all_controls_without_clipping():
+    """The gear popover must expose per-session controls without crowding the row."""
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
@@ -368,6 +374,10 @@ def test_mobile_session_settings_expose_permission_and_effort_without_clipping()
     assert 'x-model="permission"' in popover
     assert "t('session.intelligence')" in popover
     assert 'x-model="effort"' in popover
+    assert "t('fast.label')" in popover
+    assert 'x-model="fastModeEnabled"' in popover
+    assert "t('thinking.label')" in popover
+    assert 'x-model="thinkingEnabled"' in popover
     # Native iOS select sheets dispatch their confirmation click outside the
     # document. click.outside can hide the select before x-model receives its
     # change event; pointerdown.outside only sees genuine taps away.
@@ -458,12 +468,37 @@ def test_delayed_session_list_preserves_pending_setting_echoes():
 
     assert '"_modelExpected"' in helper
     assert '"_effortExpected"' in helper
+    assert '"_serviceTierExpected"' in helper
     assert '"_permissionExpected"' in helper
     assert '"_thinkingExpected"' in helper
     assert "expected.echoed = true" in helper
     assert "next.map(meta => this._retainExpectedSessionSettings(meta))" in app
     assert "const s = this._retainExpectedSessionSettings(await r.json())" in app
     assert '(x.permission || "default") !== (y.permission || "default")' in equality
+    assert '(x.service_tier || "") !== (y.service_tier || "")' in equality
+
+
+def test_fast_mode_is_catalog_gated_and_sent_independently_from_effort():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    start = app.index("async onFastModeChange()")
+    end = app.index("\n    async onPermissionChange()", start)
+    method = app[start:end]
+    send_start = app.index("async send(opts = {})")
+    send_end = app.index("\n    retryFailedMessage", send_start)
+    send = app[send_start:send_end]
+
+    assert 'typeof meta.fast_service_tier === "string"' in app
+    assert 'toLowerCase() === "fast"' in app
+    assert "this.fastModeEnabled ? this._fastServiceTier(this.model)" in method
+    assert 'body: JSON.stringify({ service_tier: next })' in method
+    assert "this._canonicalServiceTier(" in send
+    assert "focused.service_tier, focused.model || this.model" in app
+    assert 'service_tier: sendServiceTier' in send
+    assert 'serviceTier: sendServiceTier' in send
+    assert html.count('x-model="fastModeEnabled"') == 2
+    assert html.count('x-show="_supportsFast(model)"') == 2
+    assert html.count('x-model="thinkingEnabled"') == 2
 
 
 def test_large_markdown_preview_skips_rich_dom_postprocessing():
@@ -551,6 +586,71 @@ def test_preview_cache_and_find_are_memory_bounded():
     assert "this.previewFind.truncated = true" in app
 
 
+def test_preview_tabs_own_and_persist_their_reading_positions():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    open_start = app.index("async openFile(n, opts = {})")
+    open_end = app.index("\n    async csvLoadPage", open_start)
+    open_file = app[open_start:open_end]
+
+    assert "this._capturePreviewViewState(this.selected)" in open_file
+    assert "this._schedulePreviewViewRestore(cachedPath, loadSeq)" in open_file
+    assert "this.csvLoadPage(targetView.csvOffset)" in open_file
+    assert "view: this._sanitizePreviewViewState(tab.view)" in app
+    assert "this._capturePreviewViewState(this.selected);" in app[
+        app.index("_captureWorkspaceSurface(path = \"\")"):
+        app.index("async _changeWorkspaceSurface", app.index("_captureWorkspaceSurface(path = \"\")"))
+    ]
+    assert 'x-ref="previewBody"' in html
+    assert '@scroll.passive="onPreviewViewportScroll()"' in html
+    assert 'd.__muselab === "preview-scroll"' in app
+    assert '__muselab: "preview-scroll-restore"' in app
+    assert "this._htmlPreviewFramePosition" in app
+
+
+def test_html_preview_keeps_four_live_iframes_with_source_ownership():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    open_start = app.index("async openFile(n, opts = {})")
+    open_end = app.index("\n    async csvLoadPage", open_start)
+    open_file = app[open_start:open_end]
+    clear_start = app.index("    _clearPreviewState() {")
+    clear_end = app.index("\n    onPreviewImageError()", clear_start)
+    clear = app[clear_start:clear_end]
+
+    assert "HTML_PREVIEW_CACHE_MAX: 4" in app
+    assert "_touchHtmlPreviewFrame(path)" in app
+    assert "next.length >= this.HTML_PREVIEW_CACHE_MAX" in app
+    assert "reusedHtmlFrame = this._touchHtmlPreviewFrame(n.path)" in open_file
+    assert "this.previewMode === \"html\" && reusedHtmlFrame" in open_file
+    assert 'x-for="entry in htmlPreviewFrames" :key="entry.path"' in html
+    assert ':src="rawUrl(entry.path, {preview:true})"' in html
+    assert "selected===entry.path" in html
+    assert "this._htmlPreviewMessageOwner(e.source)" in app
+    assert "ownerPath === this.selected" in app
+    assert "this.htmlPreviewFrames = []" in clear
+
+
+def test_mobile_preview_captures_before_hiding_and_pins_tree_taps():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    tab_start = app.index("setMobileTab(next)")
+    tab_end = app.index("\n    // The queue is authoritative", tab_start)
+    mobile_tab = app[tab_start:tab_end]
+    click_start = app.index("async onNodeClick(ev, n)")
+    click_end = app.index("\n    // ===== multi-select helpers", click_start)
+    node_click = app[click_start:click_end]
+
+    assert mobile_tab.index("this._capturePreviewViewState(ownerPath)") < mobile_tab.index(
+        "this.mobileTab = next")
+    assert mobile_tab.index("this._restorePreviewViewState(ownerPath, ownerLoadSeq)") < (
+        mobile_tab.index("this.mobileTab = next"))
+    assert "this._schedulePreviewViewRestore(ownerPath, ownerLoadSeq)" in mobile_tab
+    assert 'this.mobileTab !== "preview"' in app
+    assert "preview: !this._isMobileLayout()" in node_click
+    assert html.count("@click=\"setMobileTab('") == 3
+
+
 def test_file_tree_refresh_preserves_last_good_content_on_failure():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async loadRoot()")
@@ -621,7 +721,9 @@ def test_boot_paints_shell_before_deferred_tree_and_stats_work():
 
     assert "requestAnimationFrame(() => this._markReady())" in boot
     assert "this._fetchModels({ retries: 2 })" in boot
-    assert "setTimeout(() => { this.loadRoot().catch(() => {}); }, 150)" in boot
+    assert "const workspaceReady = this.fetchSessionWorkspaces()" in boot
+    assert "workspaceReady.then(() => this.initSessions())" in boot
+    assert "workspaceReady.then(() => this.loadRoot()).catch(() => {})" in boot
     assert "setTimeout(() => { this.fetchStats(); }, 300)" in boot
     assert "await this.fetchContextInfo()" not in boot
 
@@ -666,13 +768,14 @@ def test_codex_quota_labels_distinguish_equal_duration_limits():
     assert 'x-text="codexLimitWindowLabel(w) || w.key"' in html
 
 
-def test_chat_grid_uses_stable_session_and_message_keys():
+def test_chat_transcript_uses_stable_session_and_message_keys():
     index = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert 'x-for="tid in mountedChatPaneIds()" :key="tid"' in index
-    assert 'x-show="visibleChatPaneIds().includes(tid)"' in index
+    assert 'x-show="tid === currentId && sessionInCurrentWorkspace(tid)"' in index
     assert 'x-for="(m, i) in paneMessages(tid)"' in index
     assert ":key=\"m._k || m.uuid || ('m-' + i)\"" in index
+    assert "chat-grid" not in index
 
 
 def test_chat_messages_do_not_scan_long_text_for_unused_intrinsic_height():
@@ -683,49 +786,51 @@ def test_chat_messages_do_not_scan_long_text_for_unused_intrinsic_height():
     assert "contain-intrinsic-size" not in index
 
 
-def test_chat_grid_loads_are_single_flight_and_mark_panes_loaded():
+def test_chat_tab_loads_are_single_flight_and_resident_dom_is_bounded():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async _ensureSessionLoaded(sid)")
     end = app.index("\n    async loadSession", start)
     loader = app[start:end]
-    grid_start = app.index("async createDefaultChatGrid()")
-    grid_end = app.index("\n    // <title> driver", grid_start)
-    grid = app[grid_start:grid_end]
+    resident_start = app.index("mountedChatPaneIds()")
+    resident_end = app.index("\n    // [resident-panes] LRU bookkeeping", resident_start)
+    resident = app[resident_start:resident_end]
 
     assert "this._sessionLoadPromises[sid]" in loader
     assert "if (ok) st._loaded = true" in loader
-    assert "await this._ensureSessionLoaded(id)" in grid
-    assert "if (!st._loaded) await this.loadSession(id)" not in grid
+    assert "this.currentId" in resident
+    assert "...this.residentPaneIds()" in resident
+    assert "new Set(this.openTabIds || [])" in resident
+    assert "return [...new Set(ids)]" in resident
 
 
-def test_grid_state_and_render_helpers_are_session_scoped():
+def test_transcript_render_helpers_are_session_scoped():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    assert "_normalizeChatGridState(preferredId" in app
-    assert "const origin = this.currentId" in app
-    assert "await this.openTab(id, false)" in app
     assert "this.paneMessages(sid)" in app
     assert "isLatestEditTool(i, m, tid)" in html
     assert "isMsgExpanded(i, m, false, tid)" in html
     assert "toolResultSummary(m, i, tid)" in html
     assert "findToolUseFor(m, i, tid)" in html
     assert "taskLogLine(m, tid)" in html
+    assert "splitPaneIds" not in app
+    assert "chatGrid" not in app
 
 
-def test_new_sessions_replace_selected_grid_pane_and_restore_on_failure():
+def test_new_sessions_are_bound_to_the_active_workspace_and_roll_back_locally():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async _newServerSession()")
     end = app.index("\n    newSession()", start)
     native_create = app[start:end]
 
-    assert "const gridBefore = this._activeGridSnapshot()" in native_create
-    assert "this._applyGridReplacement(gridBefore, draftId)" in native_create
-    assert "this._restoreGridSnapshot(gridBefore)" in native_create
-    assert "if (this.chatGridFocusId === draftId) this.chatGridFocusId = meta.id" in native_create
+    assert "const seedCwd = options.cwd || this.currentWorkspacePath()" in native_create
+    assert "cwd: seedCwd" in native_create
+    assert "[seedCwd]: draftId" in native_create
+    assert "this.workspaceOpenTabIds(seedCwd)" in native_create
+    assert "chatGrid" not in native_create
 
 
-def test_visible_grid_panes_reconcile_stream_and_scroll_independently():
+def test_visible_session_reconciles_stream_and_scroll_by_owner():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     reconcile_start = app.index("_reconcileOpenSession(next)")
     reconcile_end = app.index("\n    _sessionsEqual", reconcile_start)
@@ -734,18 +839,35 @@ def test_visible_grid_panes_reconcile_stream_and_scroll_independently():
     send_end = app.index("\n    retryFailedMessage", send_start)
     send = app[send_start:send_end]
 
-    assert "for (const sid of this.visibleChatPaneIds())" in reconcile
+    assert "for (const sid of (this.currentId ? [this.currentId] : []))" in reconcile
     assert "sessionId: sid" in app[app.index("async _checkActiveTurn"):send_start]
-    assert "this.visibleChatPaneIds().includes(streamSid)" in send
+    assert "streamSid === this.currentId" in send
     assert "streamState.atBottom !== false" in send
 
 
-def test_single_pane_grid_background_is_transparent():
+def test_silent_mobile_stream_recovers_from_server_replay_without_reload():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async _recoverStalledStream(sid = this.currentId)")
+    end = app.index("\n    _retireStaleSessionStream", start)
+    recovery = app[start:end]
+
+    assert "Date.now() - observedActivity < 18_000" in recovery
+    assert "d.events_so_far" in recovery
+    assert "st._serverActiveObserved = true" in recovery
+    assert "await this.send({" in recovery
+    assert "reconnect: true" in recovery
+    assert "this._retireStaleSessionStream(sid, st)" in recovery
+    assert "await this.loadSession(sid, { quiet: true })" in recovery
+    assert "this._recoverStalledStream(streamSid)" in app
+
+
+def test_single_transcript_stack_has_one_visible_session():
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
-    assert ".chat-body:not(.is-split) .chat-grid," in css
-    assert ".chat-body:not(.is-split) .chat-grid-pane" in css
-    assert ".chat-body.msgs-hidden .chat-grid-pane.active .msg" in css
+    assert ".chat-session-stack" in css
+    assert ".chat-session-pane" in css
+    assert ".chat-body.msgs-hidden .chat-session-pane.active .msg" in css
+    assert ".chat-grid" not in css
 
 
 def test_async_queue_clear_only_removes_submitted_composer_snapshot():
@@ -760,15 +882,18 @@ def test_async_queue_clear_only_removes_submitted_composer_snapshot():
     assert "this.pendingDocs.filter(d => !sentDocs.has(d))" in send
 
 
-def test_grid_stream_placeholder_tolerates_uninitialized_tab_state():
+def test_stream_placeholder_tolerates_uninitialized_tab_state():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     assert "modelLabel((tabState[tid] && tabState[tid].streamingModel) || '')" in html
     assert "tabState[tid] && tabState[tid].streamElapsed > 1" in html
     assert "fmtStreamElapsed((tabState[tid] && tabState[tid].streamElapsed) || 0)" in html
+    assert 'class="msg assistant msg-streaming first-token-pending"' in html
+    assert ":not(.msg-streaming) .msg-avatar" in css
 
 
-def test_grid_message_actions_use_their_pane_stream_state():
+def test_message_actions_use_their_session_stream_state():
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     pane_start = html.index('<template x-for="tid in mountedChatPaneIds()"')
     pane_end = html.index('<div class="chat-input">', pane_start)
@@ -804,17 +929,113 @@ def test_outline_fetch_throttles_failed_optimistic_draft_requests():
     assert method.index("st._outlineFetchedAt = now") < method.index("await fetch(")
 
 
-def test_multi_workspace_ui_uses_app_modal_and_preserves_grid_creation():
+def test_multi_workspace_ui_is_app_level_and_new_sessions_inherit_it():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
     assert "window.prompt" not in app
-    assert "await this.prompt({" in app
     assert "cwd: seedCwd" in app
-    assert "const gridBefore = this._activeGridSnapshot()" in app
-    assert "chat-toolbar-workspace" in html
-    assert "chat-grid-pane-workspace" in html
+    assert 'headers["X-Muselab-Workspace"] = encodeURIComponent(this.activeWorkspace)' in app
+    assert '"&workspace=" + encodeURIComponent(workspace)' in app
+    assert "workspace-picker" in html
+    assert ':disabled="workspaceSwitching || _creatingSession"' in html
+    assert "workspaceOpenTabIds()" in html
+    assert "chat-toolbar-workspace" not in html
+    assert "chat-grid" not in html
     assert ':title="tabTooltip(tid)"' in html
+    assert ':disabled="workspaceSwitching || !availableModels.length"' in html
+    assert "if (this.workspaceSwitching && !opts.reconnect && !opts.resumedItem) return" in app
+    assert "_workspacePreviewTabs(surface = {})" in app
+    assert "if (!path || seen.has(path)) return false" in app
+    assert "async _refreshSessionsAfterWorkspaceRegistryChange()" in app
+    assert app.count("await this._refreshSessionsAfterWorkspaceRegistryChange()") == 2
+
+
+def test_session_history_and_workspace_use_distinct_semantic_icons():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    history_start = html.index('class="chat-tab-history-btn"')
+    history_end = html.index("</button>", history_start)
+    workspace_start = html.index('class="workspace-picker-btn"')
+    workspace_end = html.index("</button>", workspace_start)
+
+    assert '#i-history' in html[history_start:history_end]
+    assert '#i-folder' not in html[history_start:history_end]
+    assert '#i-folder' in html[workspace_start:workspace_end]
+
+
+def test_add_workspace_uses_a_server_folder_browser_on_desktop_and_mobile():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    backend = (FRONTEND.parent / "backend" / "codex" / "api.py").read_text(
+        encoding="utf-8")
+    start = app.index("async addWorkspace()")
+    end = app.index("\n    async removeWorkspace", start)
+    add = app[start:end]
+
+    assert "this.prompt" not in add
+    assert "browser.show = true" in add
+    assert "await this.browseWorkspaceDirectory(this.currentWorkspacePath())" in add
+    assert 'fetch(\n          "/api/chat/workspaces/browse" + query' in app
+    assert "workspaceBrowserTarget()" in app
+    assert 'class="modal workspace-browser-modal"' in html
+    assert ':data-workspace-path="directory.path"' in html
+    assert 'class="btn-primary workspace-browser-confirm"' in html
+    assert '@click="addWorkspacePathManually()"' in html
+    assert "async addWorkspacePathManually()" in app
+    assert '@router.get("/workspaces/browse"' in backend
+    assert ".workspace-browser-modal" in css
+    assert "height: 100dvh" in css[css.index("@media (max-width: 720px)", css.index(
+        ".workspace-browser-modal")):]
+
+
+def test_workspace_async_file_surfaces_reject_late_previous_owner_results():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    trash_start = app.index("async loadTrash()")
+    trash_end = app.index("\n    openTrashModal()", trash_start)
+    trash = app[trash_start:trash_end]
+    meta_start = app.index("async loadSelectedMeta(path)")
+    meta_end = app.index("\n    // Format a unix-seconds", meta_start)
+    meta = app[meta_start:meta_end]
+    children_start = app.index("async fetchChildren(path, opts = {})")
+    children_end = app.index("\n    _uniqueFileNodes", children_start)
+    children = app[children_start:children_end]
+    upload_start = app.index("async _syncUploadedFiles(")
+    upload_end = app.index("\n    onPreviewTabDragStart", upload_start)
+    upload = app[upload_start:upload_end]
+    save_start = app.index("async saveEdit()")
+    save_end = app.index("\n    // ===== @ mention", save_start)
+    save = app[save_start:save_end]
+    palette_start = app.index("async _fetchPaletteFiles()")
+    palette_end = app.index("\n    // Build the item list", palette_start)
+    palette = app[palette_start:palette_end]
+
+    assert "const loadSeq = ++this._trashLoadSeq" in trash
+    assert "ownerWorkspace === this.currentWorkspacePath()" in trash
+    assert trash.count("if (!isOwner()) return") >= 2
+    assert "const loadSeq = ++this._selectedMetaSeq" in meta
+    assert "ownerWorkspace === this.currentWorkspacePath()" in meta
+    assert "this.selected === path" in meta
+    assert "opts.ownerWorkspace || this.currentWorkspacePath()" in children
+    assert "this._workspaceIsCurrent(ownerWorkspace)" in children
+    assert "stale.staleWorkspace = true" in children
+    assert "ownerWorkspace = this.currentWorkspacePath()" in upload
+    assert "if (!this._workspaceIsCurrent(ownerWorkspace)) return" in upload
+    assert save.index("if (!sameOwner) return") < save.index(
+        "this._previewCacheDel(savePath)")
+    assert "const requestSeq = ++this._paletteFileSeq" in palette
+    assert "requestSeq === this._paletteFileSeq" in palette
+
+
+def test_context_upload_keeps_the_workspace_that_opened_the_file_picker():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    handler_start = app.index("async ctxUploadHandler(ev)")
+    handler_end = app.index("\n    async doRename", handler_start)
+    handler = app[handler_start:handler_end]
+
+    assert "this._ctxUploadWorkspace = this.currentWorkspacePath()" in app
+    assert "const ownerWorkspace = this._ctxUploadWorkspace" in handler
+    assert "!this._workspaceIsCurrent(ownerWorkspace)" in handler
 
 
 def test_mobile_preview_header_prioritizes_title_and_controls():
@@ -830,7 +1051,7 @@ def test_mobile_preview_header_prioritizes_title_and_controls():
     assert "selected.slice(0, selected.lastIndexOf('/') + 1)" in html
 
 
-def test_history_jump_and_grid_paging_keep_their_session_owner():
+def test_history_jump_and_paging_keep_their_session_owner():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     jump_start = app.index("_scrollToUserMsg(m, ownerSid = this.currentId)")
     jump_end = app.index("\n    // Short preview text", jump_start)
@@ -845,7 +1066,7 @@ def test_history_jump_and_grid_paging_keep_their_session_owner():
     assert "document.querySelector(" not in jump
     assert "this._scrollToUserMsg(m, sid)" in jump
     assert "if (sid === this.currentId) this.messages = st.messages" in jump
-    assert "const isVisible = this.visibleChatPaneIds().includes(sid)" in paging
+    assert "const isVisible = sid === this.currentId" in paging
     assert "const scrollEl = isVisible ? this._chatScrollEl(sid) : null" in paging
 
 
@@ -890,14 +1111,14 @@ def test_failed_transcript_refresh_preserves_the_last_good_messages():
     assert "this.messages = st.messages" not in failed
 
 
-def test_idle_preload_yields_to_every_visible_grid_stream():
+def test_idle_preload_stays_in_workspace_and_yields_to_visible_stream():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("_idlePreloadStep()")
     end = app.index("\n    // ===== Lazy-loaded history controls", start)
     method = app[start:end]
 
-    assert "this.visibleChatPaneIds().some" in method
-    assert "st && st.streaming" in method
+    assert "const ids = this.workspaceOpenTabIds()" in method
+    assert "currentState && currentState.streaming" in method
     assert "_idlePreloadRetryTimer" in method
     assert "}, 1000)" in method
 
