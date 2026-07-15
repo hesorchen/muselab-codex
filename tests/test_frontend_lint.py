@@ -488,6 +488,121 @@ def test_open_file_updates_shared_preview_tabs_immutably():
     assert "this.tabs = [...this.tabs, { path: n.path" in method
 
 
+def test_preview_loads_are_abortable_and_latest_request_owned():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async openFile(n, opts = {})")
+    end = app.index("\n    async csvLoadPage", start)
+    method = app[start:end]
+
+    assert "this._previewAbort.abort()" in method
+    assert "const loadSeq = ++this._previewLoadSeq" in method
+    assert "signal: controller.signal" in method
+    assert "loadSeq !== this._previewLoadSeq" in method
+    assert "(opts.forceReload || needsDiskReload)" in method
+    assert '"svg"' in method and 'this.previewMode = "img"' in method
+
+
+def test_reopening_edited_file_keeps_the_current_buffer():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async openFile(n, opts = {})")
+    end = app.index("\n    async csvLoadPage", start)
+    method = app[start:end]
+
+    same_path_guard = "this.editing && n.path === this.selected && !opts.forceReload"
+    assert same_path_guard in method
+    assert method.index(same_path_guard) < method.index("this.editing = false")
+    assert "!opts.editsConfirmed && !this._confirmLoseEdits()" in method
+
+
+def test_upload_overwrite_uses_operation_local_editor_snapshot():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    prep_start = app.index("_prepareUploadOverwrite(dirPath, files)")
+    sync_start = app.index("async _syncUploadedFiles", prep_start)
+    sync_end = app.index("\n    onPreviewTabDragStart", sync_start)
+    upload = app[prep_start:sync_end]
+
+    assert "editorText = this._cm ? this._cm.getValue() : this.editText" in upload
+    assert "uploadContext.editorRef === this._cm" in upload
+    assert "liveText !== uploadContext.editorText" in upload
+    assert "this._previewNeedsReload = path" in upload
+    assert "_uploadDiscardApproved" not in app
+
+
+def test_csv_page_commits_offset_only_after_success():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async csvLoadPage(")
+    end = app.index("\n    csvWindowEnd", start)
+    csv = app[start:end]
+
+    assert "if (this._csvAbort) this._csvAbort.abort()" in csv
+    assert "const loadSeq = ++this._csvLoadSeq" in csv
+    assert csv.index("this.csvOffset = reqOffset") > csv.index("const data = await r.json()")
+    assert "this.csvOffset = next" not in csv
+    assert "this.csvData = null" not in csv
+
+
+def test_preview_cache_and_find_are_memory_bounded():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert "PREVIEW_CACHE_MAX_BYTES" in app
+    assert "_previewCacheEntryBytes(entry)" in app
+    assert "this._previewCacheBytes > this.PREVIEW_CACHE_MAX_BYTES" in app
+    assert "PREVIEW_FIND_MAX_MATCHES: 500" in app
+    assert "this.previewFind.truncated = true" in app
+
+
+def test_file_tree_refresh_preserves_last_good_content_on_failure():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async loadRoot()")
+    end = app.index("\n    // In-place removal", start)
+    load = app[start:end]
+
+    assert "const treeSeq = ++this._treeLoadSeq" in load
+    assert "children = await this.fetchChildren" in load
+    assert load.index("this.visible =") > load.index("children = await this.fetchChildren")
+    assert "return this.loadRoot()" in load
+    assert "this.childCache = {};" not in load
+    assert "this.treeError" in load
+    assert "const wantedExpanded = new Set(pendingExpanded)" in load
+    assert "const nextVisible = await buildRows(children, 0)" in load
+    assert "this.expanded = nextExpanded" in load
+    assert ".slice(0, 8)" not in load
+
+
+def test_directory_path_changes_and_removals_cover_descendant_tabs():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    remap_start = app.index("_remapPreviewPaths(src, dst)")
+    remap_end = app.index("\n    _canRemovePreviewPaths", remap_start)
+    drop_start = app.index("async _dropPreviewPathsUnder(roots)")
+    drop_end = app.index("\n    // Double-click", drop_start)
+    remap = app[remap_start:remap_end]
+    drop = app[drop_start:drop_end]
+
+    assert "this._pathAtOrBelow(t.path, src)" in remap
+    assert "this.selectedPaths = new Set" in remap
+    assert "this.fileClipboard" in remap
+    assert "oldTabs.filter(t => !removed(t.path))" in drop
+    assert "await this.openFile" in drop
+
+
+def test_preview_bulk_close_uses_owner_safe_tab_switch_and_shared_clear():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async previewTabMenuAction(action)")
+    end = app.index("\n    async onPreviewDrop", start)
+    menu = app[start:end]
+
+    assert menu.index("await this.switchTab(path)") < menu.index(
+        "this.tabs = this.tabs.filter(t => t.path === path)")
+    assert "this.closeAllTabs()" in menu
+    assert 'this.tabs = []; this.selected = ""' not in menu
+
+    clear_start = app.index("    _clearPreviewState() {")
+    clear_end = app.index("\n    onPreviewImageError()", clear_start)
+    clear = app[clear_start:clear_end]
+    assert "this.closePreviewFind()" in clear
+    assert clear.index("this.editing = false") < clear.index('this.selected = ""')
+
+
 def test_file_tree_keyed_list_never_uses_in_place_splice():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("// ===== file tree =====")

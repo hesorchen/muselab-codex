@@ -6,6 +6,7 @@ import secrets
 import shutil
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
@@ -380,11 +381,27 @@ def list_dir(path: str = "", show_hidden: bool = False) -> dict:
     # back into the tree would surface deleted files in a confusing
     # context. Only relevant at the root level since trash dir lives there.
     is_root_listing = (target == ROOT)
-    for child in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
-        if is_root_listing and child.name == TRASH_DIR_NAME:
-            continue
-        if not show_hidden and child.name.startswith("."):
-            continue
+    # DirEntry caches d_type/stat data supplied by the OS. The Path-based
+    # implementation called is_dir() during sort and then two more times per
+    # rendered row, which made large network-mounted directories needlessly
+    # syscall-heavy.
+    try:
+        with os.scandir(target) as scan:
+            candidates = []
+            for child in scan:
+                if is_root_listing and child.name == TRASH_DIR_NAME:
+                    continue
+                if not show_hidden and child.name.startswith("."):
+                    continue
+                try:
+                    is_dir = child.is_dir()
+                except OSError:
+                    continue
+                candidates.append((child.name.lower(), child, is_dir))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"failed to list: {e}")
+    candidates.sort(key=lambda item: (not item[2], item[0]))
+    for _, child, is_dir in candidates:
         if len(entries) >= MAX_LIST_ENTRIES:
             truncated = True
             break
@@ -394,9 +411,9 @@ def list_dir(path: str = "", show_hidden: bool = False) -> dict:
             continue
         entries.append(Entry(
             name=child.name,
-            path=str(child.relative_to(ROOT)),
-            is_dir=child.is_dir(),
-            size=stat.st_size if not child.is_dir() else 0,
+            path=str(Path(child.path).relative_to(ROOT)),
+            is_dir=is_dir,
+            size=stat.st_size if not is_dir else 0,
             mtime=stat.st_mtime,
         ).model_dump())
     return {"root": str(ROOT), "path": path, "entries": entries, "truncated": truncated}
@@ -490,6 +507,35 @@ CSV_MAX_COLS = 50             # per-row column cap
 CSV_CELL_MAX_CHARS = 500
 CSV_SNIFF_BYTES = 8192        # sample size for delimiter / header detection
 
+# Counting every row is necessarily O(file size), but the old endpoint paid
+# that cost on *every* page. Cache only the total (never cell content), keyed by
+# the file's stat signature; writes invalidate naturally via mtime/size. The
+# small LRU is protected because FastAPI sync handlers run in a thread pool.
+CSV_TOTAL_CACHE_MAX = 64
+_CSV_TOTAL_CACHE: OrderedDict[str, tuple[int, int, int]] = OrderedDict()
+_CSV_TOTAL_CACHE_LOCK = threading.Lock()
+
+
+def _csv_total_cache_get(target: Path, mtime_ns: int, size: int) -> int | None:
+    key = str(target)
+    with _CSV_TOTAL_CACHE_LOCK:
+        value = _CSV_TOTAL_CACHE.get(key)
+        if value is None or value[:2] != (mtime_ns, size):
+            if value is not None:
+                _CSV_TOTAL_CACHE.pop(key, None)
+            return None
+        _CSV_TOTAL_CACHE.move_to_end(key)
+        return value[2]
+
+
+def _csv_total_cache_set(target: Path, mtime_ns: int, size: int, total: int) -> None:
+    key = str(target)
+    with _CSV_TOTAL_CACHE_LOCK:
+        _CSV_TOTAL_CACHE[key] = (mtime_ns, size, total)
+        _CSV_TOTAL_CACHE.move_to_end(key)
+        while len(_CSV_TOTAL_CACHE) > CSV_TOTAL_CACHE_MAX:
+            _CSV_TOTAL_CACHE.popitem(last=False)
+
 
 @router.get("/csv", dependencies=[Depends(require_token)])
 def csv_preview(path: str, offset: int = 0, limit: int = CSV_DEFAULT_LIMIT) -> dict:
@@ -511,6 +557,11 @@ def csv_preview(path: str, offset: int = 0, limit: int = CSV_DEFAULT_LIMIT) -> d
         raise HTTPException(status_code=404, detail="not a file")
     if target.suffix.lower() not in {".csv", ".tsv"}:
         raise HTTPException(status_code=415, detail="not a csv/tsv file")
+    try:
+        stat = target.stat()
+    except OSError:
+        raise HTTPException(status_code=404, detail="not a file") from None
+    cached_total = _csv_total_cache_get(target, stat.st_mtime_ns, stat.st_size)
     if limit < 1:
         limit = CSV_DEFAULT_LIMIT
     if limit > CSV_MAX_LIMIT:
@@ -553,19 +604,38 @@ def csv_preview(path: str, offset: int = 0, limit: int = CSV_DEFAULT_LIMIT) -> d
                 except StopIteration:
                     pass
             row_idx = 0
-            for raw in reader:
-                if row_idx < offset:
+            # A cached total means pagination only needs to walk through the
+            # requested window; it can stop immediately afterwards. Without a
+            # cached total (first request or changed file), continue to EOF once
+            # so future pages are cheap.
+            if cached_total is None or offset < cached_total:
+                for raw in reader:
+                    if row_idx < offset:
+                        row_idx += 1
+                        continue
+                    if len(rows) < limit:
+                        cells = [_clip_cell(c) for c in raw[:CSV_MAX_COLS]]
+                        if len(raw) > CSV_MAX_COLS:
+                            cols_truncated = True
+                        rows.append(cells)
                     row_idx += 1
-                    continue
-                if len(rows) < limit:
-                    cells = [_clip_cell(c) for c in raw[:CSV_MAX_COLS]]
-                    if len(raw) > CSV_MAX_COLS:
-                        cols_truncated = True
-                    rows.append(cells)
-                row_idx += 1
-            total_rows = row_idx
+                    if cached_total is not None and len(rows) >= limit:
+                        break
+            total_rows = cached_total if cached_total is not None else row_idx
     except OSError as e:
         raise HTTPException(status_code=500, detail=f"failed to read: {e}")
+
+    if cached_total is None:
+        # Do not cache a count under an obsolete signature if an external
+        # writer changed the file during our scan.
+        try:
+            end_stat = target.stat()
+        except OSError:
+            end_stat = None
+        if (end_stat is not None
+                and (end_stat.st_mtime_ns, end_stat.st_size)
+                == (stat.st_mtime_ns, stat.st_size)):
+            _csv_total_cache_set(target, stat.st_mtime_ns, stat.st_size, total_rows)
 
     return {
         "path": path,

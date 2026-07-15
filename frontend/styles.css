@@ -1653,6 +1653,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   cursor: pointer;
 }
 .root-action:hover { background: var(--c-bg-3); color: var(--c-fg-1); }
+.root-action:disabled { opacity: 0.55; cursor: wait; }
+.root-action svg.spinning { animation: spin 0.8s linear infinite; }
 /* Drop target highlight — drag a tree node / OS file onto the root bar to
    move / upload it to the archive root. Mirrors `li.drag-over` (accent fill
    + inset ring) so the affordance reads the same as dropping onto a node. */
@@ -1802,6 +1804,20 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
   transition: background var(--t-fast);
   position: relative;
 }
+.filelist li.filelist-status {
+  min-height: 96px;
+  padding: var(--sp-5) var(--sp-4);
+  display: flex; flex-direction: column; justify-content: center;
+  gap: var(--sp-2);
+  color: var(--c-fg-3); text-align: center;
+  cursor: default; user-select: text; -webkit-user-select: text;
+  line-height: 1.5;
+}
+.filelist li.filelist-status:hover { background: transparent; }
+.filelist li.filelist-status .icon { color: var(--c-fg-4); }
+.filelist li.filelist-status .icon svg { width: 28px; height: 28px; }
+.filelist li.filelist-status.error-state { color: var(--c-danger); }
+.filelist li.filelist-status .btn-text { align-self: center; }
 /* Indent guide — single vertical line at the current depth so nested files
    feel anchored to their parent. Hidden at depth 0 (top-level has no parent
    to point to). 50% opacity keeps it subtle. */
@@ -2995,6 +3011,16 @@ pre.text {
 .chk .icon svg { width: 14px; height: 14px; }
 
 .chat-scroll-wrap { flex: 1; position: relative; display: flex; flex-direction: column; min-height: 0; }
+/* The transcript and composer share .chat-scroll-wrap, but floating transcript
+   controls must be positioned against the space ABOVE the composer. The input
+   is variable-height (attachments, queued messages, wrapped mobile toolbar),
+   so fixed bottom offsets on the outer wrapper inevitably disappear behind it.
+   This inner flex item shrinks/grows with the remaining transcript space and is
+   the nearest positioned ancestor for the three navigation FABs. */
+.chat-transcript-wrap {
+  flex: 1; min-height: 0; position: relative;
+  display: flex; flex-direction: column;
+}
 .chat-grid-drop-overlay {
   position: absolute;
   inset: 8px;
@@ -7110,6 +7136,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   flex: 1; min-height: 0;
   display: flex; flex-direction: column;
 }
+.xlsx-preview .table-empty { flex: 1; min-height: 160px; }
 .xlsx-scroll {
   flex: 1; min-height: 0;
   overflow: auto;
@@ -7120,7 +7147,8 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   font-size: var(--fs-sm);
   background: var(--c-bg-1);
 }
-.xlsx-table td {
+.xlsx-table td,
+.xlsx-table th {
   border: 1px solid var(--c-border);
   padding: 4px 10px;
   white-space: nowrap;
@@ -7130,8 +7158,16 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   color: var(--c-fg-0);
   vertical-align: top;
 }
+.xlsx-table th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--c-bg-2);
+  color: var(--c-fg-1);
+  text-align: left;
+  font-weight: var(--fw-semibold);
+}
+.xlsx-table th.xlsx-rownum { left: 0; z-index: 3; }
 .xlsx-table tr:hover td { background: var(--c-bg-2); }
-.xlsx-table td.xlsx-rownum {
+.xlsx-table .xlsx-rownum {
   position: sticky; left: 0;
   background: var(--c-bg-2);
   color: var(--c-fg-3);
@@ -7141,7 +7177,7 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
   user-select: none;
   z-index: 1;
 }
-.xlsx-table tr:hover td.xlsx-rownum { background: var(--c-bg-3); }
+.xlsx-table tr:hover .xlsx-rownum { background: var(--c-bg-3); }
 .xlsx-meta {
   padding: 6px 10px;
   font-size: var(--fs-xs);
@@ -8204,6 +8240,43 @@ html[data-theme="dark"] .bubble :not(pre) > code:not(.has-file-link) * {
    We force 16px on all text-input controls for touch / coarse-pointer
    devices, which is the exact threshold WebKit checks.
    ========================================================================== */
+/* Touch-first file/preview ergonomics. Desktop keeps the compact VSCode-like
+   density; coarse pointers get real finger targets and wrapping toolbars. */
+@media (pointer: coarse) {
+  .filelist li:not(.filelist-status) {
+    min-height: 40px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+  .tree-action,
+  .root-action {
+    min-width: 36px;
+    width: 36px;
+    height: 36px;
+  }
+  .filelist-sticky-root { min-height: 44px; padding-top: 4px; padding-bottom: 4px; }
+  .open-files-head { min-height: 40px; }
+  .open-files .open-files-close-all { width: 36px; height: 36px; }
+  .open-files-list { max-height: calc(40px * 5); }
+  .open-files-list li {
+    min-height: 40px;
+    grid-template-columns: 16px minmax(0, 1fr) 36px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+  }
+  .open-files-x { width: 36px; height: 36px; font-size: 20px; }
+  .srow { min-height: 44px; padding-top: 9px; padding-bottom: 9px; }
+  .csv-toolbar { flex-wrap: wrap; gap: 6px; }
+  .csv-toolbar .btn-text { min-height: 36px; padding: 5px 12px; }
+  .csv-meta { margin-left: 0; }
+  .csv-range { flex: 1; min-width: max-content; }
+  .preview-find { width: calc(100% - var(--sp-4)); }
+  .preview-find-bar { width: 100%; }
+  .preview-find-input { flex: 1; min-width: 0; width: auto; max-width: none; }
+  .preview-find-btn { width: 32px; height: 32px; }
+  .pane.preview .pane-head .preview-keep-mobile { min-width: 34px; min-height: 34px; }
+}
+
 @media (pointer: coarse) {
   input,
   textarea,

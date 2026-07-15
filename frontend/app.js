@@ -209,8 +209,16 @@ function portal() {
                        && window.matchMedia("(hover: hover)").matches,
 
     // ===== file tree =====
-    visible: [], expanded: new Set(), childCache: {},
+    visible: [], expanded: new Set(), childCache: {}, treeLoading: false,
+    treeError: "",
     selected: "",
+    // The row that owns keyboard/copy/paste focus in the file tree. Keep this
+    // separate from `selected`, which is the file whose body is rendered in
+    // the preview pane. Ctrl/Shift-clicking a directory must not relabel an
+    // already-rendered preview as that directory.
+    treeFocusPath: "",
+    _treeLoadSeq: 0,
+    _childFetches: null,
     dragOver: "",
     // Highlight flag for the sticky root bar while a tree node / OS file is
     // dragged over it (drop = move/upload to archive root).
@@ -228,6 +236,7 @@ function portal() {
     // list auto-scrolls underneath — matching native OS marquee feel).
     marquee: { active: false, x: 0, y: 0, w: 0, h: 0 },
     searchQ: "", searchMode: false, searching: false,
+    _fileSearchSeq: 0, _fileSearchAbort: null,
     searchHits: [], searchTruncated: false,
     grepHits: [], grepTruncated: false,
 
@@ -272,8 +281,11 @@ function portal() {
     // keyword match. `matches` holds serializable {snippet} for the results
     // list; the parallel live <mark> elements are kept off-reactive in
     // _pfEls so Vue/Alpine never proxies DOM nodes.
-    previewFind: { open: false, query: "", matches: [], active: -1, count: 0, listOpen: false },
+    previewFind: { open: false, query: "", matches: [], active: -1, count: 0, listOpen: false, truncated: false },
     _pfEls: [],
+    PREVIEW_FIND_MAX_MATCHES: 500,
+    _previewLoadSeq: 0,
+    _previewAbort: null,
     // xlsx preview state. previewMode==='xlsx' uses xlsxSheets (array of
     // {name, rows, rows_truncated, cols_truncated}). xlsxActive picks the
     // sheet tab. xlsxLimits carries the server's row/col caps for the UI
@@ -283,10 +295,14 @@ function portal() {
     // backend response for the current page; csvOffset advances by limit
     // when the user pages forward.
     csvPath: "", csvData: null, csvOffset: 0, csvLimit: 200, csvLoading: false,
+    _csvLoadSeq: 0, _csvAbort: null,
     // Bumped whenever an assistant tool_use edits a file. Used as a cache
     // buster on iframe / read URLs so the preview reflects the new content
     // without the user needing to manually refresh the page.
     previewVersion: 0,
+    // Disk changed while the editor buffer deliberately stayed intact. The
+    // next safe open/exit-edit bypasses cache and reconciles automatically.
+    _previewNeedsReload: "",
     // Browser-like zoom for the preview content (md/text/img/xlsx/csv/html).
     // Applied as CSS `zoom` on the content nodes only (NOT the .preview-body
     // container) so the find bar / drop overlay stay at 100%. Sticky across
@@ -713,6 +729,7 @@ function portal() {
 
     // ===== @ mention =====
     mentionShow: false, mentionResults: [], mentionIdx: 0, mentionAnchor: -1,
+    _mentionSeq: 0, _mentionAbort: null,
 
     // ===== toast / modal / ctx menu =====
     toasts: [], _toastId: 0,
@@ -844,9 +861,10 @@ function portal() {
         if (sel && sel.toString && sel.toString().length > 0) return;
         const isCopy = ev.key === "c" || ev.key === "C";
         if (isCopy) {
-          // Need a selected file (not directory). this.selected holds the
-          // path string of the currently-highlighted tree node.
-          const node = this._findTreeNode(this.selected);
+          // Need a focused file (not directory). Tree focus is intentionally
+          // separate from the preview owner: Ctrl-click must not relabel the
+          // already-rendered preview pane.
+          const node = this._findTreeNode(this.treeFocusPath || this.selected);
           if (!node || node.is_dir) return;
           ev.preventDefault();
           this.fileClipboard = { path: node.path, name: node.name };
@@ -905,7 +923,7 @@ function portal() {
       }
       if (ev.key === "Escape") {
         if (this.cheatSheet.show) { this.cheatSheet.show = false; return; }
-        if (this.mentionShow) { this.mentionShow = false; return; }
+        if (this.mentionShow) { this._cancelMentionLookup(); return; }
         if (this.ctxMenu.show) { this.ctxMenu.show = false; return; }
         if (this.tabCtxMenu) { this.closeTabMenu(); return; }
         if (this.settings.show) { this.settings.show = false; return; }
@@ -8139,41 +8157,33 @@ function portal() {
       if (!m) return;
       const path = m.path;
       this.previewTabCtxMenu = null;
-      // Unsaved-edits guard for bulk-close actions that may evict the tab
-      // currently being edited. closeAll always does; closeOthers evicts the
-      // active edit unless it's the kept tab; closeRight evicts it only when
-      // the active edit sits to the right of `path`.
-      if (this.editing) {
-        const ti = this.tabs.findIndex(t => t.path === path);
-        const si = this.tabs.findIndex(t => t.path === this.selected);
-        const evictsEdit =
-          action === "closeAll" ||
-          (action === "closeOthers" && this.selected !== path) ||
-          (action === "closeRight" && ti >= 0 && si > ti);
-        if (evictsEdit && !this._confirmLoseEdits()) return;
-      }
       switch (action) {
         case "close":
           this.closeTab(path);
           break;
         case "closeOthers":
+          // Switch first, mutate second. openFile owns the dirty-editor guard;
+          // if the user cancels, keep the original tab array intact.
+          if (this.selected !== path) {
+            await this.switchTab(path);
+            if (this.selected !== path) return;
+          }
           this.tabs = this.tabs.filter(t => t.path === path);
-          if (this.selected !== path) await this.switchTab(path);
           this.savePrefs();
           break;
         case "closeRight": {
           const idx = this.tabs.findIndex(t => t.path === path);
+          const selectedIdx = this.tabs.findIndex(t => t.path === this.selected);
+          if (idx >= 0 && selectedIdx > idx) {
+            await this.switchTab(path);
+            if (this.selected !== path) return;
+          }
           if (idx >= 0) this.tabs = this.tabs.slice(0, idx + 1);
           this.savePrefs();
           break;
         }
         case "closeAll":
-          this.tabs = []; this.selected = "";
-          this.previewMode = "";
-          this.rawText = "";
-          this.renderedMd = "";
-          this.editing = false;
-          this.savePrefs();
+          this.closeAllTabs();
           break;
         case "reveal":
           await this.revealInTree(path);
@@ -8197,6 +8207,8 @@ function portal() {
       this._dragCounter = 0;
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
+      const uploadContext = this._prepareUploadOverwrite("", files);
+      if (!uploadContext) return;
       // Always upload to the archive root (MUSELAB_ROOT), regardless of
       // which file is currently open in the preview pane. Earlier this
       // dropped into the previewed file's parent directory, but that
@@ -8217,7 +8229,8 @@ function portal() {
       );
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
-      this.reloadTree();
+      await this.reloadTree();
+      await this._syncUploadedFiles(results, uploadContext);
       if (failed && !ok) {
         this.toast(this.lang === "zh"
           ? `${failed} 个文件上传失败`
@@ -8238,7 +8251,8 @@ function portal() {
     },
     // Single-file upload without tree reload / toast — used by parallel
     // drop handlers (onPreviewDrop, tree-onDrop multi-file) so the caller
-    // can batch the side effects. Returns true on success, false on error.
+    // can batch the side effects. Returns uploaded path metadata on success,
+    // false on error.
     async _uploadFileQuiet(dirPath, file) {
       const fd = new FormData();
       fd.append("path", dirPath);
@@ -8251,12 +8265,69 @@ function portal() {
           console.warn("[upload]", file.name, "failed:", r.status);
           return false;
         }
+        const data = await r.json().catch(() => ({}));
         delete this.childCache[dirPath];
-        return true;
+        return {
+          path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
+          replaced_trash_id: data.replaced_trash_id || null,
+        };
       } catch (e) {
         console.warn("[upload]", file.name, "error:", e);
         return false;
       }
+    },
+    _prepareUploadOverwrite(dirPath, files) {
+      const targets = (files || []).map(file =>
+        dirPath ? `${dirPath}/${file.name}` : file.name);
+      const context = { editorPath: "", editorText: "", editorRef: null };
+      if (!this.editing || !targets.includes(this.selected)) return context;
+      if (!this._confirmLoseEdits()) return null;
+      context.editorPath = this.selected;
+      context.editorText = this._cm ? this._cm.getValue() : this.editText;
+      context.editorRef = this._cm;
+      return context;
+    },
+    async _syncUploadedFiles(results, uploadContext = {}) {
+      const uploaded = (results || [])
+        .filter(r => r.status === "fulfilled" && r.value && r.value.path)
+        .map(r => r.value);
+      if (!uploaded.length) return;
+      for (const item of uploaded) this._previewCacheDel(item.path);
+      const replaced = uploaded.filter(item => item.replaced_trash_id).length;
+      if (replaced) {
+        this.trash.count += replaced;
+        this.toast(this.lang === "zh"
+          ? `${replaced} 个同名旧文件已移到垃圾桶`
+          : `${replaced} replaced file(s) moved to trash`, "info", 3500);
+      }
+      if (!uploaded.some(item => item.path === this.selected)) return;
+      const path = this.selected;
+      if (this.editing) {
+        // Confirmation belongs to the exact editor buffer that existed when
+        // upload began. If the user switched away/back, entered edit mode
+        // afterwards, or kept typing while bytes were in flight, preserve that
+        // newer buffer instead of letting upload completion silently close it.
+        const sameEditor = uploadContext.editorPath === path
+          && uploadContext.editorRef === this._cm;
+        const liveText = this._cm ? this._cm.getValue() : this.editText;
+        if (!sameEditor || liveText !== uploadContext.editorText) {
+          this.cmStatus = { ...this.cmStatus, dirty: true };
+          this._previewNeedsReload = path;
+          this.previewVersion = Date.now();
+          this.toast(this.lang === "zh"
+            ? "上传已完成；上传期间的新编辑仍保留，尚未保存"
+            : "Upload finished; newer editor changes were kept unsaved",
+          "warn", 4000);
+          return;
+        }
+        this.editing = false;
+      }
+      const tab = this.tabs.find(t => t.path === path);
+      this.previewVersion = Date.now();
+      await this.openFile(
+        { path, name: path.split("/").pop() },
+        { preview: !!(tab && tab.preview), forceReload: true },
+      );
     },
     onPreviewTabDragStart(ev, path) {
       this._draggingPreviewTabPath = path;
@@ -8283,8 +8354,10 @@ function portal() {
       const from = this.tabs.findIndex(t => t.path === src);
       const to = this.tabs.findIndex(t => t.path === path);
       if (from < 0 || to < 0) return;
-      const [moved] = this.tabs.splice(from, 1);
-      this.tabs.splice(to, 0, moved);
+      const next = this.tabs.slice();
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      this.tabs = next;
       this.savePrefs();
     },
     onPreviewTabDragEnd() {
@@ -10518,29 +10591,93 @@ function portal() {
 
     // ===== file tree =====
     async loadRoot() {
-      this.childCache = {};
-      const children = await this.fetchChildren("");
-      this.visible = this._uniqueFileNodes(children)
-        .map(c => ({ ...c, depth: 0 }));
-      this.expanded = new Set();
-      // Restoring every directory that was ever left open can rebuild
-      // thousands of keyed rows on refresh. Only reveal ancestors of the
-      // selected preview; unrelated folders stay collapsed and load lazily.
-      const selectedPath = this._pendingPreviewSelected || this.selected || "";
-      const want = [...new Set(this._pendingExpanded || [])]
-        .filter(p => selectedPath && selectedPath.startsWith(p + "/"))
-        .sort((a, b) => a.length - b.length)
-        .slice(0, 8);
-      this._pendingExpanded = null;
-      for (const p of want) {
-        const node = this.visible.find(n => n.path === p);
-        if (node && node.is_dir) await this.expand(node);
+      const treeSeq = ++this._treeLoadSeq;
+      this.treeLoading = true;
+      this.treeError = "";
+      const pendingExpanded = [...new Set(this._pendingExpanded || [])];
+      const wantedExpanded = new Set(pendingExpanded);
+      const oldChildCache = this.childCache;
+      const showHidden = this.showHidden;
+      let children;
+      try {
+        // Keep the last-good tree on screen until the fresh root succeeds.
+        // Previously a transient 401/network error was indistinguishable from
+        // an empty archive and blanked the whole file pane.
+        children = await this.fetchChildren("", {
+          force: true, cache: false, treeSeq,
+        });
+      } catch (e) {
+        if (treeSeq === this._treeLoadSeq) {
+          this.treeLoading = false;
+          this.treeError = this.lang === "zh"
+            ? "文件列表加载失败，请检查连接后重试。"
+            : "Could not load files. Check your connection and retry.";
+          this.toast(this.visible.length
+            ? (this.lang === "zh" ? "文件列表刷新失败，已保留原内容"
+                                  : "Could not refresh files; kept the previous list")
+            : this.treeError, "error", 3500);
+        }
+        return false;
       }
+      if (treeSeq !== this._treeLoadSeq) return false;
+      const rootKey = `:${showHidden}`;
+      const nextCache = { [rootKey]: children };
+      const nextExpanded = new Set();
+      let nestedRefreshFailed = false;
+
+      // Rebuild every previously-expanded branch off-screen, then commit the
+      // flat tree once. The old implementation replaced `visible` with root
+      // rows immediately and restored only selected-file ancestors (max 8), so
+      // manual refresh collapsed every unrelated directory and visibly grew
+      // the tree one request at a time. Keeping construction local preserves
+      // both expansion state and the last-good UI throughout the refresh.
+      const buildRows = async (items, depth) => {
+        const rows = [];
+        for (const child of this._uniqueFileNodes(items)) {
+          if (treeSeq !== this._treeLoadSeq) return rows;
+          const node = { ...child, depth };
+          rows.push(node);
+          if (!node.is_dir || !wantedExpanded.has(node.path)) continue;
+          const cacheKey = `${node.path}:${showHidden}`;
+          let grandchildren;
+          try {
+            grandchildren = await this.fetchChildren(node.path, {
+              force: true, cache: false, treeSeq,
+            });
+          } catch (_e) {
+            nestedRefreshFailed = true;
+            // A transient child failure must not erase a branch that was
+            // already visible. Reuse its last-good cache when available.
+            grandchildren = oldChildCache[cacheKey];
+            if (!Array.isArray(grandchildren)) continue;
+          }
+          if (treeSeq !== this._treeLoadSeq) return rows;
+          nextCache[cacheKey] = grandchildren;
+          nextExpanded.add(node.path);
+          rows.push(...await buildRows(grandchildren, depth + 1));
+        }
+        return rows;
+      };
+      const nextVisible = await buildRows(children, 0);
+      if (treeSeq !== this._treeLoadSeq) return false;
+
+      this.treeError = "";
+      this.childCache = nextCache;
+      this.visible = nextVisible;
+      this.expanded = nextExpanded;
+      this._pendingExpanded = null;
+      if (nestedRefreshFailed) {
+        this.toast(this.lang === "zh"
+          ? "部分目录刷新失败，已保留上次内容"
+          : "Some folders could not refresh; kept their previous contents",
+        "warn", 3500);
+      }
+      if (treeSeq === this._treeLoadSeq) this.treeLoading = false;
+      return treeSeq === this._treeLoadSeq;
     },
     reloadTree() {
       this._pendingExpanded = Array.from(this.expanded);
-      this.childCache = {};
-      this.loadRoot();
+      return this.loadRoot();
     },
     // In-place removal of a node (and its descendants, if a dir) from the
     // visible flat-list. Avoids the full reloadTree() that delete used to
@@ -10591,14 +10728,13 @@ function portal() {
     // we fall back to reloadTree — rare in practice but covers the
     // edge case without bespoke logic.
     async _refreshParentInTree(restoredPath) {
-      if (!restoredPath) { this.reloadTree(); return; }
+      if (!restoredPath) return this.reloadTree();
       const parent = restoredPath.split("/").slice(0, -1).join("/");
       delete this.childCache[`${parent}:true`];
       delete this.childCache[`${parent}:false`];
       if (!parent) {
         // Root-level restore: re-merge root children, preserving expanded subtrees.
-        this.reloadTree();
-        return;
+        return this.reloadTree();
       }
       if (!this.expanded.has(parent)) {
         // Parent is collapsed → nothing visible changes; expanding later
@@ -10606,12 +10742,23 @@ function portal() {
         return;
       }
       const parentIdx = this.visible.findIndex(n => n.path === parent);
-      if (parentIdx < 0) { this.reloadTree(); return; }
+      if (parentIdx < 0) return this.reloadTree();
       const parentNode = this.visible[parentIdx];
       // Snapshot inner-expanded subtrees so we can restore them after
       // re-rendering the parent's children.
       const innerExpanded = Array.from(this.expanded)
         .filter(p => p !== parent && p.startsWith(parent + "/"));
+      // Fetch first, mutate second. A failed refresh must not destroy the
+      // currently-visible subtree and replace it with a misleading blank.
+      let children;
+      try {
+        children = await this.fetchChildren(parent, { force: true });
+      } catch (_e) {
+        this.toast(this.lang === "zh"
+          ? "目录刷新失败，已保留原内容"
+          : "Could not refresh folder; kept the previous contents", "error", 3500);
+        return false;
+      }
       // Splice out parent's current rendered subtree.
       let end = parentIdx + 1;
       while (end < this.visible.length
@@ -10621,7 +10768,6 @@ function portal() {
         ...this.visible.slice(end),
       ];
       for (const p of innerExpanded) this.expanded.delete(p);
-      const children = await this.fetchChildren(parent);
       const items = this._uniqueFileNodes(children)
         .map(c => ({ ...c, depth: parentNode.depth + 1 }));
       this.visible = [
@@ -10636,26 +10782,53 @@ function portal() {
         if (node && node.is_dir) await this.expand(node);
       }
       this.expanded = new Set(this.expanded);
+      return true;
     },
-    async fetchChildren(path) {
-      const cacheKey = `${path}:${this.showHidden}`;
-      if (this.childCache[cacheKey]) return this.childCache[cacheKey];
+    async fetchChildren(path, opts = {}) {
+      const showHidden = this.showHidden;
+      const cacheKey = `${path}:${showHidden}`;
+      if (!opts.force && Object.prototype.hasOwnProperty.call(this.childCache, cacheKey)) {
+        return this.childCache[cacheKey];
+      }
+      if (!this._childFetches) this._childFetches = new Map();
+      const pendingKey = `${cacheKey}:${opts.force ? "force" : "normal"}`;
+      if (this._childFetches.has(pendingKey)) return this._childFetches.get(pendingKey);
       const url = "/api/files/list?path=" + encodeURIComponent(path)
-        + (this.showHidden ? "&show_hidden=true" : "");
-      const r = await fetch(url, { headers: this.hdr() });
-      if (!r.ok) return [];
-      const d = await r.json();
-      this.childCache[cacheKey] = d.entries;
-      // LRU: keep at most 100 directory entries to prevent unbounded growth
-      const keys = Object.keys(this.childCache);
-      if (keys.length > 100) {
-        // Delete oldest 20 entries (insertion order preserved in modern JS)
-        keys.slice(0, 20).forEach(k => delete this.childCache[k]);
+        + (showHidden ? "&show_hidden=true" : "");
+      const promise = (async () => {
+        let r;
+        try {
+          r = await fetch(url, { headers: this.hdr() });
+        } catch (e) {
+          throw new Error(String((e && e.message) || e || "network error"));
+        }
+        if (!r.ok) {
+          let detail = "";
+          try { detail = await r.text(); } catch (_) {}
+          throw new Error(detail || `HTTP ${r.status}`);
+        }
+        const d = await r.json();
+        const entries = d.entries || [];
+        const treeOwner = opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq;
+        if (opts.cache !== false && treeOwner) {
+          this.childCache[cacheKey] = entries;
+          // LRU: keep at most 100 directory entries to prevent unbounded growth
+          const keys = Object.keys(this.childCache);
+          if (keys.length > 100) keys.slice(0, 20).forEach(k => delete this.childCache[k]);
+        }
+        if (d.truncated && treeOwner) {
+          this.toast(this.t("toast.dir_truncated", { path: path || "", n: entries.length }), "warn", 3500);
+        }
+        return entries;
+      })();
+      this._childFetches.set(pendingKey, promise);
+      try {
+        return await promise;
+      } finally {
+        if (this._childFetches.get(pendingKey) === promise) {
+          this._childFetches.delete(pendingKey);
+        }
       }
-      if (d.truncated) {
-        this.toast(this.t("toast.dir_truncated", { path: path || "", n: d.entries.length }), "warn", 3500);
-      }
-      return d.entries;
     },
     _uniqueFileNodes(nodes) {
       const seen = new Set();
@@ -10682,18 +10855,19 @@ function portal() {
       if (ev && (ev.ctrlKey || ev.metaKey)) {
         this._toggleSelect(n.path);
         this._selAnchor = n.path;
-        this.selected = n.path;          // active focus follows the toggled row
+        this.treeFocusPath = n.path;
         return;
       }
       if (ev && ev.shiftKey) {
         if (ev.preventDefault) ev.preventDefault();   // suppress text selection
         this._rangeSelect(n.path);
-        this.selected = n.path;
+        this.treeFocusPath = n.path;
         return;
       }
       // ---- Plain click → single selection (clears any batch set) ----
       this.clearTreeSelection();
       this._selAnchor = n.path;
+      this.treeFocusPath = n.path;
       if (n.is_dir) {
         if (this.expanded.has(n.path)) this.collapse(n);
         else await this.expand(n);
@@ -10711,7 +10885,7 @@ function portal() {
     // active/preview highlight (unchanged legacy behavior).
     isRowSelected(n) {
       if (this.selectedPaths.size) return this.selectedPaths.has(n.path);
-      return this.selected === n.path;
+      return (this.treeFocusPath || this.selected) === n.path;
     },
     clearTreeSelection() {
       if (this.selectedPaths.size) this.selectedPaths = new Set();
@@ -10729,7 +10903,7 @@ function portal() {
     // Range-select from the anchor to `targetPath` in flattened `visible`
     // order. Falls back to a single selection when the anchor is gone.
     _rangeSelect(targetPath) {
-      const anchor = this._selAnchor || this.selected || targetPath;
+      const anchor = this._selAnchor || this.treeFocusPath || this.selected || targetPath;
       const ai = this.visible.findIndex(x => x.path === anchor);
       const ti = this.visible.findIndex(x => x.path === targetPath);
       if (ai < 0 || ti < 0) { this._setSelection([targetPath]); return; }
@@ -10745,6 +10919,84 @@ function portal() {
     _pruneDescendants(paths) {
       return paths.filter(p => !paths.some(q => q !== p && p.startsWith(q + "/")));
     },
+    _pathAtOrBelow(path, root) {
+      return !!path && !!root && (path === root || path.startsWith(root + "/"));
+    },
+    _remapPath(path, src, dst) {
+      if (!this._pathAtOrBelow(path, src)) return path;
+      return dst + path.slice(src.length);
+    },
+    _invalidatePreviewCacheUnder(root) {
+      if (!this._previewCache || !root) return;
+      for (const path of Array.from(this._previewCache.keys())) {
+        if (this._pathAtOrBelow(path, root)) this._previewCacheDel(path);
+      }
+    },
+    // Rename/move is a prefix operation when the source is a directory. Keep
+    // every path-bearing client state in sync, not only an exact active tab.
+    // Returns true when the active preview itself moved and should be re-read.
+    _remapPreviewPaths(src, dst) {
+      if (!src || !dst || src === dst) return false;
+      const activeMoved = this._pathAtOrBelow(this.selected, src);
+      const remap = p => this._remapPath(p, src, dst);
+      this.tabs = this.tabs.map(t => this._pathAtOrBelow(t.path, src)
+        ? { ...t, path: remap(t.path), name: remap(t.path).split("/").pop() }
+        : t);
+      this.selected = remap(this.selected);
+      this.treeFocusPath = remap(this.treeFocusPath);
+      this._selAnchor = remap(this._selAnchor);
+      this.selectedPaths = new Set(Array.from(this.selectedPaths, remap));
+      this.expanded = new Set(Array.from(this.expanded, remap));
+      if (this._pendingExpanded) this._pendingExpanded = this._pendingExpanded.map(remap);
+      if (this.fileClipboard.path) {
+        const next = remap(this.fileClipboard.path);
+        if (next !== this.fileClipboard.path) {
+          this.fileClipboard = { path: next, name: next.split("/").pop() };
+        }
+      }
+      if (this.csvPath) this.csvPath = remap(this.csvPath);
+      this._previewNeedsReload = remap(this._previewNeedsReload);
+      this._invalidatePreviewCacheUnder(src);
+      this._scheduleSavePrefs();
+      return activeMoved;
+    },
+    _canRemovePreviewPaths(roots) {
+      const list = (roots || []).filter(Boolean);
+      if (!this.editing || !list.some(p => this._pathAtOrBelow(this.selected, p))) {
+        return true;
+      }
+      return this._confirmLoseEdits();
+    },
+    // Remove a path and every descendant from open-preview state. If the
+    // active tab disappears, activate its nearest surviving neighbour instead
+    // of leaving a blank pane while other valid tabs are still open.
+    async _dropPreviewPathsUnder(roots) {
+      const list = this._pruneDescendants((roots || []).filter(Boolean));
+      if (!list.length) return;
+      const removed = p => list.some(root => this._pathAtOrBelow(p, root));
+      const oldTabs = this.tabs.slice();
+      const oldIndex = oldTabs.findIndex(t => t.path === this.selected);
+      const activeRemoved = removed(this.selected);
+      this.tabs = oldTabs.filter(t => !removed(t.path));
+      for (const root of list) this._invalidatePreviewCacheUnder(root);
+      this.selectedPaths = new Set(Array.from(this.selectedPaths).filter(p => !removed(p)));
+      if (removed(this.treeFocusPath)) this.treeFocusPath = "";
+      if (removed(this._selAnchor)) this._selAnchor = "";
+      if (removed(this.fileClipboard.path)) this.fileClipboard = { path: "", name: "" };
+      if (removed(this._previewNeedsReload)) this._previewNeedsReload = "";
+      if (activeRemoved) {
+        this._clearPreviewState();
+        if (this.tabs.length) {
+          const next = this.tabs[Math.min(Math.max(0, oldIndex), this.tabs.length - 1)];
+          await this.openFile(
+            { path: next.path, name: next.name || next.path.split("/").pop() },
+            { preview: !!next.preview },
+          );
+          return;
+        }
+      }
+      this._scheduleSavePrefs();
+    },
     // Double-click a tree file ⇒ pin it as a permanent tab. The two preceding
     // single-click events already opened it in the preview slot; this just
     // promotes that slot to permanent (openFile's `existing && !asPreview`
@@ -10757,18 +11009,29 @@ function portal() {
     pinTab(path) {
       const t = this.tabs.find(x => x.path === path);
       if (t && t.preview) {
-        t.preview = false;
+        this.tabs = this.tabs.map(x => x.path === path
+          ? { ...x, preview: false } : x);
         this.savePrefs();
       }
     },
-    async expand(n) {
+    async expand(n, opts = {}) {
       // Idempotency guard (both sides of the await): two concurrent reveals
       // — e.g. a fire-and-forget revealInTree racing an awaited one after a
       // search — can both pass a single pre-await check and double-splice the
       // same children, corrupting the flat `visible` array. Re-check after the
       // async fetch so the loser bails out instead of inserting duplicates.
       if (this.expanded.has(n.path)) return;
-      const children = await this.fetchChildren(n.path);
+      let children;
+      try {
+        children = await this.fetchChildren(n.path, { treeSeq: opts.treeSeq });
+      } catch (_e) {
+        if (!opts.quiet && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq)) {
+          this.toast(this.lang === "zh"
+            ? `无法展开 /${n.path}` : `Could not open /${n.path}`, "error", 3000);
+        }
+        return false;
+      }
+      if (opts.treeSeq != null && opts.treeSeq !== this._treeLoadSeq) return false;
       if (this.expanded.has(n.path)) return;
       const idx = this.visible.findIndex(x => x.path === n.path);
       if (idx < 0) return;
@@ -10783,6 +11046,7 @@ function portal() {
       ];
       this.expanded.add(n.path);
       this.expanded = new Set(this.expanded);
+      return true;
     },
     collapse(n) {
       const idx = this.visible.findIndex(x => x.path === n.path);
@@ -10810,6 +11074,7 @@ function portal() {
       } else if (this.selectedPaths.size) {
         this.clearTreeSelection();
       }
+      if (n) this.treeFocusPath = n.path;
       // Clamp to viewport so menu doesn't overflow.
       const MENU_W = 200, MENU_H = 280;
       const x = Math.min(ev.clientX, window.innerWidth - MENU_W - 8);
@@ -10886,7 +11151,7 @@ function portal() {
         this.toast(this.t("toast.created_name", { name }), "success");
         // 自动打开编辑
         await this.openFile({ path, name });
-        this.editing = true;
+        if (this.selected === path) await this.toggleEdit();
       } else this.errToast("create", await r.text());
     },
     async doNewDir(dirNode) {
@@ -10943,12 +11208,16 @@ function portal() {
         });
       } catch (e) { this.errToast("rename", String((e && e.message) || e)); return; }
       if (r.ok) {
-        if (this.selected === n.path) this.selected = newPath;
-        // Old path no longer exists; drop its cached body so a future file
-        // created at the same path can't serve this one's stale content.
-        this._previewCacheDel(n.path);
+        const activeMoved = this._remapPreviewPaths(n.path, newPath);
         delete this.childCache[parent];
-        this.reloadTree();
+        await this.reloadTree();
+        if (activeMoved && this.selected && !this.editing) {
+          const active = this.tabs.find(t => t.path === this.selected);
+          await this.openFile(
+            { path: this.selected, name: this.selected.split("/").pop() },
+            { preview: !!(active && active.preview), forceReload: true },
+          );
+        }
         this.toast(this.t("toast.renamed"), "success");
       } else this.errToast("rename", await r.text());
     },
@@ -11010,7 +11279,7 @@ function portal() {
       //   - nothing selected → fall through (backend defaults to src
       //     parent, i.e. same-directory duplicate)
       let dstDir = "";
-      const selNode = this._findTreeNode(this.selected);
+      const selNode = this._findTreeNode(this.treeFocusPath || this.selected);
       if (selNode) {
         dstDir = selNode.is_dir
           ? selNode.path
@@ -11048,6 +11317,7 @@ function portal() {
         okText: zh ? "移到垃圾桶" : "Move to trash",
       });
       if (!ok) return;
+      if (!this._canRemovePreviewPaths([n.path])) return;
       let r;
       try {
         r = await fetch("/api/files/delete", {
@@ -11061,8 +11331,7 @@ function portal() {
         // moments ago). The goal state is reached, so refresh the tree to
         // drop the phantom row rather than surfacing a "not found" error.
         if (r.status === 404) {
-          this.tabs = this.tabs.filter(t => t.path !== n.path);
-          if (this.selected === n.path) { this.selected = ""; this.previewMode = ""; }
+          await this._dropPreviewPathsUnder([n.path]);
           await this.reloadTree();
           this.toast(zh ? `${n.name} 已不存在，已刷新列表` : `${n.name} no longer exists — refreshed`, "info", 2500);
           return;
@@ -11072,9 +11341,7 @@ function portal() {
       }
       let data = {};
       try { data = await r.json(); } catch (_) {}
-      // 同步 tabs：删了的文件如果在 tabs 也清掉
-      this.tabs = this.tabs.filter(t => t.path !== n.path);
-      if (this.selected === n.path) { this.selected = ""; this.previewMode = ""; }
+      await this._dropPreviewPathsUnder([n.path]);
       // In-place tree removal: no full reload, no flicker. Helper also
       // invalidates the parent's childCache so a future re-expand fetches
       // fresh truth from disk.
@@ -11256,6 +11523,7 @@ function portal() {
     // committed), then sync tabs / trash count / tree once. Mirrors
     // deleteSelected's batch arm but without the modal.
     async _trashManyPaths(paths) {
+      if (!this._canRemovePreviewPaths(paths)) return;
       const zh = this.lang === "zh";
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
@@ -11267,11 +11535,7 @@ function portal() {
       ));
       const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okPaths.length;
-      for (const p of okPaths) {
-        this.tabs = this.tabs.filter(t => t.path !== p);
-        this._previewCacheDel(p);
-        if (this.selected === p) { this.selected = ""; this.previewMode = ""; }
-      }
+      await this._dropPreviewPathsUnder(okPaths);
       this.trash.count += okPaths.length;
       this.clearTreeSelection();
       await this.reloadTree();
@@ -11286,6 +11550,7 @@ function portal() {
       }
     },
     async _sendToTrash(path) {
+      if (!this._canRemovePreviewPaths([path])) return;
       const name = path.split("/").pop() || path;
       let r;
       try {
@@ -11298,9 +11563,7 @@ function portal() {
       if (!r.ok) {
         // 404 = already gone — refresh instead of erroring (see doDelete).
         if (r.status === 404) {
-          this.tabs = this.tabs.filter(t => t.path !== path);
-          this._previewCacheDel(path);
-          if (this.selected === path) { this.selected = ""; this.previewMode = ""; }
+          await this._dropPreviewPathsUnder([path]);
           await this.reloadTree();
           const zh = this.lang === "zh";
           this.toast(zh ? `${name} 已不存在，已刷新列表` : `${name} no longer exists — refreshed`, "info", 2500);
@@ -11311,9 +11574,7 @@ function portal() {
       }
       let data = {};
       try { data = await r.json(); } catch (_) {}
-      this.tabs = this.tabs.filter(t => t.path !== path);
-      this._previewCacheDel(path);
-      if (this.selected === path) { this.selected = ""; this.previewMode = ""; }
+      await this._dropPreviewPathsUnder([path]);
       // In-place removal — see _removeNodeFromTree for rationale.
       this._removeNodeFromTree(path);
       this.trash.count += 1;
@@ -11351,11 +11612,12 @@ function portal() {
     // a "loading" state even for a file already shown moments ago. This LRU
     // caches the parsed/rendered preview for md / text / xlsx so a tab switch
     // back is synchronous (no fetch, no loading flash). Bounded by entry count
-    // and per-entry body size so it can't hoard memory on huge files. csv is
+    // and a total byte budget so it can't hoard memory on huge workbooks. csv is
     // paginated (stateful) and html/img/pdf are URL-based (already instant), so
     // neither is cached. Invalidated on edit-save / reload / external write.
     PREVIEW_CACHE_MAX_ENTRIES: 16,
     PREVIEW_CACHE_MAX_CHARS: 512 * 1024,   // skip caching bodies larger than this
+    PREVIEW_CACHE_MAX_BYTES: 8 * 1024 * 1024,
     LARGE_MD_DEFER_CHARS: 200 * 1024,      // above this, render md off the click frame
     _previewCacheGet(path) {
       if (!this._previewCache || !path) return null;
@@ -11369,14 +11631,65 @@ function portal() {
     _previewCacheSet(path, entry) {
       if (!path || !entry) return;
       if (!this._previewCache) this._previewCache = new Map();
+      if (!Number.isFinite(this._previewCacheBytes)) this._previewCacheBytes = 0;
+      const old = this._previewCache.get(path);
+      if (old) this._previewCacheBytes -= old._cacheBytes || 0;
       this._previewCache.delete(path);
-      this._previewCache.set(path, entry);
-      while (this._previewCache.size > this.PREVIEW_CACHE_MAX_ENTRIES) {
-        this._previewCache.delete(this._previewCache.keys().next().value);
+      const bytes = this._previewCacheEntryBytes(entry);
+      // A single large xlsx response can be several megabytes even though it
+      // is row-capped server-side. Do not let one entry evict everything and
+      // remain as an over-budget cache by itself.
+      if (bytes > this.PREVIEW_CACHE_MAX_BYTES) return;
+      const stored = { ...entry, _cacheBytes: bytes };
+      this._previewCache.set(path, stored);
+      this._previewCacheBytes += bytes;
+      while (this._previewCache.size > this.PREVIEW_CACHE_MAX_ENTRIES
+             || this._previewCacheBytes > this.PREVIEW_CACHE_MAX_BYTES) {
+        const oldest = this._previewCache.keys().next().value;
+        const evicted = this._previewCache.get(oldest);
+        this._previewCache.delete(oldest);
+        this._previewCacheBytes -= (evicted && evicted._cacheBytes) || 0;
       }
+      this._previewCacheBytes = Math.max(0, this._previewCacheBytes);
+    },
+    _previewCacheEntryBytes(entry) {
+      // Iterative, allocation-light estimate. Avoid JSON.stringify here: a
+      // large workbook would briefly allocate a second giant string merely
+      // to decide that it should not be cached.
+      let bytes = 0;
+      const stack = [entry];
+      const seen = new Set();
+      while (stack.length) {
+        const value = stack.pop();
+        if (typeof value === "string") {
+          bytes += value.length * 2;
+        } else if (typeof value === "number" || typeof value === "boolean") {
+          bytes += 8;
+        } else if (value && typeof value === "object" && !seen.has(value)) {
+          seen.add(value);
+          if (Array.isArray(value)) {
+            bytes += value.length * 8;
+            for (const item of value) stack.push(item);
+          } else {
+            for (const [key, item] of Object.entries(value)) {
+              if (key === "_cacheBytes") continue;
+              bytes += key.length * 2 + 8;
+              stack.push(item);
+            }
+          }
+        }
+        if (bytes > this.PREVIEW_CACHE_MAX_BYTES) return bytes;
+      }
+      return bytes;
     },
     _previewCacheDel(path) {
-      if (this._previewCache && path) this._previewCache.delete(path);
+      if (!this._previewCache || !path) return;
+      const old = this._previewCache.get(path);
+      if (old && Number.isFinite(this._previewCacheBytes)) {
+        this._previewCacheBytes = Math.max(0,
+          this._previewCacheBytes - (old._cacheBytes || 0));
+      }
+      this._previewCache.delete(path);
     },
     // Restore preview-pane reactive state from a cache entry; mirrors the
     // post-fetch assignments in openFile's per-mode branches.
@@ -11435,12 +11748,27 @@ function portal() {
     // A 404 means the file is gone, so we also drop the phantom tab openFile
     // optimistically created (otherwise a dead, un-openable tab lingers and
     // the user has to × it by hand). closeTab() re-selects an adjacent tab.
-    async _previewFail(r, path) {
+    async _previewFail(r, path, loadSeq = this._previewLoadSeq) {
       const reason = await this._readFailReason(r);
+      if (loadSeq !== this._previewLoadSeq || this.selected !== path) return;
       this.errToast("read", reason.hint || reason.title);
       if (reason.status === 404) { this.closeTab(path); return; }
       this.previewError = reason;
       this.previewMode = "unsupported";
+    },
+    _previewNetworkFail(error, path, loadSeq) {
+      if (loadSeq !== this._previewLoadSeq || this.selected !== path) return;
+      const zh = this.lang === "zh";
+      const detail = String((error && error.message) || error || "");
+      this.previewError = {
+        status: 0,
+        title: zh ? "网络连接失败" : "Network error",
+        hint: zh ? "无法读取文件，请检查连接后重试。"
+                 : "Could not read the file. Check your connection and retry.",
+        detail,
+      };
+      this.previewMode = "unsupported";
+      this.toast(this.previewError.hint, "error", 3500);
     },
     // ----- Find in preview (magnifier) ----------------------------------
     // The live container whose DOM text we search/highlight. Only the two
@@ -11470,6 +11798,7 @@ function portal() {
       this.previewFind.active = -1;
       this.previewFind.count = 0;
       this.previewFind.listOpen = false;
+      this.previewFind.truncated = false;
     },
     // Unwrap every <mark class="find-hit"> we injected, restoring the original
     // text so a re-run (or close) leaves the DOM exactly as the renderer left
@@ -11502,6 +11831,7 @@ function portal() {
       this.previewFind.matches = [];
       this.previewFind.active = -1;
       this.previewFind.count = 0;
+      this.previewFind.truncated = false;
       const q = this.previewFind.query || "";
       if (!q) return;
       const container = this._previewFindContainer();
@@ -11527,8 +11857,18 @@ function portal() {
         const lower = text.toLowerCase();
         const starts = [];
         let idx = 0, from = 0;
-        while ((idx = lower.indexOf(needle, from)) !== -1) { starts.push(idx); from = idx + needle.length; }
-        if (!starts.length) continue;
+        while ((idx = lower.indexOf(needle, from)) !== -1) {
+          if (matches.length + starts.length >= this.PREVIEW_FIND_MAX_MATCHES) {
+            this.previewFind.truncated = true;
+            break;
+          }
+          starts.push(idx);
+          from = idx + needle.length;
+        }
+        if (!starts.length) {
+          if (this.previewFind.truncated) break;
+          continue;
+        }
         const frag = document.createDocumentFragment();
         let cursor = 0;
         for (const s of starts) {
@@ -11543,6 +11883,7 @@ function portal() {
         }
         if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
         tn.parentNode.replaceChild(frag, tn);
+        if (this.previewFind.truncated) break;
       }
       this._pfEls = els;
       this.previewFind.matches = matches;
@@ -11564,13 +11905,37 @@ function portal() {
     previewFindNext() { if (this._pfEls.length) this.previewFindGoto(this.previewFind.active + 1); },
     previewFindPrev() { if (this._pfEls.length) this.previewFindGoto(this.previewFind.active - 1); },
     async openFile(n, opts = {}) {
-      // Unsaved-edits guard: switching to a DIFFERENT file while the editor
-      // is dirty would silently drop the changes. Confirm first; abort the
-      // switch if the user cancels. Re-opening the same path is a no-op for
-      // dirtiness (we'd just re-enter the same buffer), so skip the prompt.
-      if (this.editing && n && n.path !== this.selected && !this._confirmLoseEdits()) {
-        return;
+      if (!n || !n.path) return false;
+      // Clicking / double-clicking the file that already owns the editor is a
+      // focus or pin gesture, not a request to throw the buffer away and read
+      // it again. The old path guard only prompted for a *different* file, but
+      // then unconditionally set editing=false below — so one innocent repeat
+      // click silently discarded dirty text. Explicit force-reload is the one
+      // same-path operation that is allowed to replace the buffer.
+      if (this.editing && n.path === this.selected && !opts.forceReload) {
+        if (!opts.preview) this.pinTab(n.path);
+        this.treeFocusPath = n.path;
+        return true;
       }
+      // Unsaved-edits guard: switching to a DIFFERENT file while the editor
+      // is dirty, or explicitly force-reloading the current one, would replace
+      // the buffer. Confirm first; reloadPreview can pass the confirmation it
+      // already obtained so the user never sees the same dialog twice.
+      if (this.editing && !opts.editsConfirmed && !this._confirmLoseEdits()) {
+        return false;
+      }
+      // A preview has one owner: the latest open request. Abort the old
+      // transport as well as invalidating its sequence so a slow A response
+      // cannot land under B's header (and so mobile radios stop doing wasted
+      // work after a rapid tab switch).
+      if (this._previewAbort) this._previewAbort.abort();
+      this._previewAbort = null;
+      const loadSeq = ++this._previewLoadSeq;
+      if (this._csvAbort) this._csvAbort.abort();
+      this._csvAbort = null;
+      ++this._csvLoadSeq;
+      this.csvLoading = false;
+      this.csvPath = "";
       // Switching to a different file invalidates any open find session — the
       // old file's <mark> nodes get blown away by the new x-html/x-text render
       // anyway, so drop the find UI + state cleanly.
@@ -11618,8 +11983,12 @@ function portal() {
           this.tabs = [...this.tabs, { path: n.path, name, preview: false }];
         }
       }
-      this.selected = n.path;
+      // Tear down CodeMirror while it still belongs to the old path. Updating
+      // selected first makes the selected watcher briefly mount a fresh editor
+      // for the new file, only for the editing watcher to tear it down again.
       this.editing = false;
+      this.selected = n.path;
+      this.treeFocusPath = n.path;
       // Persist preview-pane state so a refresh restores tabs + selected.
       this._scheduleSavePrefs();
       // Mobile: opening a file should jump to the preview pane (otherwise
@@ -11633,16 +12002,20 @@ function portal() {
       this.$nextTick(() => this._scrollPreviewSelectedIntoView());
       // Cache hit: serve a previously-loaded md/text/xlsx body synchronously —
       // no fetch, no "loading" flash. Invalidated on edit/reload/external write.
-      const cachedPrev = this._previewCacheGet(n.path);
+      const needsDiskReload = this._previewNeedsReload === n.path;
+      const cachedPrev = (opts.forceReload || needsDiskReload)
+        ? null : this._previewCacheGet(n.path);
       if (cachedPrev) {
         // Paint the active-tab marker before rebuilding a potentially large
         // cached markdown/text DOM.
         const cachedPath = n.path;
         this.previewMode = "loading";
         requestAnimationFrame(() => {
-          if (this.selected === cachedPath) this._applyPreviewCache(cachedPrev);
+          if (this.selected === cachedPath && loadSeq === this._previewLoadSeq) {
+            this._applyPreviewCache(cachedPrev);
+          }
         });
-        return;
+        return true;
       }
       // Clear the previous file's preview data and surface a loading
       // indicator. Without this, switching from a 10MB markdown file to
@@ -11662,18 +12035,24 @@ function portal() {
       // the target now; `_stale()` checks it after every await — a stale
       // response is silently dropped (B's own open owns the pane).
       const targetPath = n.path;
-      const _stale = () => this.selected !== targetPath;
+      const _stale = () => this.selected !== targetPath
+        || loadSeq !== this._previewLoadSeq;
+      const controller = new AbortController();
+      this._previewAbort = controller;
       const ext = name.split(".").pop().toLowerCase();
+      let loadOk = true;
+      try {
       if (["md", "markdown"].includes(ext)) {
         // Stay in "loading" until content actually arrives — renderMd() flips
         // it to "md" once rawText is set. Setting it early would briefly show
         // the empty-file placeholder (previewMode==='md' && !rawText) during
         // the in-flight fetch. Failures route through _previewFail().
-        const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path), { headers: this.hdr() });
-        if (_stale()) return;
+        const r = await fetch("/api/files/read?path=" + encodeURIComponent(n.path),
+                              { headers: this.hdr(), signal: controller.signal });
+        if (_stale()) return false;
         if (r.ok) {
           const body = await r.text();
-          if (_stale()) return;
+          if (_stale()) return false;
           this.rawText = body;
           // For large markdown the synchronous markdown-it + sanitize pass can
           // block the main thread long enough to make the click feel frozen
@@ -11681,19 +12060,19 @@ function portal() {
           // next animation frame. The `selected` guard aborts the deferred
           // render if the user switched tabs while it was pending.
           const renderMd = () => {
-            if (this.selected !== targetPath) return;   // switched away mid-defer
-            this.renderedMd = this._renderPreviewMd(this.rawText);
+            if (_stale()) return;   // switched away mid-defer
+            this.renderedMd = this._renderPreviewMd(body);
             this.previewMode = "md";
-            if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-              this._previewCacheSet(targetPath, { mode: "md", rawText: this.rawText, renderedMd: this.renderedMd });
+            if (body.length <= this.PREVIEW_CACHE_MAX_CHARS) {
+              this._previewCacheSet(targetPath, { mode: "md", rawText: body, renderedMd: this.renderedMd });
             }
             // Avoid a second all-code-block walk (and parser cold-load) on
             // very large files. Fenced code remains readable without colors.
-            if (this.rawText.length <= this.LARGE_MD_DEFER_CHARS) {
+            if (body.length <= this.LARGE_MD_DEFER_CHARS) {
               this.$nextTick(() => this.highlightCode(".markdown"));
             }
           };
-          if (this.rawText.length > this.LARGE_MD_DEFER_CHARS) {
+          if (body.length > this.LARGE_MD_DEFER_CHARS) {
             this.previewMode = "loading";
             requestAnimationFrame(() => requestAnimationFrame(renderMd));
           } else {
@@ -11702,24 +12081,25 @@ function portal() {
         } else {
           // Failed read left previewMode="md" with empty rawText → blank white
           // pane. Surface a status-aware reason (404 drops the phantom tab).
-          await this._previewFail(r, n.path);
+          await this._previewFail(r, n.path, loadSeq);
+          loadOk = false;
         }
       } else if (["html", "htm"].includes(ext)) {
         // Render via sandboxed iframe (backend sends strict CSP + sandbox token).
         this.previewMode = "html";
       }
-      else if (["png", "jpg", "jpeg", "gif", "webp", "ico", "bmp"].includes(ext)) this.previewMode = "img";
+      else if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"].includes(ext)) this.previewMode = "img";
       else if (ext === "pdf") this.previewMode = "pdf";
       else if (["xlsx", "xlsm", "xltx", "xltm"].includes(ext)) {
         // xlsx preview: backend serializes the workbook into capped per-sheet
         // string matrices so the frontend just renders <table>s. No formula
         // evaluation; cells show the last-cached value.
         const r = await fetch("/api/files/xlsx?path=" + encodeURIComponent(n.path),
-                              { headers: this.hdr() });
-        if (_stale()) return;
+                              { headers: this.hdr(), signal: controller.signal });
+        if (_stale()) return false;
         if (r.ok) {
           const data = await r.json();
-          if (_stale()) return;
+          if (_stale()) return false;
           this.previewMode = "xlsx";
           this.xlsxSheets = data.sheets || [];
           this.xlsxActive = (this.xlsxSheets[0] && this.xlsxSheets[0].name) || "";
@@ -11730,7 +12110,8 @@ function portal() {
             xlsxLimits: this.xlsxLimits, xlsxSheetsTruncated: this.xlsxSheetsTruncated,
           });
         } else {
-          await this._previewFail(r, n.path);
+          await this._previewFail(r, n.path, loadSeq);
+          loadOk = false;
         }
       }
       else if (["csv", "tsv"].includes(ext)) {
@@ -11738,10 +12119,9 @@ function portal() {
         // file doesn't blow the browser. First page only here; "next page"
         // button is wired through csvLoadPage().
         this.csvPath = n.path;
-        this.csvOffset = 0;
-        await this.csvLoadPage();
-        if (_stale()) return;
-        if (this.csvData) {
+        const csvOk = await this.csvLoadPage(0);
+        if (_stale()) return false;
+        if (csvOk && this.csvData) {
           this.previewMode = "csv";
         } else {
           // csvLoadPage() already toasted the failure; give the empty state a
@@ -11752,20 +12132,21 @@ function portal() {
             hint:  this.lang === "zh" ? "无法解析该 CSV 文件。" : "Could not parse this CSV file.",
           };
           this.previewMode = "unsupported";
+          loadOk = false;
         }
       }
       else {
         const r = await fetch(
           "/api/files/read?path=" + encodeURIComponent(n.path),
-          { headers: this.hdr() },
+          { headers: this.hdr(), signal: controller.signal },
         );
-        if (_stale()) return;
+        if (_stale()) return false;
         if (r.ok) {
           // Read body BEFORE flipping previewMode → text, otherwise the
           // empty-file placeholder (previewMode==='text' && !rawText) flashes
           // during the await on a non-empty file.
           const body = await r.text();
-          if (_stale()) return;
+          if (_stale()) return false;
           this.rawText = body;
           this.previewMode = "text";
           this.previewLang = this.hljsLang(n.path);
@@ -11778,49 +12159,80 @@ function portal() {
             this.highlightCode(".text");
           });
         }
-        else await this._previewFail(r, n.path);
+        else {
+          await this._previewFail(r, n.path, loadSeq);
+          loadOk = false;
+        }
       }
+      } catch (e) {
+        if ((e && e.name === "AbortError") || _stale()) return false;
+        this._previewNetworkFail(e, targetPath, loadSeq);
+        return false;
+      } finally {
+        if (loadSeq === this._previewLoadSeq && this._previewAbort === controller) {
+          this._previewAbort = null;
+        }
+      }
+      if (loadOk && this.selected === targetPath && loadSeq === this._previewLoadSeq
+          && this._previewNeedsReload === targetPath) {
+        this._previewNeedsReload = "";
+      }
+      return loadOk;
     },
-    async csvLoadPage() {
-      if (!this.csvPath || this.csvLoading) return;
+    async csvLoadPage(requestedOffset = this.csvOffset) {
+      if (!this.csvPath) return false;
+      // A newly-opened CSV must supersede an older in-flight CSV instead of
+      // being rejected by a global `csvLoading` flag. This was the rapid
+      // A.csv → B.csv blank-preview bug.
+      if (this._csvAbort) this._csvAbort.abort();
+      const controller = new AbortController();
+      this._csvAbort = controller;
+      const loadSeq = ++this._csvLoadSeq;
       this.csvLoading = true;
-      // Snapshot the request identity — by the time the response lands the
-      // user may have opened a DIFFERENT csv (openFile resets csvPath) or
-      // paged again. Writing a stale response into csvData would show the
-      // old file / old offset's rows under the new header.
       const reqPath = this.csvPath;
-      const reqOffset = this.csvOffset;
-      const _csvStale = () =>
-        this.csvPath !== reqPath || this.csvOffset !== reqOffset;
+      const reqOffset = Math.max(0, Number(requestedOffset) || 0);
+      const _csvStale = () => loadSeq !== this._csvLoadSeq
+        || this.csvPath !== reqPath || this.selected !== reqPath;
       try {
         const url = `/api/files/csv?path=${encodeURIComponent(reqPath)}`
                     + `&offset=${reqOffset}&limit=${this.csvLimit}`;
-        const r = await fetch(url, { headers: this.hdr() });
-        if (_csvStale()) return;
+        const r = await fetch(url, { headers: this.hdr(), signal: controller.signal });
+        if (_csvStale()) return false;
         if (r.ok) {
           const data = await r.json();
-          if (_csvStale()) return;
+          if (_csvStale()) return false;
+          // Commit the page number only after the page itself arrived. A
+          // failed Next therefore leaves the last good range and rows intact.
+          this.csvOffset = reqOffset;
           this.csvData = data;
+          return true;
         } else {
-          this.csvData = null;
           this.toast(this.lang === "zh" ? "CSV 解析失败" : "CSV parse failed",
                       "error", 3000);
+          return false;
         }
+      } catch (e) {
+        if ((e && e.name === "AbortError") || _csvStale()) return false;
+        this.toast(this.lang === "zh"
+          ? "CSV 加载失败，请检查网络后重试"
+          : "CSV load failed. Check your connection and retry.", "error", 3500);
+        return false;
       } finally {
-        this.csvLoading = false;
+        if (loadSeq === this._csvLoadSeq) {
+          this.csvLoading = false;
+          if (this._csvAbort === controller) this._csvAbort = null;
+        }
       }
     },
     csvNextPage() {
-      if (!this.csvData) return;
+      if (!this.csvData || this.csvLoading) return;
       const next = this.csvOffset + this.csvLimit;
       if (next >= (this.csvData.total_rows || 0)) return;
-      this.csvOffset = next;
-      this.csvLoadPage();
+      this.csvLoadPage(next);
     },
     csvPrevPage() {
-      if (this.csvOffset <= 0) return;
-      this.csvOffset = Math.max(0, this.csvOffset - this.csvLimit);
-      this.csvLoadPage();
+      if (this.csvOffset <= 0 || this.csvLoading) return;
+      this.csvLoadPage(Math.max(0, this.csvOffset - this.csvLimit));
     },
     csvWindowEnd() {
       if (!this.csvData) return 0;
@@ -11866,15 +12278,15 @@ function portal() {
     async openByPath(path) { await this.openFile({ path, name: path.split("/").pop() }); },
 
     async switchTab(path) {
-      if (!path || path === this.selected) return;
+      if (!path || path === this.selected) return true;
       // 不再 push（已在 tabs 里），只是切换 selected 并重新加载内容。
       // Preserve the tab's preview/pinned state: a single-click to view a
       // preview tab must NOT pin it (only a double-click / edit does). Pass
       // the tab's current preview flag so openFile's "existing" branch leaves
       // it untouched.
       const cur = this.tabs.find(t => t.path === path);
-      await this.openFile({ path, name: path.split("/").pop() },
-                          { preview: !!(cur && cur.preview) });
+      return await this.openFile({ path, name: path.split("/").pop() },
+                                 { preview: !!(cur && cur.preview) });
     },
     async revealInTree(path, opts = {}) {
       // Make the file's row visible in the tree pane and flash it so the
@@ -11943,7 +12355,7 @@ function portal() {
       if (idx < 0) return;
       // Closing the tab being edited would discard unsaved changes — confirm.
       if (this.editing && path === this.selected && !this._confirmLoseEdits()) return;
-      this.tabs.splice(idx, 1);
+      this.tabs = this.tabs.filter(t => t.path !== path);
       if (this.selected === path) {
         // 关掉的是当前 tab，切到旁边
         if (this.tabs.length === 0) {
@@ -11964,13 +12376,48 @@ function portal() {
     // preview pane keeps showing the last file's content because rawText/
     // renderedMd were never cleared (2026-05-23 user feedback).
     _clearPreviewState() {
+      if (this._previewAbort) this._previewAbort.abort();
+      if (this._csvAbort) this._csvAbort.abort();
+      this._previewAbort = null;
+      this._csvAbort = null;
+      ++this._previewLoadSeq;
+      ++this._csvLoadSeq;
+      if (this.previewFind.open || this._pfEls.length) this.closePreviewFind();
+      // Set editing first: the selected watcher remounts CodeMirror whenever
+      // the path changes *while* editing. Clearing selected in the opposite
+      // order caused a pointless mount against an empty path before unmount.
+      this.editing = false;
       this.selected = "";
+      this.treeFocusPath = "";
       this.previewMode = "";
       this.previewError = null;
       this.rawText = "";
       this.renderedMd = "";
-      this.editing = false;
+      this.xlsxSheets = [];
+      this.xlsxActive = "";
+      this.xlsxLimits = null;
+      this.xlsxSheetsTruncated = false;
+      this.csvPath = "";
+      this.csvData = null;
+      this.csvOffset = 0;
+      this.csvLoading = false;
+      this.editText = "";
+      this.livePreviewHtml = "";
+      this.editorIsMd = false;
+      this.cmStatus = { ...this.cmStatus, dirty: false };
+      this._previewNeedsReload = "";
       this.selectedMeta = null;
+    },
+    onPreviewImageError() {
+      if (!this.selected || this.previewMode !== "img") return;
+      this.previewError = {
+        status: 0,
+        title: this.lang === "zh" ? "图片无法显示" : "Image could not be displayed",
+        hint: this.lang === "zh"
+          ? "文件可能已移动、网络中断，或图片格式已损坏。请刷新后重试。"
+          : "The file may have moved, the connection failed, or the image is invalid. Try reloading.",
+      };
+      this.previewMode = "unsupported";
     },
     // Fetch on-disk metadata (mtime / size) for the preview-header strip.
     // Guarded against races: by the time the await resolves the user may have
@@ -12019,46 +12466,27 @@ function portal() {
       // read endpoint for md / text. Useful when the file changed outside
       // muselab's normal write paths (terminal git pull, external editor).
       if (!this.selected) return;
+      if (this.editing && !this._confirmLoseEdits()) return;
+      const path = this.selected;
+      const tab = this.tabs.find(t => t.path === path);
       // Re-render replaces the content nodes our find marks live in; close the
       // find session so it doesn't dangle on detached <mark> elements.
       if (this.previewFind.open) this.closePreviewFind();
       this.previewVersion = Date.now();
       // File content changed underneath us — drop any stale cached body so a
       // later tab switch back re-fetches instead of serving the old render.
-      this._previewCacheDel(this.selected);
-      if (this.previewMode === "md" || this.previewMode === "text") {
-        const url = "/api/files/read?path=" + encodeURIComponent(this.selected)
-                     + "&_v=" + this.previewVersion;
-        try {
-          const r = await fetch(url, { headers: this.hdr() });
-          if (r.ok) {
-            this.rawText = await r.text();
-            if (this.previewMode === "md") {
-              this.renderedMd = this._renderPreviewMd(this.rawText);
-              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-                this._previewCacheSet(this.selected, {
-                  mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
-                });
-              }
-              this.$nextTick(() => this.highlightCode(".markdown"));
-            } else {
-              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-                this._previewCacheSet(this.selected, {
-                  mode: "text", rawText: this.rawText, previewLang: this.previewLang,
-                });
-              }
-              this.$nextTick(() => {
-                document.querySelectorAll(".text code")
-                  .forEach(el => { delete el.dataset.hl; });
-                this.highlightCode(".text");
-              });
-            }
-          }
-        } catch (_e) { /* network blip */ }
-      }
+      this._previewCacheDel(path);
+      // Route every type through the same owner-safe loader. The old manual
+      // implementation only refreshed md/text while claiming success for
+      // CSV/XLSX, and a late response could overwrite a newly-selected file.
+      const ok = await this.openFile(
+        { path, name: path.split("/").pop() },
+        { preview: !!(tab && tab.preview), forceReload: true, editsConfirmed: true },
+      );
+      if (!ok || this.selected !== path) return;
       // mtime almost certainly changed if the reload was triggered by an
       // external edit — refresh the header strip too.
-      this.loadSelectedMeta(this.selected);
+      this.loadSelectedMeta(path);
       this.toast(this.lang === "zh" ? "已刷新预览" : "Preview reloaded",
                   "success", 1200);
     },
@@ -12094,7 +12522,8 @@ function portal() {
       // acceptable (we'd over-refresh, which is harmless) vs missing a real
       // hit by being too strict on path normalization.
       if (!this.selected || !toolFilePath) return;
-      const selBase = this.selected.split("/").pop();
+      const path = this.selected;
+      const selBase = path.split("/").pop();
       const toolBase = toolFilePath.split("/").pop();
       if (selBase !== toolBase) return;
       // Same basename → cache-bust. For html/img/pdf/iframe the new
@@ -12102,39 +12531,23 @@ function portal() {
       // also need to re-fetch since rawText is cached in the component.
       this.previewVersion = Date.now();
       // An external/tool write invalidated the cached body — drop it.
-      this._previewCacheDel(this.selected);
-      if (this.previewMode === "md" || this.previewMode === "text") {
-        const url = "/api/files/read?path=" + encodeURIComponent(this.selected)
-                     + "&_v=" + this.previewVersion;
-        try {
-          const r = await fetch(url, { headers: this.hdr() });
-          if (r.ok) {
-            this.rawText = await r.text();
-            if (this.previewMode === "md") {
-              this.renderedMd = this._renderPreviewMd(this.rawText);
-              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-                this._previewCacheSet(this.selected, {
-                  mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
-                });
-              }
-              this.$nextTick(() => this.highlightCode(".markdown"));
-            } else {
-              if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-                this._previewCacheSet(this.selected, {
-                  mode: "text", rawText: this.rawText, previewLang: this.previewLang,
-                });
-              }
-              this.$nextTick(() => {
-                document.querySelectorAll(".text code")
-                  .forEach(el => { delete el.dataset.hl; });
-                this.highlightCode(".text");
-              });
-            }
-          }
-        } catch (e) { /* network blip — manual refresh still possible */ }
+      this._previewCacheDel(path);
+      // Never overwrite an editor buffer after a tool write. Keeping the
+      // user's local text is safer; metadata still updates and the next
+      // explicit reload will reconcile the disk version.
+      if (this.editing) {
+        this._previewNeedsReload = path;
+        this.loadSelectedMeta(path);
+        return;
       }
+      const tab = this.tabs.find(t => t.path === path);
+      await this.openFile(
+        { path, name: path.split("/").pop() },
+        { preview: !!(tab && tab.preview), forceReload: true },
+      );
+      if (this.selected !== path) return;
       // A tool just wrote this file → its mtime moved; refresh the strip.
-      this.loadSelectedMeta(this.selected);
+      this.loadSelectedMeta(path);
     },
     downloadUrl(p) { return "/api/files/download?path=" + encodeURIComponent(p) + "&token=" + encodeURIComponent(this.token); },
 
@@ -13000,6 +13413,9 @@ function portal() {
     // ===== search =====
     async doSearch() {
       const q = this.searchQ.trim();
+      if (this._fileSearchAbort) this._fileSearchAbort.abort();
+      this._fileSearchAbort = null;
+      const searchSeq = ++this._fileSearchSeq;
       if (q.length < 2) {
         // Don't full clearSearch() here — that resets `searchQ = ""` and
         // breaks IME composition on mobile (observed 2026-05-28 on iOS
@@ -13018,17 +13434,46 @@ function portal() {
       }
       this.searchMode = true;
       this.searching = true;
-      const [a, b] = await Promise.all([
-        fetch("/api/files/search?q=" + encodeURIComponent(q), { headers: this.hdr() }).then(r => r.ok ? r.json() : { entries: [] }),
-        fetch("/api/files/grep?q=" + encodeURIComponent(q), { headers: this.hdr() }).then(r => r.ok ? r.json() : { hits: [] }),
-      ]);
-      this.searchHits = a.entries || [];
-      this.searchTruncated = !!a.truncated;
-      this.grepHits = b.hits || [];
-      this.grepTruncated = !!b.truncated;
-      this.searching = false;
+      const controller = new AbortController();
+      this._fileSearchAbort = controller;
+      const readJson = async (url) => {
+        const r = await fetch(url, { headers: this.hdr(), signal: controller.signal });
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.json();
+      };
+      try {
+        // Let filename and content search fail independently. A permission
+        // error in grep should not hide perfectly-good filename matches.
+        const [names, content] = await Promise.allSettled([
+          readJson("/api/files/search?q=" + encodeURIComponent(q)),
+          readJson("/api/files/grep?q=" + encodeURIComponent(q)),
+        ]);
+        if (searchSeq !== this._fileSearchSeq || this.searchQ.trim() !== q) return;
+        const a = names.status === "fulfilled" ? names.value : null;
+        const b = content.status === "fulfilled" ? content.value : null;
+        this.searchHits = (a && a.entries) || [];
+        this.searchTruncated = !!(a && a.truncated);
+        this.grepHits = (b && b.hits) || [];
+        this.grepTruncated = !!(b && b.truncated);
+        if (!a && !b) {
+          this.toast(this.lang === "zh" ? "文件搜索失败" : "File search failed",
+                     "error", 3500);
+        } else if (!a || !b) {
+          this.toast(this.lang === "zh"
+            ? "部分搜索结果暂时不可用" : "Some search results are unavailable",
+            "warn", 2500);
+        }
+      } finally {
+        if (searchSeq === this._fileSearchSeq) {
+          this.searching = false;
+          if (this._fileSearchAbort === controller) this._fileSearchAbort = null;
+        }
+      }
     },
     clearSearch() {
+      if (this._fileSearchAbort) this._fileSearchAbort.abort();
+      this._fileSearchAbort = null;
+      ++this._fileSearchSeq;
       this.searchQ = ""; this.searchMode = false; this.searching = false;
       this.searchHits = []; this.grepHits = []; this.searchTruncated = false; this.grepTruncated = false;
     },
@@ -13054,12 +13499,18 @@ function portal() {
       // the upload button silently uploaded just the first one.
       const files = Array.from(ev.target.files || []);
       if (!files.length) return;
+      const uploadContext = this._prepareUploadOverwrite("", files);
+      if (!uploadContext) {
+        ev.target.value = "";
+        return;
+      }
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet("", f))
       );
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
-      this.reloadTree();
+      await this.reloadTree();
+      await this._syncUploadedFiles(results, uploadContext);
       if (failed && !ok) {
         this.toast(this.lang === "zh"
           ? `${failed} 个文件上传失败`
@@ -13080,17 +13531,30 @@ function portal() {
       ev.target.value = "";
     },
     async uploadFileTo(dirPath, file) {
+      const uploadContext = this._prepareUploadOverwrite(dirPath, [file]);
+      if (!uploadContext) return;
       const fd = new FormData();
       fd.append("path", dirPath);
       fd.append("file", file);
       let r;
       try {
         r = await fetch("/api/files/upload", { method: "POST", headers: this.hdr(), body: fd });
-      } catch (e) { this.errToast("upload", String((e && e.message) || e)); return; }
+      } catch (e) {
+        this.errToast("upload", String((e && e.message) || e));
+        return;
+      }
       if (r.ok) {
         delete this.childCache[dirPath];
-        this.reloadTree();
         const data = await r.json().catch(() => ({}));
+        await this._refreshParentInTree(
+          data.path || (dirPath ? `${dirPath}/${file.name}` : file.name));
+        await this._syncUploadedFiles([{
+          status: "fulfilled",
+          value: {
+            path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
+            replaced_trash_id: data.replaced_trash_id || null,
+          },
+        }], uploadContext);
         // Backend trashes any same-name file it replaced; tell the user so a
         // silent overwrite isn't mistaken for a clean upload.
         if (data.replaced_trash_id) {
@@ -13098,7 +13562,9 @@ function portal() {
         } else {
           this.toast(this.t("toast.uploaded_to", { name: file.name, dir: dirPath || "" }), "success");
         }
-      } else this.errToast("upload", await r.text());
+      } else {
+        this.errToast("upload", await r.text());
+      }
     },
     // Custom MIME so tree-internal drags don't collide with OS file drops.
     // Reading getData with this type during dragover would force a stale
@@ -13256,12 +13722,17 @@ function portal() {
     // multi-file drop doesn't serialize.
     async _uploadFilesToDir(targetDir, files) {
       if (!files.length) return;
+      const uploadContext = this._prepareUploadOverwrite(targetDir, files);
+      if (!uploadContext) return;
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet(targetDir, f))
       );
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
-      this.reloadTree();
+      const firstUploaded = results.find(r =>
+        r.status === "fulfilled" && r.value && r.value.path);
+      if (firstUploaded) await this._refreshParentInTree(firstUploaded.value.path);
+      await this._syncUploadedFiles(results, uploadContext);
       const intoLabel = targetDir ? `/${targetDir}` : "/";
       if (failed && !ok) {
         this.toast(this.lang === "zh"
@@ -13330,11 +13801,18 @@ function portal() {
         return;
       }
       const newPath = targetDir ? `${targetDir}/${srcName}` : srcName;
-      const r = await fetch("/api/files/rename", {
-        method: "POST",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ src: srcPath, dst: newPath }),
-      });
+      let r;
+      try {
+        r = await fetch("/api/files/rename", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ src: srcPath, dst: newPath }),
+        });
+      } catch (e) {
+        this.toast((this.lang === "zh" ? "移动失败：" : "Move failed: ")
+          + String((e && e.message) || e), "error", 4000);
+        return;
+      }
       if (!r.ok) {
         const err = await r.text();
         this.toast((this.lang === "zh" ? "移动失败：" : "Move failed: ") + err,
@@ -13344,12 +13822,15 @@ function portal() {
       this.toast(this.lang === "zh"
         ? `已移动到 /${targetDir || "(根)"}`
         : `Moved to /${targetDir || "(root)"}`, "success", 2000);
-      // Refresh the tree and reroute selected/preview if we just moved
-      // the currently-open file.
-      if (this.selected === srcPath) this.selected = newPath;
-      const openTab = this.tabs.find(t => t.path === srcPath);
-      if (openTab) openTab.path = newPath;
+      const activeMoved = this._remapPreviewPaths(srcPath, newPath);
       await this.reloadTree();
+      if (activeMoved && this.selected && !this.editing) {
+        const active = this.tabs.find(t => t.path === this.selected);
+        await this.openFile(
+          { path: this.selected, name: this.selected.split("/").pop() },
+          { preview: !!(active && active.preview), forceReload: true },
+        );
+      }
     },
     // Batch move: drag a multi-selection onto a folder (or the root bar).
     // Delegates to the single-item path when there's only one, so toasts /
@@ -13383,14 +13864,20 @@ function portal() {
       ));
       const okItems = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okItems.length;
-      // Reroute the active focus + any open tabs for moved items.
+      // Reroute the active focus + every descendant open tab for moved dirs.
+      let activeMoved = false;
       for (const { src, dst } of okItems) {
-        if (this.selected === src) this.selected = dst;
-        const tab = this.tabs.find(t => t.path === src);
-        if (tab) tab.path = dst;
+        activeMoved = this._remapPreviewPaths(src, dst) || activeMoved;
       }
       this.clearTreeSelection();
       await this.reloadTree();
+      if (activeMoved && this.selected && !this.editing) {
+        const active = this.tabs.find(t => t.path === this.selected);
+        await this.openFile(
+          { path: this.selected, name: this.selected.split("/").pop() },
+          { preview: !!(active && active.preview), forceReload: true },
+        );
+      }
       const zh = this.lang === "zh";
       const into = targetDir ? `/${targetDir}` : (zh ? "/(根)" : "/(root)");
       if (failed && !okItems.length) {
@@ -13411,7 +13898,7 @@ function portal() {
     async deleteSelected() {
       const paths = this._pruneDescendants(Array.from(this.selectedPaths));
       if (paths.length <= 1) {
-        const p = paths[0] || this.selected;
+        const p = paths[0] || this.treeFocusPath || this.selected;
         const node = p && this._findTreeNode(p);
         if (node) await this.doDelete(node);
         return;
@@ -13424,6 +13911,7 @@ function portal() {
         okText: zh ? "移到垃圾桶" : "Move to trash",
       });
       if (!ok) return;
+      if (!this._canRemovePreviewPaths(paths)) return;
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
           method: "DELETE",
@@ -13435,10 +13923,7 @@ function portal() {
       ));
       const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okPaths.length;
-      for (const p of okPaths) {
-        this.tabs = this.tabs.filter(t => t.path !== p);
-        if (this.selected === p) { this.selected = ""; this.previewMode = ""; }
-      }
+      await this._dropPreviewPathsUnder(okPaths);
       this.trash.count += okPaths.length;
       this.clearTreeSelection();
       await this.reloadTree();
@@ -13887,29 +14372,64 @@ function portal() {
     async toggleEdit() {
       if (this.editing) {
         if (!this._confirmLoseEdits()) return;
+        const reloadPath = this._previewNeedsReload === this.selected
+          ? this.selected : "";
         this.editing = false;
+        if (reloadPath) {
+          const tab = this.tabs.find(t => t.path === reloadPath);
+          await this.openFile(
+            { path: reloadPath, name: reloadPath.split("/").pop() },
+            { preview: !!(tab && tab.preview), forceReload: true, editsConfirmed: true },
+          );
+        }
         return;
       }
+      if (!this.selected) return;
+      const targetPath = this.selected;
+      const targetMode = this.previewMode;
+      // Entering the editor takes ownership of the file body. Cancel any
+      // preview/CSV transport and invalidate deferred markdown rendering so it
+      // cannot replace rawText after the editable buffer has been seeded.
+      if (this._previewAbort) this._previewAbort.abort();
+      this._previewAbort = null;
+      ++this._previewLoadSeq;
+      if (this._csvAbort) this._csvAbort.abort();
+      this._csvAbort = null;
+      ++this._csvLoadSeq;
+      this.csvLoading = false;
       // Entering edit mode hides the rendered .markdown/pre.text containers our
       // find marks live in — close find so it can't point at a hidden DOM.
       if (this.previewFind.open) this.closePreviewFind();
       // 进入编辑：确保 rawText 已加载（html/img/pdf 走 raw 模式时没 fetch 文本）
-      if (!this.rawText || this.previewMode === "html" || this.previewMode === "pdf" || this.previewMode === "img") {
-        const r = await fetch("/api/files/read?path=" + encodeURIComponent(this.selected), { headers: this.hdr() });
-        if (!r.ok) {
-          this.errToast("read", this.lang === "zh"
-                                  ? "可能是二进制或太大 — " + (await r.text())
-                                  : "binary or too large — " + (await r.text()));
+      if (!this.rawText || targetMode === "html" || targetMode === "pdf" || targetMode === "img") {
+        let r;
+        try {
+          r = await fetch("/api/files/read?path=" + encodeURIComponent(targetPath),
+                          { headers: this.hdr() });
+        } catch (e) {
+          if (this.selected === targetPath) this.errToast("read", String((e && e.message) || e));
           return;
         }
-        this.rawText = await r.text();
+        if (this.selected !== targetPath) return;
+        if (!r.ok) {
+          const detail = await r.text();
+          if (this.selected !== targetPath) return;
+          this.errToast("read", this.lang === "zh"
+                                  ? "可能是二进制或太大 — " + detail
+                                  : "binary or too large — " + detail);
+          return;
+        }
+        const body = await r.text();
+        if (this.selected !== targetPath) return;
+        this.rawText = body;
       }
+      if (this.selected !== targetPath) return;
       this.editText = this.rawText;
       // Live-preview setup: markdown files get the split pane; others edit
       // full-width (editorView forced to "edit" so the template hides the
       // preview + view-switch toolbar). For md, restore the persisted layout
       // choice and seed the preview HTML so it's there on first paint.
-      this.editorIsMd = this._isMdPath(this.selected);
+      this.editorIsMd = this._isMdPath(targetPath);
       if (this.editorIsMd) {
         const saved = localStorage.getItem("muselab_editor_view");
         this.editorView = (saved === "edit" || saved === "split" || saved === "preview")
@@ -13926,7 +14446,7 @@ function portal() {
       this.editing = true;
       // Editing is a deliberate commitment to the file — pin its tab so it
       // doesn't get recycled out from under the editor by the next preview.
-      this.pinTab(this.selected);
+      this.pinTab(targetPath);
     },
     async saveEdit() {
       // Ctrl/Cmd+S can enter from two places when CodeMirror has focus:
@@ -13941,13 +14461,18 @@ function portal() {
         // active; the textarea fallback (this._cm === null) keeps editText synced
         // via its input listener. Everything below (write body, post-save
         // rawText sync) reads this.editText, so refresh it first.
-        if (this._cm) this.editText = this._cm.getValue();
+        if (!this.selected) return;
+        const savePath = this.selected;
+        const saveMode = this.previewMode;
+        const saveLang = this.previewLang;
+        const saveText = this._cm ? this._cm.getValue() : this.editText;
+        this.editText = saveText;
         let r;
         try {
           r = await fetch("/api/files/write", {
             method: "PUT",
             headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ path: this.selected, content: this.editText }),
+            body: JSON.stringify({ path: savePath, content: saveText }),
           });
         } catch (e) {
           // Keep editing=true so the unsaved buffer is preserved for retry.
@@ -13955,23 +14480,37 @@ function portal() {
           return;
         }
         if (r.ok) {
-          this.rawText = this.editText;
+          this._previewCacheDel(savePath);
+          if (this._previewNeedsReload === savePath) this._previewNeedsReload = "";
+          // The user can keep typing while the request is in flight. Compare
+          // the live buffer with the exact payload that reached disk before
+          // deciding whether it is safe to close the editor.
+          const sameOwner = this.selected === savePath;
+          const liveText = sameOwner && this.editing
+            ? (this._cm ? this._cm.getValue() : this.editText)
+            : saveText;
+          const hasNewerEdits = sameOwner && liveText !== saveText;
+          if (!sameOwner) {
+            this.previewVersion = Date.now();
+            this.toast(this.t("toast.saved"), "success");
+            return;
+          }
+          this.rawText = saveText;
           // Keep the preview cache in step with the just-saved body. For md/text
           // we can refresh in place; other modes (xlsx/html/img/pdf) just drop
           // the stale entry so the next switch-back re-fetches.
-          this._previewCacheDel(this.selected);
-          if (this.previewMode === "md") {
+          if (saveMode === "md") {
             this.renderedMd = this._renderPreviewMd(this.rawText);
             if (this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-              this._previewCacheSet(this.selected, {
+              this._previewCacheSet(savePath, {
                 mode: "md", rawText: this.rawText, renderedMd: this.renderedMd,
               });
             }
             this.$nextTick(() => this.highlightCode(".markdown"));
-          } else if (this.previewMode === "text"
+          } else if (saveMode === "text"
                      && this.rawText.length <= this.PREVIEW_CACHE_MAX_CHARS) {
-            this._previewCacheSet(this.selected, {
-              mode: "text", rawText: this.rawText, previewLang: this.previewLang,
+            this._previewCacheSet(savePath, {
+              mode: "text", rawText: this.rawText, previewLang: saveLang,
             });
           }
           // Bump previewVersion so HTML / PDF / image iframes pick up the new
@@ -13980,10 +14519,19 @@ function portal() {
           // the issue was visible when editing a html report styled in dark
           // mode to light mode: editor saved, preview iframe still showed dark.
           this.previewVersion = Date.now();
-          this.editing = false;
+          if (hasNewerEdits) {
+            this.editText = liveText;
+            this.cmStatus = { ...this.cmStatus, dirty: true };
+          } else {
+            this.editText = saveText;
+            this.editing = false;
+          }
           // Saving moved the file's mtime — refresh the header strip.
-          this.loadSelectedMeta(this.selected);
-          this.toast(this.t("toast.saved"), "success");
+          this.loadSelectedMeta(savePath);
+          this.toast(hasNewerEdits
+            ? (this.lang === "zh" ? "已保存；之后输入的改动仍待保存"
+                                  : "Saved; newer edits are still unsaved")
+            : this.t("toast.saved"), "success", hasNewerEdits ? 3000 : 2000);
         } else this.errToast("save", await r.text());
       } finally {
         this._saveEditInFlight = false;
@@ -14704,6 +15252,12 @@ function portal() {
       // Otherwise let the browser handle ↑ (cursor up inside textarea).
     },
 
+    _cancelMentionLookup() {
+      if (this._mentionAbort) this._mentionAbort.abort();
+      this._mentionAbort = null;
+      ++this._mentionSeq;
+      this.mentionShow = false;
+    },
     onChatInput(ev) {
       const ta = ev.target;
       const pos = ta.selectionStart;
@@ -14720,7 +15274,7 @@ function portal() {
           this.slashShow = this.slashResults.length > 0;
           this.slashAnchor = 0;
         }
-        this.mentionShow = false;
+        this._cancelMentionLookup();
         return;
       } else {
         this.slashShow = false;
@@ -14735,14 +15289,17 @@ function portal() {
       // emails and the picker auto-hides as soon as a space is typed.
       // 2026-05-28 user request: "任何时候 @ 都弹出".
       const at = text.lastIndexOf("@");
-      if (at < 0) { this.mentionShow = false; return; }
+      if (at < 0) { this._cancelMentionLookup(); return; }
       const query = text.slice(at + 1);
-      if (/\s/.test(query)) { this.mentionShow = false; return; }
+      if (/\s/.test(query)) { this._cancelMentionLookup(); return; }
       this.mentionAnchor = at;
       clearTimeout(this._mentionDebounce);
       this._mentionDebounce = setTimeout(() => this.fetchMention(query), 200);
     },
     async fetchMention(q) {
+      if (this._mentionAbort) this._mentionAbort.abort();
+      this._mentionAbort = null;
+      const mentionSeq = ++this._mentionSeq;
       // Currently open preview tabs — surface them at the top of the picker
       // so the user can quickly @-reference whatever they're already looking
       // at. `this.tabs` is the preview-pane tab strip; each entry has
@@ -14757,7 +15314,10 @@ function portal() {
         // then a few root entries to keep the original "browse from root"
         // affordance. Dedupe so an open file at the root doesn't appear
         // twice.
-        const root = (await this.fetchChildren("")).slice(0, 8);
+        let root = [];
+        try { root = (await this.fetchChildren("")).slice(0, 8); }
+        catch (_) { /* open tabs remain useful while the tree is offline */ }
+        if (mentionSeq !== this._mentionSeq) return;
         const openPaths = new Set(openTabs.map(t => t.path));
         const rootFresh = root.filter(e => !openPaths.has(e.path));
         this.mentionResults = [...openTabs, ...rootFresh].slice(0, 12);
@@ -14771,14 +15331,27 @@ function portal() {
           (t.name || "").toLowerCase().includes(ql)
           || (t.path || "").toLowerCase().includes(ql)
         );
-        const r = await fetch("/api/files/search?q=" + encodeURIComponent(q) + "&limit=15",
-                                { headers: this.hdr() });
-        const d = r.ok ? await r.json() : { entries: [] };
+        const controller = new AbortController();
+        this._mentionAbort = controller;
+        let d = { entries: [] };
+        try {
+          const r = await fetch("/api/files/search?q=" + encodeURIComponent(q) + "&limit=15",
+                                { headers: this.hdr(), signal: controller.signal });
+          if (r.ok) d = await r.json();
+        } catch (e) {
+          if ((e && e.name === "AbortError") || mentionSeq !== this._mentionSeq) return;
+        } finally {
+          if (mentionSeq === this._mentionSeq && this._mentionAbort === controller) {
+            this._mentionAbort = null;
+          }
+        }
+        if (mentionSeq !== this._mentionSeq) return;
         const searchResults = (d.entries || []).filter(e => !e.is_dir);
         const openPaths = new Set(openMatches.map(t => t.path));
         const fresh = searchResults.filter(e => !openPaths.has(e.path));
         this.mentionResults = [...openMatches, ...fresh].slice(0, 15);
       }
+      if (mentionSeq !== this._mentionSeq) return;
       this.mentionIdx = 0;
       this.mentionShow = true;
     },
@@ -14790,7 +15363,7 @@ function portal() {
       const before = this.input.slice(0, this.mentionAnchor);
       const after = this.input.slice(ta.selectionStart);
       this.input = before + "@" + item.path + " " + after;
-      this.mentionShow = false;
+      this._cancelMentionLookup();
       this.$nextTick(() => {
         const newPos = (before + "@" + item.path + " ").length;
         ta.setSelectionRange(newPos, newPos);
@@ -15374,7 +15947,7 @@ function portal() {
           if (!this._isMobileLayout()) ta.focus();
         });
       }
-      this.mentionShow = false;
+      this._cancelMentionLookup();
       // streamSid + streamState alias the sendSid snapshot taken at function
       // entry. We KEEP the local names `streamSid` / `streamState` because
       // every downstream event handler (text / thinking / tool_use / done /

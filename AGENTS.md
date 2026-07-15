@@ -79,6 +79,9 @@ version and schema digest in the change that upgrades the protocol baseline.
   blank band). While keyboard geometry is present, reconcile its live values
   with a bounded watchdog; on close, clear both the keyboard inset and root
   viewport offset even if the textarea keeps focus and no close event arrives.
+- Anchor floating chat navigation controls to a transcript-only positioning
+  context, never to a wrapper that also contains the variable-height composer;
+  attachments, queue rows, and mobile toolbar wrapping must not cover the FABs.
 - Stable Codex thread reads do not expose `thread/resume.config`. Persist a
   user's pending next-turn effort override in the thread compatibility
   sidecar, merge it over the previous rollout's settings, and retain an
@@ -105,6 +108,11 @@ version and schema digest in the change that upgrades the protocol baseline.
 - Make background connection starters genuinely idempotent by replacing their
   global listeners as well as clearing intervals. Bound caches whose keys
   contain user searches or opaque pagination cursors.
+- Treat file-tree and preview loads as owner-scoped state: abort superseded
+  requests, re-check the path/sequence after every await, and preserve the last
+  good view on failure. Directory rename/delete is a prefix lifecycle event;
+  update descendant tabs, caches, editor ownership, tree focus, selections,
+  and clipboard paths together instead of matching only the directory itself.
 - Prefer small modules and standard-library primitives over new dependencies.
 - Keep flat-file persistence unless a concrete requirement justifies a
   database.
