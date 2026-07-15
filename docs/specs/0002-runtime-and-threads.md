@@ -17,7 +17,8 @@ Make one Codex app-server an application-scoped runtime and provide a workspace-
 - Runtime health exposes state, process liveness, restart count, and a bounded error.
 - Tests disable the authenticated runtime unless they explicitly inject a fake process.
 - Thread operations cover `thread/start`, `thread/list`, `thread/read`, `thread/resume`, `thread/name/set`, and `thread/delete`.
-- Thread lists are scoped to the exact resolved `MUSELAB_ROOT` and sorted by `updated_at` descending.
+- Thread lists are scoped to the exact resolved paths in the explicit workspace registry and sorted by `updated_at` descending. `MUSELAB_ROOT` is always the primary entry; additional existing directories are persisted in `.muselab-codex/workspaces.json`.
+- New threads may choose any registered workspace as `cwd`. Resume and fork omit a `cwd` override by default so Codex preserves the source thread's working directory.
 
 ## Empty-thread boundary
 

@@ -89,11 +89,32 @@ def main():
             })
         elif method == "thread/list":
             cwd = message.get("params", {}).get("cwd")
+            allowed = set(cwd) if isinstance(cwd, list) else {cwd}
             data = [thread for thread in threads.values()
-                    if cwd is None or thread.get("cwd") == cwd]
+                    if cwd is None or thread.get("cwd") in allowed]
             write_message({
                 "id": request_id,
                 "result": {"data": data, "nextCursor": None},
+            })
+        elif method == "thread/search":
+            params = message.get("params", {})
+            needle = str(params.get("searchTerm") or "").casefold()
+            limit = int(params.get("limit") or 20)
+            data = []
+            for thread in threads.values():
+                searchable = json.dumps(thread, ensure_ascii=False).casefold()
+                if needle and needle not in searchable:
+                    continue
+                data.append({
+                    "thread": thread,
+                    "snippet": thread.get("name") or thread.get("preview") or "",
+                })
+                if len(data) >= limit:
+                    break
+            write_message({
+                "id": request_id,
+                "result": {"data": data, "nextCursor": None,
+                           "backwardsCursor": None},
             })
         elif method == "thread/read":
             thread_id = message.get("params", {}).get("threadId")
@@ -300,6 +321,8 @@ def main():
                 "id": request_id,
                 "result": {"authorizationUrl": f"https://auth.example.test/{name}"},
             })
+        elif method == "thread/settings/update":
+            write_message({"id": request_id, "result": {}})
         elif method == "turn/start":
             params = message.get("params", {})
             thread_id = params.get("threadId", "thread-1")

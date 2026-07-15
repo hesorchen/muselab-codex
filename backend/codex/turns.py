@@ -32,11 +32,40 @@ class TurnStream:
     done: bool = False
     status: str = "inProgress"
     session_usage: dict[str, Any] | None = None
+    # Relative timing must use a monotonic clock. ``started_at`` remains the
+    # wall-clock epoch exposed for diagnostics/deduplication, but subtracting
+    # it from a browser's Date.now() is invalid when browser and server run on
+    # different devices with slightly different clocks.
+    _started_monotonic: float = field(default_factory=time.monotonic, repr=False)
     _subscribers: set[asyncio.Queue] = field(default_factory=set, repr=False)
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return max(0.0, time.monotonic() - self._started_monotonic)
 
     def publish(self, event: str, data: dict[str, Any]) -> None:
         envelope = {"event": event, "data": data}
-        self.events.append(envelope)
+        # Live subscribers need every delta for low-latency rendering, while
+        # reconnects only need the exact accumulated text.  Keeping thousands
+        # of one-token envelopes for a long answer wastes substantially more
+        # memory than the text itself, so compact only consecutive, plain-text
+        # deltas in the replay buffer.  Use a separate envelope so extending
+        # the replay copy never mutates an event already queued to a client.
+        previous = self.events[-1] if self.events else None
+        previous_data = previous.get("data") if isinstance(previous, dict) else None
+        if (
+            event in {"text", "thinking"}
+            and set(data) == {"text"}
+            and isinstance(data.get("text"), str)
+            and isinstance(previous, dict)
+            and previous.get("event") == event
+            and isinstance(previous_data, dict)
+            and set(previous_data) == {"text"}
+            and isinstance(previous_data.get("text"), str)
+        ):
+            previous["data"] = {"text": previous_data["text"] + data["text"]}
+        else:
+            self.events.append({"event": event, "data": dict(data)})
         for queue in tuple(self._subscribers):
             queue.put_nowait(envelope)
 
@@ -145,6 +174,9 @@ class CodexTurnService:
                 "input": turn_input,
             }
             params.update(_permission_overrides(permission, model, effort))
+            reasoning_summary = self.threads.reasoning_summary(clean_id)
+            if reasoning_summary is not None:
+                params["summary"] = reasoning_summary
             if model:
                 params["model"] = model
             if effort:
@@ -294,6 +326,11 @@ class CodexTurnService:
                     # Queue draining is an optional follow-up. It must never
                     # turn a completed native turn into an SSE failure.
                     pass
+            elif stream.status != "completed":
+                # Failed/interrupted turns skip the success callback (no push,
+                # no queue drain), but their device-origin entry must not leak.
+                from ..turn_notifications import clear_turn_origin
+                clear_turn_origin(stream.thread_id)
 
 
 class TurnAlreadyActive(RuntimeError):
@@ -395,11 +432,18 @@ def _map_notification(
             raise AppServerProtocolError("turn/completed is missing turn")
         stream.status = str(turn.get("status") or "failed")
         failed = stream.status == "failed"
+        interrupted = stream.status == "interrupted"
         data: dict[str, Any] = {
             "turn_id": stream.turn_id,
             "status": stream.status,
             "is_error": failed,
+            "cancelled": interrupted,
             "duration_ms": turn.get("durationMs"),
+            # Browser timers can be throttled/suspended while a phone is in
+            # the background. Preserve server-observed completion timing so
+            # the footer does not stamp the wake-up time or a stale tick.
+            "elapsed_ms": round(stream.elapsed_seconds * 1000),
+            "completed_at": time.time(),
         }
         if failed:
             data["errors"] = [_turn_error(turn.get("error"))]

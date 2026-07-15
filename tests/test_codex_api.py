@@ -43,10 +43,14 @@ from backend.codex import (
     CodexQueueDrainService,
 )
 from backend.codex.api import (
+    QueueEnqueueRequest,
     _session_meta,
     _thread_messages,
     _thread_outline,
+    active_session,
     codex_rate_limit,
+    enqueue_queue,
+    interrupt as interrupt_session,
     router,
     session_usage,
 )
@@ -55,6 +59,98 @@ from backend.codex.settings_api import router as settings_router
 
 FAKE_SERVER = Path(__file__).parent / "fixtures" / "fake_codex_app_server.py"
 PNG_BYTES = b"\x89PNG\r\n\x1a\nfixture-image"
+
+
+def test_enqueue_can_atomically_drain_when_busy_state_went_stale():
+    queue = CodexQueueService()
+
+    class Drain:
+        calls = []
+
+        async def drain(self, thread_id):
+            self.calls.append(thread_id)
+            assert queue.take_next(thread_id)["text"] == "late follow-up"
+            return True
+
+    attachments = SimpleNamespace(describe_staged=lambda _ids: [])
+    drain = Drain()
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        codex_queue=queue,
+        codex_queue_drain=drain,
+        codex_attachments=attachments,
+    )))
+
+    result = asyncio.run(enqueue_queue(
+        request,
+        "thread-race",
+        QueueEnqueueRequest(text="late follow-up", drain_if_idle=True),
+    ))
+
+    assert result["started"] is True
+    assert result["items"] == []
+    assert drain.calls == ["thread-race"]
+
+
+def test_active_session_exposes_clock_skew_safe_relative_elapsed():
+    stream = SimpleNamespace(
+        turn_id="turn-timing",
+        model="gpt-test",
+        started_at=1_700_000_000.0,
+        elapsed_seconds=7.25,
+        events=[{"event": "thinking"}],
+        user_text="hello",
+        user_images=[],
+        user_docs=[],
+    )
+    turns = SimpleNamespace(active=lambda thread_id: (
+        stream if thread_id == "thread-timing" else None
+    ))
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        codex_threads=object(), codex_turns=turns,
+    )))
+
+    result = asyncio.run(active_session(request, "thread-timing"))
+
+    assert result["started_at"] == 1_700_000_000.0
+    assert result["elapsed_seconds"] == 7.25
+    assert result["turn_id"] == "turn-timing"
+
+
+def test_interrupt_pauses_pending_queue_before_interrupting_turn():
+    calls = []
+
+    class QueueStub:
+        def get(self, thread_id):
+            calls.append(("get", thread_id))
+            return {"items": [{"id": "queued-1"}], "paused": False}
+
+        def pause(self, thread_id, paused):
+            calls.append(("pause", thread_id, paused))
+            return {"items": [{"id": "queued-1"}], "paused": paused}
+
+    class TurnsStub:
+        async def interrupt(self, thread_id):
+            calls.append(("interrupt", thread_id))
+            return True
+
+    request = SimpleNamespace(app=SimpleNamespace(state=SimpleNamespace(
+        codex_threads=object(),
+        codex_turns=TurnsStub(),
+        codex_queue=QueueStub(),
+    )))
+
+    result = asyncio.run(interrupt_session(request, "thread-stop"))
+
+    assert calls == [
+        ("get", "thread-stop"),
+        ("pause", "thread-stop", True),
+        ("interrupt", "thread-stop"),
+    ]
+    assert result == {
+        "ok": True,
+        "interrupted": ["thread-stop"],
+        "queue_paused": True,
+    }
 
 
 def test_session_meta_uses_native_preview_for_legacy_timestamp_placeholder():
@@ -272,6 +368,21 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex-home"))
     app = native_app(tmp_path)
     with TestClient(app) as client:
+        workspaces = client.get("/api/chat/workspaces")
+        assert workspaces.status_code == 200
+        assert workspaces.json()["workspaces"] == [{
+            "path": str(tmp_path.resolve()),
+            "name": tmp_path.name,
+            "primary": True,
+        }]
+        extra_workspace = tmp_path / "second-project"
+        extra_workspace.mkdir()
+        registered = client.post("/api/chat/workspaces", json={
+            "path": str(extra_workspace), "name": "Second project",
+        })
+        assert registered.status_code == 200
+        assert registered.json()["path"] == str(extra_workspace.resolve())
+
         models = client.get("/api/chat/providers")
         assert models.status_code == 200
         assert models.json()["default_model"] == "gpt-test-codex"
@@ -279,10 +390,19 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         assert models.json()["models"][0]["reasoning_efforts"] == ["medium"]
 
         created = client.post("/api/chat/sessions", json={"name": "source"})
+        custom_created = client.post("/api/chat/sessions", json={
+            "name": "custom cwd", "cwd": str(extra_workspace),
+        })
+        assert custom_created.status_code == 200
+        assert custom_created.json()["cwd"] == str(extra_workspace.resolve())
         forked = client.post(
-            f"/api/chat/sessions/{created.json()['id']}/fork", json={})
+            f"/api/chat/sessions/{custom_created.json()['id']}/fork",
+            json={"model": "gpt-test-codex", "effort": "medium"},
+        )
         assert forked.status_code == 200
-        assert forked.json()["id"] != created.json()["id"]
+        assert forked.json()["id"] != custom_created.json()["id"]
+        assert forked.json()["cwd"] == str(extra_workspace.resolve())
+        assert forked.json()["effort"] == "medium"
 
         context = client.get("/api/chat/context-info")
         assert context.status_code == 200
@@ -328,17 +448,33 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         assert usage.json()["runtime"] == "codex"
         assert usage.json()["cost_available"] is False
 
-        interrupted = client.get("/api/chat/interrupted-turns")
-        assert interrupted.json() == {"turns": [], "runtime": "codex"}
-
         limits = client.get("/api/chat/codex-rate-limit")
         assert limits.status_code == 200
         assert limits.json()["provider_authoritative"] is False
 
+        queued_upload = client.post(
+            "/api/chat/upload-image",
+            files={"file": ("queued.png", PNG_BYTES, "image/png")},
+        )
+        assert queued_upload.status_code == 200
+        queued_id = queued_upload.json()["id"]
         queued = client.post("/api/chat/sessions/thread-1/queue",
-                             json={"text": "later"})
+                             json={"text": "later", "image_ids": queued_id})
         assert queued.status_code == 200
         assert queued.json()["items"][0]["text"] == "later"
+        assert queued.json()["items"][0]["attachments"] == [{
+            "id": queued_id,
+            "kind": "image",
+            "name": "queued.png",
+            "mime": "image/png",
+            "available": True,
+        }]
+        queued_preview = client.get(
+            f"/api/chat/queued-image/{queued_id}",
+            params={"token": os.environ["MUSELAB_TOKEN"]},
+        )
+        assert queued_preview.status_code == 200
+        assert queued_preview.content == PNG_BYTES
         item_id = queued.json()["items"][0]["id"]
         paused = client.post("/api/chat/sessions/thread-1/queue/pause",
                              json={"paused": True})
@@ -395,10 +531,22 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
             f"/api/chat/sessions/{thread_id}", json={"effort": "medium"})
         assert configured_effort.status_code == 200
         assert configured_effort.json()["effort"] == "medium"
+        hidden_thinking = client.patch(
+            f"/api/chat/sessions/{thread_id}", json={"thinking": False})
+        assert hidden_thinking.status_code == 200
+        assert hidden_thinking.json()["thinking"] is False
+        changed_permission = client.patch(
+            f"/api/chat/sessions/{thread_id}", json={"permission": "plan"})
+        assert changed_permission.status_code == 200
+        assert changed_permission.json()["permission"] == "plan"
 
         listed = client.get("/api/chat/sessions?limit=100")
         assert listed.status_code == 200
-        assert thread_id in [item["id"] for item in listed.json()["sessions"]]
+        listed_session = next(
+            item for item in listed.json()["sessions"] if item["id"] == thread_id)
+        assert listed_session["effort"] == "medium"
+        assert listed_session["thinking"] is False
+        assert listed_session["permission"] == "plan"
         assert listed.headers["etag"].startswith('W/"')
         unchanged = client.get(
             "/api/chat/sessions?limit=100",
@@ -438,6 +586,8 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         assert breakdown.json()["maxTokens"] == 100
 
         loaded = client.get(f"/api/chat/sessions/{thread_id}?tail=80")
+        assert loaded.json()["effort"] == "medium"
+        assert loaded.json()["thinking"] is False
         assert loaded.status_code == 200
         assert [message["role"] for message in loaded.json()["messages"]] == [
             "user", "thinking", "assistant",
@@ -630,6 +780,11 @@ def test_stream_ticket_is_single_use(tmp_path):
         }).json()["ticket"]
         assert client.get("/api/chat/stream", params={"ticket": ticket}).status_code == 200
         assert client.get("/api/chat/stream", params={"ticket": ticket}).status_code == 401
+        assert client.get("/api/chat/stream", params={
+            "prompt": "must-not-travel-in-url",
+            "session_id": thread_id,
+            "token": "legacy-token",
+        }).status_code == 401
 
 
 def test_context_info_recognizes_global_codex_agents(tmp_path, monkeypatch):
@@ -705,7 +860,71 @@ def test_native_image_and_document_attachments_roundtrip(tmp_path):
         ).status_code == 404
 
 
+def test_visible_session_management_actions_have_native_routes(tmp_path):
+    app = native_app(tmp_path)
+    with TestClient(app) as client:
+        organized = client.post("/api/chat/sessions/organize", json={
+            "name": "[整理档案]", "model": "gpt-test-codex",
+        })
+        assert organized.status_code == 200
+        assert organized.json()["name"] == "[整理档案]"
+        assert "确认" in organized.json()["initial_message"]["zh"]
+
+        found = client.get("/api/chat/search", params={"q": "整理档案"})
+        assert found.status_code == 200
+        assert found.json()["hits"][0]["sid"] == organized.json()["id"]
+
+        exported = client.get(
+            f"/api/chat/sessions/{organized.json()['id']}/export",
+            params={"token": os.environ["MUSELAB_TOKEN"]},
+        )
+        assert exported.status_code == 200
+        assert exported.text.startswith("# [整理档案]\n")
+        assert "attachment" in exported.headers["content-disposition"]
+
+
+def test_purge_old_is_server_authoritative_and_cleans_queue(tmp_path):
+    app = native_app(tmp_path)
+    with TestClient(app) as client:
+        keep = client.post(
+            "/api/chat/sessions", json={"name": "keep current"}).json()
+        pinned = client.post(
+            "/api/chat/sessions", json={"name": "keep pinned"}).json()
+        victim = client.post(
+            "/api/chat/sessions", json={"name": "remove old"}).json()
+        assert client.patch(
+            f"/api/chat/sessions/{pinned['id']}", json={"pinned": True}
+        ).status_code == 200
+        assert client.post(
+            f"/api/chat/sessions/{victim['id']}/queue",
+            json={"text": "queued"},
+        ).status_code == 200
+
+        preview = client.post("/api/chat/sessions/purge-old", json={
+            "days": 7, "keep_id": keep["id"], "dry_run": True,
+        })
+        assert preview.status_code == 200
+        assert preview.json()["ids"] == [victim["id"]]
+
+        purged = client.post("/api/chat/sessions/purge-old", json={
+            "days": 7, "keep_id": keep["id"],
+        })
+        assert purged.status_code == 200
+        assert purged.json()["ids"] == [victim["id"]]
+        assert client.get(f"/api/chat/sessions/{keep['id']}").status_code == 200
+        assert client.get(f"/api/chat/sessions/{pinned['id']}").status_code == 200
+        assert client.get(f"/api/chat/sessions/{victim['id']}").status_code == 404
+        assert client.get(
+            f"/api/chat/sessions/{victim['id']}/queue"
+        ).json()["items"] == []
+
+
 def test_model_switch_uses_native_thread_fork():
     app_js = Path("frontend/app.js").read_text(encoding="utf-8")
     assert '"/fork"' in app_js
-    assert "await this.loadSession(meta.id)" in app_js
+    # Fork activation now goes through switchSession(), whose shared
+    # _ensureSessionLoaded() path de-duplicates cold loads for grid panes,
+    # hover-prefetch and ordinary tab switches.
+    fork_block = app_js[app_js.index('"/fork"') :]
+    assert "newSt._loaded = false" in fork_block
+    assert "await this.switchSession()" in fork_block

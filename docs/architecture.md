@@ -77,7 +77,7 @@ App-server notifications share one stream. If every SSE connection called `next_
 ## Threads, turns, and browser tabs
 
 - The Codex thread ID is the session key; Codex-native history is the transcript source of truth.
-- Multiple browser tabs hold independent message, stream, and scroll state.
+- Multiple browser tabs hold independent message and stream state. Desktop users can drag up to four threads into a live chat grid; only the active pane receives the shared composer, while mobile stays single-pane. The composer can create a thread in any explicitly registered working directory without changing the file browser's `MUSELAB_ROOT` boundary.
 - One thread can have one active turn; additional user messages enter the application queue.
 - Fork uses native thread branching. Compact rewrites the active context of the same thread and records a compaction boundary in its transcript.
 - After an app-server restart, persisted threads are resumed once per runtime generation before a new turn starts.

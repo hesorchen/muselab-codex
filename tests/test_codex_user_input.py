@@ -156,6 +156,10 @@ def test_frontend_submits_native_question_ids_and_masks_secrets():
     index_html = __import__("pathlib").Path("frontend/index.html").read_text()
 
     assert "q?.id || q?.question" in app_js
-    assert "/api/chat/answer/${encodeURIComponent(this.currentId)}" in app_js
+    # The card can remain mounted in a background split pane while the user
+    # activates another tab. Always answer its owner session, never whatever
+    # happens to be current when the button is pressed.
+    assert "async submitAskAnswers(msg, sid = this.currentId)" in app_js
+    assert "/api/chat/answer/${encodeURIComponent(sid)}" in app_js
     assert 'type="password"' in index_html
     assert "m.askOtherText[askQuestionKey(q)]" in index_html

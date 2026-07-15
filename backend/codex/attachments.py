@@ -155,6 +155,63 @@ class CodexAttachmentService:
             client_user_message_id=client_id,
         )
 
+    def describe_staged(self, attachment_ids: str) -> list[dict[str, Any]]:
+        """Return safe UI metadata for attachments waiting in a queue.
+
+        Queue items retain staged upload ids until the head is claimed by
+        ``prepare``.  The browser needs names/types for chips and a thumbnail
+        route, but must not receive local filesystem paths.  Missing data is
+        represented explicitly so the UI can say "attachment expired" rather
+        than pretending a generic attachment still exists.
+        """
+        described: list[dict[str, Any]] = []
+        for attachment_id in _attachment_ids(attachment_ids):
+            metadata = self._read_metadata(
+                self.staged / f"{attachment_id}.json")
+            available = False
+            if metadata is not None:
+                filename = str(metadata.get("filename") or "")
+                data_path = self.staged / filename
+                try:
+                    available = (
+                        data_path.is_file()
+                        and not data_path.is_symlink()
+                        and data_path.parent.resolve() == self.staged
+                    )
+                except OSError:
+                    available = False
+            described.append({
+                "id": attachment_id,
+                "kind": str((metadata or {}).get("kind") or "file"),
+                "name": str((metadata or {}).get("name") or "file"),
+                "mime": str(
+                    (metadata or {}).get("mime")
+                    or "application/octet-stream"
+                ),
+                "available": available,
+            })
+        return described
+
+    def resolve_staged_image(self, attachment_id: str) -> tuple[Path, str]:
+        """Resolve one queued image without claiming it for a thread."""
+        ids = _attachment_ids(attachment_id)
+        if len(ids) != 1:
+            raise HTTPException(400, "bad queued image id")
+        clean_id = ids[0]
+        metadata = self._read_metadata(self.staged / f"{clean_id}.json")
+        if metadata is None or metadata.get("kind") != "image":
+            raise HTTPException(404, "queued image not found")
+        filename = str(metadata.get("filename") or "")
+        path = self.staged / filename
+        try:
+            resolved = path.resolve(strict=True)
+            resolved.relative_to(self.staged)
+        except (OSError, ValueError):
+            raise HTTPException(404, "queued image not found") from None
+        if path.is_symlink() or not resolved.is_file():
+            raise HTTPException(404, "queued image not found")
+        return resolved, str(metadata.get("mime") or "image/*")
+
     def history_items(
         self,
         thread_id: str,

@@ -84,10 +84,17 @@ class CodexHistoryService:
             snapshot = await self.transcripts.read(clean_id)
             if snapshot is not None:
                 thread = await self.threads.read(clean_id, include_turns=False)
+                local_settings = thread.get("_settings")
+                settings = dict(snapshot.settings or {})
+                if isinstance(local_settings, dict):
+                    # A user can change effort between turns. The rollout only
+                    # knows the previous turn, while the thread sidecar holds
+                    # the pending next-turn override and therefore wins.
+                    settings.update(local_settings)
                 return {
                     **thread,
                     "turns": _project_turns(snapshot.items),
-                    "_settings": dict(snapshot.settings or {}),
+                    "_settings": settings,
                 }
             if clean_id in self._degraded:
                 return await self.threads.read(clean_id, include_turns=False)

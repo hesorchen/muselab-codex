@@ -1,11 +1,13 @@
 """Turn lifecycle and SSE-shape mapping tests."""
 
 import asyncio
+import time
 
 import pytest
 
 from backend.codex import CodexTurnService, TurnAlreadyActive
 from backend.codex.turns import (
+    TurnStream,
     _is_tool_item,
     _permission_overrides,
     _tool_result,
@@ -53,6 +55,7 @@ class Threads:
     def __init__(self):
         self.calls = []
         self.materialized = []
+        self.summary = None
 
     async def resume(self, thread_id, *, model=None):
         self.calls.append((thread_id, model))
@@ -63,6 +66,9 @@ class Threads:
 
     def invalidate_list_cache(self):
         pass
+
+    def reasoning_summary(self, _thread_id):
+        return self.summary
 
 
 class History:
@@ -80,6 +86,28 @@ class Usage:
     def update(self, thread_id, token_usage, *, model=""):
         self.calls.append((thread_id, token_usage, model))
         return {"context_used": 10, "context_limit": 100, "context_used_pct": 10.0}
+
+
+@pytest.mark.asyncio
+async def test_replay_compacts_deltas_without_delaying_live_subscribers():
+    stream = TurnStream("thread-1", "hello", "gpt-test")
+    live = stream.subscribe()
+
+    stream.publish("text", {"text": "first "})
+    stream.publish("text", {"text": "second"})
+    stream.finish()
+
+    assert await live.get() == {"event": "text", "data": {"text": "first "}}
+    assert await live.get() == {"event": "text", "data": {"text": "second"}}
+    assert stream.events == [
+        {"event": "text", "data": {"text": "first second"}},
+    ]
+
+    replay = stream.subscribe()
+    assert await replay.get() == {
+        "event": "text",
+        "data": {"text": "first second"},
+    }
 
 
 @pytest.mark.parametrize(("permission", "approval", "sandbox", "mode"), [
@@ -142,12 +170,16 @@ async def test_turn_maps_reasoning_tools_text_and_done_with_replay():
     stream = await service.start(
         "thread-1", "hello", model="gpt-test", permission="default",
         effort="high")
+    # Make server-observed elapsed timing deterministic without sleeping.
+    stream._started_monotonic = time.monotonic() - 2.5
 
     turn_params = next(params for method, params, _timeout in runtime.calls
                        if method == "turn/start")
     assert turn_params["effort"] == "high"
     assert "approvalPolicy" not in turn_params
     assert "sandboxPolicy" not in turn_params
+
+    threads.summary = "none"
 
     notifications = [
         ("item/reasoning/summaryTextDelta", {"delta": "think"}),
@@ -179,6 +211,9 @@ async def test_turn_maps_reasoning_tools_text_and_done_with_replay():
     ]
     assert stream.events[1]["data"]["name"] == "Bash"
     assert stream.events[-1]["data"]["duration_ms"] == 8
+    assert stream.events[-1]["data"]["cancelled"] is False
+    assert 2_500 <= stream.events[-1]["data"]["elapsed_ms"] < 3_000
+    assert abs(stream.events[-1]["data"]["completed_at"] - time.time()) < 1
     assert events.subscription.closed is True
     assert threads.calls == [("thread-1", "gpt-test")]
 
@@ -189,6 +224,9 @@ async def test_turn_maps_reasoning_tools_text_and_done_with_replay():
 
     events.subscription = Subscription()
     await service.start("thread-1", "second", model="gpt-test")
+    second_params = [params for method, params, _timeout in runtime.calls
+                     if method == "turn/start"][-1]
+    assert second_params["summary"] == "none"
     assert threads.calls == [("thread-1", "gpt-test")]
     await service.close()
 
@@ -280,6 +318,42 @@ async def test_turn_includes_native_usage_in_done_event():
         await asyncio.sleep(0.01)
     assert usage.calls == [("thread-1", {"last": {"totalTokens": 10}}, "")]
     assert stream.events[-1]["data"]["session_usage"]["context_used"] == 10
+
+
+@pytest.mark.asyncio
+async def test_interrupted_turn_is_cancelled_without_success_followups():
+    from backend import turn_notifications
+
+    runtime = Runtime()
+    events = Events()
+    completed = []
+
+    async def on_completed(thread_id, status):
+        completed.append((thread_id, status))
+
+    service = CodexTurnService(
+        runtime, events, Threads(), History(), on_turn_finished=on_completed)
+    stream = await service.start("thread-1", "stop")
+    turn_notifications.record_turn_origin("thread-1", "mobile")
+    await events.subscription.queue.put({
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "turn": {"id": "turn-1", "status": "interrupted", "items": []},
+        },
+    })
+
+    for _ in range(100):
+        if stream.done and "thread-1" not in service._active:
+            break
+        await asyncio.sleep(0.01)
+    done = stream.events[-1]
+    assert done["event"] == "done"
+    assert done["data"]["cancelled"] is True
+    assert done["data"]["is_error"] is False
+    assert completed == []
+    assert "thread-1" not in turn_notifications._turn_origins
 
 
 @pytest.mark.asyncio

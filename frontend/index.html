@@ -226,8 +226,7 @@
 
 <!-- x-init removes the no-JS splash only. Alpine 3 auto-invokes the
      component's init() method when x-data evaluates — calling it again
-     here would double-fire _checkInterruptedTurns() and toast every
-     interrupted-turn notice twice. See 2026-05-22 fix. -->
+     here would duplicate global listeners, heartbeats, and session polls. -->
 <div id="app" x-data="portal()" x-init="document.getElementById('loading').remove()"
      x-effect="document.title = pageTitle()" x-cloak>
 
@@ -537,7 +536,15 @@
           <svg x-show="leftOpen && desktopFullPane !== 'preview'"><use href="#i-chevron-left"/></svg>
           <svg x-show="!leftOpen || desktopFullPane === 'preview'"><use href="#i-chevron-right"/></svg>
         </button>
-        <span class="pane-title" x-text="selected ? selected.split('/').pop() : t('pane.preview')"></span>
+        <div class="preview-title-stack">
+          <span class="pane-title" x-text="selected ? selected.split('/').pop() : t('pane.preview')"></span>
+          <span class="preview-mobile-path" x-show="selected"
+                :title="selected.includes('/') ? selected.slice(0, selected.lastIndexOf('/') + 1) : './'"
+                x-text="selected.includes('/') ? selected.slice(0, selected.lastIndexOf('/') + 1) : './'"></span>
+          <span class="preview-mobile-mtime"
+                x-show="selected && selectedMeta && selectedMeta.mtime"
+                x-text="(lang === 'zh' ? '修改于 ' : 'Modified ') + (selectedMeta && selectedMeta.mtime ? fmtMtime(selectedMeta.mtime) : '')"></span>
+        </div>
         <!-- File path + last-modified strip. Fills the gap between the title
              and the action icons; when no file is open it's empty but still
              flex:1, so it doubles as the old `.spacer`. Light/muted styling. -->
@@ -1044,9 +1051,9 @@
                 aria-label="Open skills list">
           <svg><use href="#i-puzzle"/></svg>
         </button>
-        <button @click="openImageGen()" class="icon-btn"
-                :title="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'"
-                aria-label="Codex Image 2">
+        <button @click="promptNativeImageGeneration()" class="icon-btn"
+                :title="lang==='zh' ? '让 Muse 生成图片' : 'Ask Muse to generate an image'"
+                aria-label="Ask Muse to generate an image">
           <svg><use href="#i-image"/></svg>
         </button>
         <button @click="toggleMcpDrawer()" class="icon-btn"
@@ -1066,11 +1073,6 @@
              Deliberately NOT a "raw edit" button — direct editing of
              AGENTS.md works (it's just a file) but is a worse UX:
              nobody wants to stare at a 9-section form. -->
-        <!-- 2026-05-23: 「设置档案」按钮已并入「整理档案」。整理档案 workflow
-             现在同时覆盖 archive 整理 + AGENTS.md profile 补全（curator prompt
-             第 3 步 3b 节）。两个按钮职责重合 + 移动端 toolbar 拥挤，合并为一。
-             历史 startProfileIntake / /sessions/profile-intake 端点保留做向后
-             兼容，外部 API 调用不会断；但 UI 不再暴露独立入口。-->
         <!-- Organize archive — creates a curator-mode session that walks
              Muse through scan → suggest → confirm-per-item → execute,
              AND walks the user through any blank AGENTS.md profile
@@ -1239,6 +1241,7 @@
                 <template x-for="s in g.visibleItems" :key="s.id">
                   <div class="session-picker-row"
                        :class="historyRowClass(s.id) + (s.pinned ? ' pinned' : '')"
+                       :title="tabTooltip(s.id)"
                        @click="pickerOpenSession(s.id)"
                        @mouseenter="prefetchSession(s.id)"
                        @contextmenu.prevent="pickerRowMenu($event, s.id)"
@@ -1340,8 +1343,20 @@
           </div>
         </div>
         <div class="chat-tabs-list" @wheel="onChatTabsWheel($event)">
+          <button class="chat-tab chat-workspace-tab"
+                  x-show="hasChatGridWorkspace() && !_isMobileLayout()"
+                  :class="{ active: chatGridIsActive() }"
+                  @click="openChatGridWorkspace()"
+                  :title="lang==='zh' ? '返回多视图工作区' : 'Return to multi-view workspace'">
+            <svg viewBox="0 0 20 20" aria-hidden="true">
+              <rect x="1.5" y="1.5" width="9" height="17" rx="1"/>
+              <rect x="12" y="1.5" width="6.5" height="7.5" rx="1"/>
+              <rect x="12" y="10.5" width="6.5" height="8" rx="1"/>
+            </svg>
+            <span x-text="(lang==='zh' ? '多视图' : 'Multi-view') + ' · ' + chatGridWorkspaceIds().length"></span>
+          </button>
           <template x-for="tid in openTabIds" :key="tid">
-            <div class="chat-tab" :class="{active: tid === currentId, 'drag-over': tabDragOverId === tid}"
+            <div class="chat-tab" :class="{active: !chatGridIsActive() && tid === currentId, 'drag-over': tabDragOverId === tid}"
                  :data-tid="tid"
                  :draggable="isPointerDevice"
                  @dragstart="onTabDragStart($event, tid)"
@@ -1354,7 +1369,7 @@
                  @dblclick="startRenameTab(tid)"
                  @contextmenu.prevent="showTabMenu($event, tid)"
                  @auxclick="onTabAuxClick($event, tid)"
-                 :title="tabTitle(tid)">
+                 :title="tabTooltip(tid)">
               <span class="chat-tab-stream-dot"
                     x-show="isTabStreaming(tid)"
                     :title="lang==='zh' ? '该会话正在生成…' : 'Streaming…'"></span>
@@ -1392,7 +1407,47 @@
                strip (middle) + new (right)". Removed current-session chip
                (redundant once strip is visible) and outline button (moved
                to chat-pane FAB that aligns with .jump-bottom). -->
-          <button class="chat-tab-new" @click="newSession()" :disabled="_creatingSession"
+          <div class="chat-grid-menu-wrap" @click.outside="chatGridMenuOpen = false">
+            <button class="chat-grid-toggle" @click="toggleChatGrid()"
+                    :class="{ active: chatGridIsActive() }"
+                    :title="lang==='zh' ? '选择会话视图' : 'Choose chat view'"
+                    :aria-expanded="chatGridMenuOpen"
+                    :aria-label="lang==='zh' ? '会话视图' : 'Chat view'">
+              <svg viewBox="0 0 20 20" aria-hidden="true">
+                <rect x="1.5" y="1.5" width="9" height="17" rx="1"/>
+                <rect x="12" y="1.5" width="6.5" height="7.5" rx="1"/>
+                <rect x="12" y="10.5" width="6.5" height="8" rx="1"/>
+              </svg>
+            </button>
+            <div class="chat-grid-menu" x-show="chatGridMenuOpen" x-transition.opacity.duration.120ms>
+              <div class="chat-grid-menu-title" x-text="lang==='zh' ? '会话视图' : 'Chat view'"></div>
+              <button @click="setChatGridView(1)">
+                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="26" height="18" rx="2"/></svg>
+                <span x-text="lang==='zh' ? '单窗口' : 'Single'"></span>
+              </button>
+              <button @click="setChatGridView(2, 'columns')" :disabled="openTabIds.length < 2">
+                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12.5" height="18" rx="2"/><rect x="14.5" y="1" width="12.5" height="18" rx="2"/></svg>
+                <span x-text="lang==='zh' ? '左右双栏' : 'Two columns'"></span>
+              </button>
+              <button @click="setChatGridView(2, 'rows')" :disabled="openTabIds.length < 2">
+                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="26" height="8.5" rx="2"/><rect x="1" y="10.5" width="26" height="8.5" rx="2"/></svg>
+                <span x-text="lang==='zh' ? '上下双栏' : 'Two rows'"></span>
+              </button>
+              <button @click="setChatGridView(3, 'primary')" :disabled="openTabIds.length < 3">
+                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="13" height="18" rx="2"/><rect x="15" y="1" width="12" height="8.5" rx="2"/><rect x="15" y="10.5" width="12" height="8.5" rx="2"/></svg>
+                <span x-text="lang==='zh' ? '主次三窗' : 'Primary three panes'"></span>
+              </button>
+              <button @click="setChatGridView(3, 'secondary')" :disabled="openTabIds.length < 3">
+                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12" height="8.5" rx="2"/><rect x="1" y="10.5" width="12" height="8.5" rx="2"/><rect x="15" y="1" width="12" height="18" rx="2"/></svg>
+                <span x-text="lang==='zh' ? '次主三窗' : 'Secondary three panes'"></span>
+              </button>
+              <button @click="setChatGridView(4, 'quad')" :disabled="openTabIds.length < 4">
+                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12.5" height="8.5" rx="2"/><rect x="14.5" y="1" width="12.5" height="8.5" rx="2"/><rect x="1" y="10.5" width="12.5" height="8.5" rx="2"/><rect x="14.5" y="10.5" width="12.5" height="8.5" rx="2"/></svg>
+                <span x-text="lang==='zh' ? '四宫格' : 'Four panes'"></span>
+              </button>
+            </div>
+          </div>
+          <button class="chat-tab-new" @click="newSession({ cwd: currentWorkspacePath() })" :disabled="_creatingSession"
                   :aria-busy="_creatingSession"
                   :title="t('btn.new_session')">+</button>
         </div>
@@ -1407,8 +1462,8 @@
              @keydown.escape.window="closeTabMenu()">
           <button @click="menuRename(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '重命名' : 'Rename'"></button>
-          <button @click="menuEditPrompt(tabCtxMenu && tabCtxMenu.id)"
-                  x-text="lang==='zh' ? '编辑 system prompt' : 'Edit system prompt'"></button>
+          <button @click="openGridFromTab(tabCtxMenu && tabCtxMenu.id)"
+                  x-text="lang==='zh' ? '加入会话分屏' : 'Add to chat grid'"></button>
           <button @click="menuClose(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '关闭 tab' : 'Close tab'"></button>
           <button @click="menuExportMarkdown(tabCtxMenu && tabCtxMenu.id)"
@@ -1423,7 +1478,22 @@
            moved to the chat-input toolbar at the bottom (VSCode-style). -->
 
       <div class="chat-scroll-wrap">
-        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent()" @touchmove.passive="_userScrollIntent()" @pointerdown.passive="_userScrollIntent()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length }">
+        <div class="chat-grid-drop-overlay"
+             x-show="_draggingTabId && !visibleChatPaneIds().includes(_draggingTabId)"
+             @dragenter.prevent.stop
+             @dragover.prevent.stop="$event.dataTransfer.dropEffect = 'move'"
+             @drop.prevent.stop="onChatGridDrop($event, '')">
+          <div class="chat-grid-drop-card">
+            <svg viewBox="0 0 28 20" aria-hidden="true">
+              <rect x="1" y="1" width="13" height="18" rx="2"/>
+              <rect x="15" y="1" width="12" height="8.5" rx="2"/>
+              <rect x="15" y="10.5" width="12" height="8.5" rx="2"/>
+            </svg>
+            <strong x-text="lang==='zh' ? '松开加入分屏' : 'Drop to add a pane'"></strong>
+            <span x-text="lang==='zh' ? '当前会话会继续保留' : 'The current conversation stays open'"></span>
+          </div>
+        </div>
+        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent()" @touchmove.passive="_userScrollIntent()" @pointerdown.passive="_userScrollIntent()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length, 'is-split': visibleChatPaneIds().length > 1 }">
           <!-- Shimmer skeleton while loadSession is in-flight. Without
                this, switching to a long-history session briefly shows the
                brand-empty onboarding cards as if it were a new session. -->
@@ -1573,16 +1643,57 @@
                to hide the avatar on all but the FIRST assistant-side
                msg in a run — visually the same "one avatar per turn"
                result without a derived data structure. -->
-          <!-- Render only the active conversation. The former nested
-               residentPaneIds → paneMessages x-for kept multiple hidden
-               message trees alive, but concurrent history/queue updates
-               corrupted Alpine's keyed lookup and stopped the render before
-               tool/code-edit cards. The initial window is already bounded,
-               so one flat keyed list is both faster and reliable. -->
-          <template x-for="(m, i) in messages" :key="m._k || m.uuid || ('m-' + i)">
-            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
-                 :data-uuid="m.uuid || ''"
-                 :style="'contain-intrinsic-size: auto ' + estIntrinsicH(m) + 'px'">
+          <!-- Keep only the recent keyed panes mounted. Every binding inside
+               the loop is scoped by `tid`, so hidden tabs can retain their DOM
+               and scroll position without reading the active tab's messages.
+               The LRU in mountedChatPaneIds bounds retained transcript DOM. -->
+          <div class="chat-grid" :class="chatGridClass()"
+               @dragover.prevent="onChatGridDragOver($event, '')"
+               @dragleave.self="splitDragOverId = ''"
+               @drop.prevent="onChatGridDrop($event, '')">
+          <template x-for="tid in mountedChatPaneIds()" :key="tid">
+          <section class="chat-grid-pane"
+                   x-show="visibleChatPaneIds().includes(tid)"
+                   :class="chatGridPaneClass(tid)"
+                   :data-pane-id="tid"
+                   @dragover.prevent.stop="onChatGridDragOver($event, tid)"
+                   @drop.prevent.stop="onChatGridDrop($event, tid)">
+            <header class="chat-grid-pane-head" draggable="true"
+                    @dragstart="onTabDragStart($event, tid)" @dragend="onTabDragEnd()">
+              <span class="chat-grid-pane-status"
+                    x-show="isTabStreaming(tid) || isTabUnread(tid)"
+                    :class="{ streaming: isTabStreaming(tid), unread: isTabUnread(tid) }"></span>
+              <span class="chat-grid-pane-title ellipsis" x-text="tabTitle(tid) || '…'"></span>
+              <span class="chat-grid-pane-workspace ellipsis"
+                    x-show="sessionWorkspaces.length > 1"
+                    x-text="workspaceLabel((sessions.find(s => s.id === tid) || {}).cwd)"></span>
+              <button class="chat-grid-pane-close" @click.stop="removeSessionFromGrid(tid)"
+                      :title="lang==='zh' ? '移出分屏' : 'Remove from grid'">×</button>
+            </header>
+            <div class="chat-grid-pane-loading"
+                 x-show="visibleChatPaneIds().length > 1
+                         && (!tabState[tid] || !tabState[tid]._loaded
+                             || (tid === currentId && !messagesReady))">
+              <span x-text="lang==='zh' ? '正在恢复会话…' : 'Restoring session…'"></span>
+            </div>
+            <div class="msg-pane"
+                 @scroll="onChatScroll(tid, $event)"
+                 @wheel.passive="_userScrollIntent(tid)"
+                 @touchmove.passive="_userScrollIntent(tid)"
+                 @pointerdown.passive="_userScrollIntent(tid)">
+            <div x-show="visibleChatPaneIds().length > 1 && (hasMoreHistory(tid) || historyTruncated(tid))"
+                 class="load-earlier-wrap">
+              <button x-show="hasMoreHistory(tid)"
+                      class="load-earlier-btn"
+                      @click="loadEarlierMessages(tid)"
+                      x-text="t('history.load_earlier', { n: earlierMessageCount(tid) })"></button>
+              <div x-show="historyTruncated(tid) && !hasMoreHistory(tid)"
+                   class="load-earlier-truncated-note"
+                   x-text="t('history.truncated_note')"></div>
+            </div>
+          <template x-for="(m, i) in paneMessages(tid)" :key="m._k || m.uuid || ('m-' + i)">
+            <div :class="'msg ' + (m._is_compact_summary ? 'compact' : m.role) + (isMsgRenderable(m, i, tid) ? '' : ' is-hidden') + (m._noAnim ? ' no-anim' : '')"
+                 :data-uuid="m.uuid || ''">
               <!-- compact-summary pill -->
               <template x-if="m._is_compact_summary">
                 <div class="compact-summary-pill">
@@ -1665,7 +1776,7 @@
                       <svg x-show="!m._copied"><use href="#i-copy"/></svg>
                       <svg x-show="m._copied"><use href="#i-check"/></svg>
                     </button>
-                    <button x-show="!streaming && !m._editing"
+                    <button x-show="!isTabStreaming(tid) && !m._editing"
                             @click="startEditMessage(m)" class="icon-btn sm"
                             :title="t('btn.edit')">
                       <svg><use href="#i-edit"/></svg>
@@ -1708,12 +1819,12 @@
                 <div class="asst-msg-wrap">
                   <div class="msg-row">
                     <span class="msg-avatar assistant-avatar"
-                          :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                          :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                           :title="mascotLabel()">
                       <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                     </span>
                     <div class="bubble"
-                         :class="{ 'is-streaming-bubble': streaming && i === messages.length - 1 }"
+                         :class="{ 'is-streaming-bubble': isTabStreaming(tid) && i === paneMessages(tid).length - 1 }"
                          x-html="m.html || ''"></div>
                   </div>
                   <!-- Per-bubble footer removed. Time + streaming dots
@@ -1742,24 +1853,24 @@
               <template x-if="m.role === 'thinking'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
-                  <div :class="thinkingClass(i, m)">
+                  <div :class="thinkingClass(i, m, tid)">
                     <div class="thinking-head"
-                         @click.stop="toggleMsgExpanded(m, i)"
+                         @click.stop="toggleMsgExpanded(m, i, tid)"
                          :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
                       <span class="thinking-chevron">
                         <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                          <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                          <path :d="isMsgExpanded(i, m, false, tid) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
                         </svg>
                       </span>
                       <span class="icon"><svg><use href="#i-brain"/></svg></span>
                       <span class="thinking-label-text">thinking</span>
-                      <span x-show="!isMsgExpanded(i, m)" class="thinking-preview" x-text="thinkingPreview(m)"></span>
+                      <span x-show="!isMsgExpanded(i, m, false, tid)" class="thinking-preview" x-text="thinkingPreview(m)"></span>
                     </div>
-                    <pre x-show="isMsgExpanded(i, m)" x-text="m.text"></pre>
+                    <pre x-show="isMsgExpanded(i, m, false, tid)" x-text="m.text"></pre>
                   </div>
                 </div>
               </template>
@@ -1768,7 +1879,7 @@
               <template x-if="m.role === 'tool_use' && m.name === 'TodoWrite'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1800,7 +1911,7 @@
               <template x-if="m.role === 'tool_use' && (m.name === 'Task' || m.name === 'Agent')">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1819,33 +1930,6 @@
                        x-show="m.task && m.task.thread_id"
                        @click.prevent="openCollabThread(m.task && m.task.thread_id)"
                        x-text="lang === 'zh' ? '打开子 agent 会话' : 'Open subagent thread'"></a>
-                    <!-- SDK-native background-task status (run_in_background=
-                         true). The task_started/progress/notification SSE
-                         handlers stamp m.task_status via tool_use_id. Renders
-                         ⏳ running → ✅/❌, with the SDK summary + an open-result
-                         link (best-effort openByPathToasted on output_file). -->
-                    <template x-if="m.task_status">
-                      <div class="subagent-task"
-                           :class="'is-' + (m.task_status.state || 'running')">
-                        <span class="subagent-task-badge"
-                              x-text="taskStatusLabel(m.task_status.state)"></span>
-                        <span class="subagent-task-summary"
-                              x-show="m.task_status.summary"
-                              x-text="m.task_status.summary"></span>
-                        <a class="subagent-task-open" href="#"
-                           x-show="m.task_status.output_file"
-                           @click.prevent="openTaskOutput(m.task_status)"
-                           x-text="t('subagent.open_result')"></a>
-                        <!-- Stop button — only while running. Backed by the
-                             SDK-native stop_task control request; the card
-                             flips to ⏹ when the CLI's status='stopped'
-                             notification round-trips the settle path. -->
-                        <a class="subagent-task-stop" href="#"
-                           x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
-                           @click.prevent="stopBackgroundTask(m.task_status)"
-                           x-text="'⏹ ' + t('subagent.stop_task')"></a>
-                      </div>
-                    </template>
                   </div>
                 </div>
               </template>
@@ -1854,7 +1938,7 @@
               <template x-if="m.role === 'tool_use' && m.name === 'ExitPlanMode'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1873,14 +1957,14 @@
                    TaskGet / TaskOutput) are hidden entirely. Adjacent task
                    lines visually fuse into a "plan panel" via CSS sibling
                    selectors (see .task-log-line + .task-log-line). -->
-              <template x-if="m.role === 'tool_use' && isTaskTool(m) && shouldRenderTaskLine(m)">
-                <div class="task-log-line" :class="taskLogLine(m)?.colorClass">
-                  <span class="task-log-icon" x-text="taskLogLine(m)?.icon"></span>
-                  <span class="task-log-verb" x-text="taskLogLine(m)?.verb"></span>
-                  <span class="task-log-ref" x-show="taskLogLine(m)?.ref"
-                        x-text="taskLogLine(m)?.ref"></span>
-                  <span class="task-log-subject" x-show="taskLogLine(m)?.subject"
-                        x-text="taskLogLine(m)?.subject"></span>
+              <template x-if="m.role === 'tool_use' && isTaskTool(m) && shouldRenderTaskLine(m, tid)">
+                <div class="task-log-line" :class="taskLogLine(m, tid)?.colorClass">
+                  <span class="task-log-icon" x-text="taskLogLine(m, tid)?.icon"></span>
+                  <span class="task-log-verb" x-text="taskLogLine(m, tid)?.verb"></span>
+                  <span class="task-log-ref" x-show="taskLogLine(m, tid)?.ref"
+                        x-text="taskLogLine(m, tid)?.ref"></span>
+                  <span class="task-log-subject" x-show="taskLogLine(m, tid)?.subject"
+                        x-text="taskLogLine(m, tid)?.subject"></span>
                 </div>
               </template>
 
@@ -1888,7 +1972,7 @@
               <template x-if="m.role === 'tool_use' && m.name !== 'TodoWrite' && m.name !== 'Task' && m.name !== 'Agent' && m.name !== 'ExitPlanMode' && !isTaskTool(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -1940,34 +2024,6 @@
                         <pre x-text="toolInputText(m)"></pre>
                       </template>
                     </details>
-                    <!-- SDK-native background-task status for non-subagent
-                         tools (Bash run_in_background=true). Same task_status
-                         contract as the subagent card: task_started/progress/
-                         notification SSE handlers stamp m.task_status via
-                         tool_use_id; renders ⏳ running → ✅/❌ + summary +
-                         open-result link. Without this, a background Bash card
-                         never flips (only the Task/Agent template had it). -->
-                    <template x-if="m.task_status">
-                      <span class="tool-task"
-                            :class="'is-' + (m.task_status.state || 'running')">
-                        <span class="tool-task-badge"
-                              x-text="taskStatusLabel(m.task_status.state)"></span>
-                        <span class="tool-task-summary"
-                              x-show="m.task_status.summary"
-                              x-text="m.task_status.summary"></span>
-                        <a class="tool-task-open" href="#"
-                           x-show="m.task_status.output_file"
-                           @click.prevent="openTaskOutput(m.task_status)"
-                           x-text="t('subagent.open_result')"></a>
-                        <!-- Stop button — same contract as the subagent
-                             card's: visible only while running, settles via
-                             the CLI's status='stopped' notification. -->
-                        <a class="tool-task-stop" href="#"
-                           x-show="(m.task_status.state || 'running') === 'running' && m.task_status.task_id"
-                           @click.prevent="stopBackgroundTask(m.task_status)"
-                           x-text="'⏹ ' + t('subagent.stop_task')"></a>
-                      </span>
-                    </template>
                   </div>
                 </div>
               </template>
@@ -1985,11 +2041,11 @@
                    filter for. -->
               <template x-if="m.role === 'tool_use' && ['Edit','MultiEdit','Write'].includes(m.name) && m.input && (m.input.old_string || m.input.new_string || m.input.edits || m.input.content)">
                 <div class="diff-strip diff-strip-cr"
-                     :class="{ 'is-collapsed': !isMsgExpanded(i, m, isLatestEditTool(i, m)) }">
-                  <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i)">
+                     :class="{ 'is-collapsed': !isMsgExpanded(i, m, isLatestEditTool(i, m, tid), tid) }">
+                  <div class="diff-strip-head" @click.stop="toggleMsgExpanded(m, i, tid)">
                     <span class="thinking-chevron">
                       <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                        <path :d="isMsgExpanded(i, m, isLatestEditTool(i, m)) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                        <path :d="isMsgExpanded(i, m, isLatestEditTool(i, m, tid), tid) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
                       </svg>
                     </span>
                     <span class="diff-strip-label" x-text="lang==='zh' ? '改动预览' : 'diff'"></span>
@@ -2002,7 +2058,7 @@
                       </span>
                     </template>
                   </div>
-                  <div x-show="isMsgExpanded(i, m, isLatestEditTool(i, m))" class="diff-body diff-body-cr">
+                  <div x-show="isMsgExpanded(i, m, isLatestEditTool(i, m, tid), tid)" class="diff-body diff-body-cr">
                     <template x-for="(op, oi) in editDiffOps(m)" :key="oi">
                       <div :class="'diff-line diff-' + op.op">
                         <span class="diff-sign" x-text="op.op === 'ins' ? '+' : op.op === 'del' ? '−' : op.op === 'sep' ? '⋯' : ' '"></span>
@@ -2023,27 +2079,27 @@
               <template x-if="m.role === 'tool_result' && !shouldHideToolResult(m)">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
-                  <div :class="toolResultClass(i, m)">
+                  <div :class="toolResultClass(i, m, tid)">
                     <div class="tool-result-head"
-                         @click.stop="toggleMsgExpanded(m, i)"
+                         @click.stop="toggleMsgExpanded(m, i, tid)"
                          :title="lang==='zh' ? '点击展开/折叠' : 'Click to expand / collapse'">
                       <span class="thinking-chevron">
                         <svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2">
-                          <path :d="isMsgExpanded(i, m) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
+                          <path :d="isMsgExpanded(i, m, false, tid) ? 'M4 6l4 4 4-4' : 'M6 4l4 4-4 4'"/>
                         </svg>
                       </span>
-                      <span x-show="!isMsgExpanded(i, m)" class="tool-result-summary"
-                            x-text="toolResultSummary(m, i)"></span>
+                      <span x-show="!isMsgExpanded(i, m, false, tid)" class="tool-result-summary"
+                            x-text="toolResultSummary(m, i, tid)"></span>
                     </div>
                     <!-- Error hint banner — shown for failed tool calls when
                          we can detect a common pattern + give a fix. Only
                          visible when the user explicitly expands the result;
                          collapsed state should stay quiet. -->
-                    <template x-if="m.is_error && errorFixHint(m) && isMsgExpanded(i, m)">
+                    <template x-if="m.is_error && errorFixHint(m) && isMsgExpanded(i, m, false, tid)">
                       <div class="tool-error-hint">
                         <span class="tool-error-hint-icon">💡</span>
                         <span class="tool-error-hint-text" x-text="errorFixHint(m)"></span>
@@ -2051,7 +2107,7 @@
                     </template>
                     <!-- expanded body: per-tool renderer takes precedence,
                          falls back to plain text for unknown tool types -->
-                    <template x-if="isMsgExpanded(i, m)">
+                    <template x-if="isMsgExpanded(i, m, false, tid)">
                       <div class="tool-result-body">
                         <!-- Bash: terminal-style w/ stdout / stderr split -->
                         <template x-if="toolResultKind(m) === 'bash'">
@@ -2088,19 +2144,19 @@
                         <!-- WebFetch / WebSearch: card w/ source badge on top -->
                         <template x-if="toolResultKind(m) === 'web'">
                           <div class="web-card">
-                            <template x-if="findToolUseFor(m, i) && webSourceUrl(findToolUseFor(m, i))">
+                            <template x-if="findToolUseFor(m, i, tid) && webSourceUrl(findToolUseFor(m, i, tid))">
                               <div class="web-source">
                                 <span class="web-source-icon"
-                                      x-text="webIsUrl(webSourceUrl(findToolUseFor(m, i))) ? '🔗' : '🔍'"></span>
-                                <template x-if="webIsUrl(webSourceUrl(findToolUseFor(m, i)))">
+                                      x-text="webIsUrl(webSourceUrl(findToolUseFor(m, i, tid))) ? '🔗' : '🔍'"></span>
+                                <template x-if="webIsUrl(webSourceUrl(findToolUseFor(m, i, tid)))">
                                   <a class="web-source-link"
-                                     :href="webSourceUrl(findToolUseFor(m, i))"
+                                     :href="webSourceUrl(findToolUseFor(m, i, tid))"
                                      target="_blank" rel="noopener"
-                                     x-text="webSourceDomain(webSourceUrl(findToolUseFor(m, i)))"></a>
+                                     x-text="webSourceDomain(webSourceUrl(findToolUseFor(m, i, tid)))"></a>
                                 </template>
-                                <template x-if="!webIsUrl(webSourceUrl(findToolUseFor(m, i)))">
+                                <template x-if="!webIsUrl(webSourceUrl(findToolUseFor(m, i, tid)))">
                                   <span class="web-source-query"
-                                        x-text="webSourceUrl(findToolUseFor(m, i))"></span>
+                                        x-text="webSourceUrl(findToolUseFor(m, i, tid))"></span>
                                 </template>
                               </div>
                             </template>
@@ -2183,7 +2239,7 @@
               <template x-if="m.role === 'ask_user_question'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -2222,9 +2278,9 @@
                                  :aria-disabled="m.submitted"
                                  :aria-pressed="isAskOptionPicked(m, qIdx, askOptionValue(opt))"
                                  :class="{ picked: isAskOptionPicked(m, qIdx, askOptionValue(opt)), disabled: m.submitted, 'has-preview': !!(opt && opt.preview) }"
-                                 @click="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt)))"
-                                 @keydown.enter.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt)))"
-                                 @keydown.space.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt)))">
+                                 @click="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt), tid))"
+                                 @keydown.enter.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt), tid))"
+                                 @keydown.space.prevent="m.submitted ? null : (q.multiSelect ? toggleAskOption(m, qIdx, askOptionValue(opt)) : pickAskOption(m, qIdx, askOptionValue(opt), tid))">
                               <div class="ask-option-label" x-text="askOptionLabel(opt)"></div>
                               <div x-show="askOptionDesc(opt)" class="ask-option-desc" x-text="askOptionDesc(opt)"></div>
                               <!-- Optional preview (markdown / mockup / code).
@@ -2241,7 +2297,7 @@
                         <div class="ask-other-section" x-show="!m.submitted">
                           <button x-show="!m.askOtherOpen[askQuestionKey(q)]"
                                   class="ask-other-toggle"
-                                  @click="openAskOther(m, q)"
+                                  @click="openAskOther(m, q, tid)"
                                   x-text="t('ask.other')"></button>
                           <div x-show="m.askOtherOpen[askQuestionKey(q)]" class="ask-other-form">
                             <input x-show="q.isSecret"
@@ -2249,23 +2305,25 @@
                                    type="password"
                                    autocomplete="off"
                                    class="ask-other-textarea"
+                                   :data-question-key="askQuestionKey(q)"
                                    :placeholder="t('ask.placeholder')"
                                    @keydown.escape.stop="cancelAskOther(m, q)"
-                                   @keydown.enter.prevent="submitAskOther(m, q)">
+                                   @keydown.enter.prevent="submitAskOther(m, q, tid)">
                             <textarea x-show="!q.isSecret"
                                       x-model="m.askOtherText[askQuestionKey(q)]"
                                       class="ask-other-textarea"
+                                      :data-question-key="askQuestionKey(q)"
                                       rows="3"
                                       :placeholder="t('ask.placeholder')"
                                       @keydown.escape.stop="cancelAskOther(m, q)"
-                                      @keydown.meta.enter.prevent="submitAskOther(m, q)"
-                                      @keydown.ctrl.enter.prevent="submitAskOther(m, q)"></textarea>
+                                      @keydown.meta.enter.prevent="submitAskOther(m, q, tid)"
+                                      @keydown.ctrl.enter.prevent="submitAskOther(m, q, tid)"></textarea>
                             <div class="ask-other-actions">
                               <button x-show="(q.options || []).length"
                                       class="ask-other-cancel"
                                       @click="cancelAskOther(m, q)"
                                       x-text="t('ask.cancel')"></button>
-                              <button class="btn-primary" @click="submitAskOther(m, q)"
+                              <button class="btn-primary" @click="submitAskOther(m, q, tid)"
                                       :disabled="!(m.askOtherText[askQuestionKey(q)] || '').trim()"
                                       x-text="t('ask.submit')"></button>
                             </div>
@@ -2274,7 +2332,7 @@
                       </div>
                     </template>
                     <div x-show="((m.questions || []).some(q => q.multiSelect) || m.kind === 'mcp_form') && !m.submitted" class="ask-submit-row">
-                      <button class="btn-primary" @click="submitAskAnswers(m)" x-text="t('ask.submit')"></button>
+                      <button class="btn-primary" @click="submitAskAnswers(m, tid)" x-text="t('ask.submit')"></button>
                     </div>
                   </div>
                 </div>
@@ -2284,7 +2342,7 @@
               <template x-if="m.role === 'permission_request'">
                 <div class="msg-row">
                   <span class="msg-avatar assistant-avatar"
-                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i) }"
+                        :class="{ 'is-streaming-avatar': isStreamingTurnAvatar(i, tid) }"
                         :title="mascotLabel()">
                     <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                   </span>
@@ -2310,10 +2368,10 @@
                          x-text="m.url"></a>
                     </div>
                     <div class="perm-actions" x-show="!m.resolved">
-                      <button class="btn-deny" @click="decidePermission(m, 'deny')" x-text="t('perm.deny')"></button>
-                      <button class="btn-allow" @click="decidePermission(m, 'allow')" x-text="t('perm.allow')"></button>
+                      <button class="btn-deny" @click="decidePermission(m, 'deny', tid)" x-text="t('perm.deny')"></button>
+                      <button class="btn-allow" @click="decidePermission(m, 'allow', tid)" x-text="t('perm.allow')"></button>
                       <button class="btn-always" x-show="m.kind !== 'mcp_url'"
-                              @click="decidePermission(m, 'always')" x-text="t('perm.always')"></button>
+                              @click="decidePermission(m, 'always', tid)" x-text="t('perm.always')"></button>
                     </div>
                   </div>
                 </div>
@@ -2341,19 +2399,19 @@
                    messages.length) directly — method calls aren't
                    guaranteed to wire up reactivity inside x-for. -->
               <div class="turn-footer"
-                   x-show="m.role !== 'user' && (i === messages.length - 1 || (messages[i + 1] && messages[i + 1].role === 'user'))"
+                   x-show="m.role !== 'user' && (i === paneMessages(tid).length - 1 || (paneMessages(tid)[i + 1] && paneMessages(tid)[i + 1].role === 'user'))"
                    aria-hidden="true">
-                <span x-show="streaming && i === messages.length - 1"
+                <span x-show="isTabStreaming(tid) && i === paneMessages(tid).length - 1"
                       class="thinking-dots">
                   <span></span><span></span><span></span>
                 </span>
                 <!-- Elapsed counter next to the streaming dots — kicks in
                      after 1s so fast replies don't flash a "0s" label.
                      Format: 12s / 2m50s / 1h05m (see fmtStreamElapsed). -->
-                <span x-show="streaming && i === messages.length - 1 && streamElapsed >= 1"
+                <span x-show="isTabStreaming(tid) && i === paneMessages(tid).length - 1 && ((tabState[tid] && tabState[tid].streamElapsed) || 0) >= 1"
                       class="stream-elapsed"
-                      x-text="fmtStreamElapsed(streamElapsed)"></span>
-                <span x-show="m.ts && !(streaming && i === messages.length - 1)"
+                      x-text="fmtStreamElapsed((tabState[tid] && tabState[tid].streamElapsed) || 0)"></span>
+                <span x-show="m.ts && !(isTabStreaming(tid) && i === paneMessages(tid).length - 1)"
                       class="msg-ts" :title="m.model || ''"
                       x-text="fmtTurnTime(m.ts)"></span>
                 <!-- Total elapsed kept after done so the user can
@@ -2361,174 +2419,171 @@
                      for long agentic runs). Stamped in _markDone next
                      to .ts; only shown when both exist and m.elapsed
                      >= 1s (sub-second replies don't need the noise). -->
-                <span x-show="m.elapsed && m.ts && !(streaming && i === messages.length - 1)"
+                <span x-show="m.elapsed && m.ts && !(isTabStreaming(tid) && i === paneMessages(tid).length - 1)"
                       class="msg-elapsed"
                       x-text="'· ' + fmtStreamElapsed(m.elapsed)"></span>
               </div>
             </div>
           </template>
-          <!-- Pending "Muse 正在思考" bubble — only while we're waiting for
-               the very first chunk. Once a streaming assistant message has
-               started accumulating text (its bubble is already rendered
-               above via the x-for), this pending placeholder must hide or
-               we get two stacked bubbles with overlapping model labels. -->
-          <!-- Pending bubble: shown only when streaming AND there's no
-               assistant-side msg yet (i.e. last msg is the user's
-               input, or the message list is empty). Simpler than the
-               old "role NOT in [assistant, tool_use, tool_result,
-               thinking]" exclusion list — that list missed ask_user_
-               question / permission_request / system_note, leaving
-               the pending bubble's avatar duplicated next to those
-               msgs' own avatars. Now: any non-user last msg already
-               has its own avatar — suppress pending. -->
-          <div x-show="streaming && (!messages.length
-                                       || messages[messages.length-1].role === 'user')"
-               class="msg assistant">
-            <div class="msg-row">
-              <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
-                <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-              </span>
-              <div class="bubble pending">
-                <span class="thinking-dots"><span></span><span></span><span></span></span>
-                <span class="thinking-label">
-                  <span x-text="t('chat.thinking') + ' · ' + modelLabel(streamingModel)"></span>
-                  <!-- 2026-05-23: 用统一 fmtStreamElapsed（"12s"/"2m50s"/"1h05m"），
-                       跟下方 turn-footer 一致；之前是 `12.3s` 一种格式，长 turn
-                       会变 187.4s 这种难读的大数字。-->
-                  <span x-show="streamElapsed > 1" class="stream-elapsed"
-                        x-text="' · ' + fmtStreamElapsed(streamElapsed)"></span>
+            <!-- Per-pane pending queue. This must live inside .msg-pane:
+                 split mode intentionally hides chat-body children outside
+                 .chat-grid, which previously made queueing appear unsupported. -->
+            <template x-for="(q, qi) in (tabState[tid] && tabState[tid].pendingQueue || [])"
+                      :key="q.id">
+              <div class="msg user queued">
+                <div class="msg-row queued-row">
+                  <div class="bubble user-bubble queued-bubble">
+                    <div class="queued-header">
+                      <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
+                      <span class="queued-label"
+                            x-text="(lang==='zh' ? '已排队 ' : 'Queued ') + (qi+1) + ' / '
+                                     + _currentQueueLen(tid)"></span>
+                      <span style="flex:1"></span>
+                      <button class="queued-act icon-btn sm"
+                              @click="editPendingQueueItem(tid, qi)"
+                              :title="lang==='zh' ? '编辑' : 'Edit'">
+                        <svg><use href="#i-edit"/></svg>
+                      </button>
+                      <button class="queued-act icon-btn sm"
+                              @click="removePendingQueueItem(tid, qi)"
+                              :title="lang==='zh' ? '移除' : 'Remove'">
+                        <svg><use href="#i-x"/></svg>
+                      </button>
+                    </div>
+                    <div class="queued-text" x-show="q.text" x-text="q.text"></div>
+                    <div class="queued-attach" x-show="q.hasAttach">
+                      <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
+                        <img class="queued-thumb" :src="im.src" loading="lazy" alt=""
+                             @error="$el.style.display='none'" />
+                      </template>
+                      <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">
+                        <span class="queued-doc-chip" :title="d.name + ' · ' + d.kind">
+                          <svg><use href="#i-file-text"/></svg>
+                          <span x-text="d.name"></span>
+                        </span>
+                      </template>
+                      <span class="queued-doc-chip queued-attach-expired"
+                            x-show="q.expiredCount > 0">
+                        <svg><use href="#i-alert-triangle"/></svg>
+                        <span x-text="lang==='zh' ? '附件已过期' : 'attachment expired'"></span>
+                      </span>
+                      <span class="queued-doc-chip"
+                            x-show="!(q.images && q.images.length) && !(q.docs && q.docs.length) && !q.expiredCount">
+                        <svg><use href="#i-paperclip"/></svg>
+                        <span x-text="lang==='zh' ? '含附件' : 'has attachment'"></span>
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </template>
+
+            <div x-show="tabState[tid]
+                          && tabState[tid].pendingQueue
+                          && tabState[tid].pendingQueue.length
+                          && !isTabStreaming(tid)
+                          && !(tabState[tid].compacting)
+                          && !(tabState[tid]._draining)"
+                 class="queue-paused-banner">
+              <span class="queue-paused-icon"><svg><use href="#i-alert-triangle"/></svg></span>
+              <span class="queue-paused-text"
+                    x-text="((tabState[tid] && tabState[tid]._queuePaused)
+                              ? (lang==='zh' ? '上一条中断，队列已暂停（' : 'Queue paused (')
+                              : (lang==='zh' ? '队列等待中（' : 'Queue waiting (' ))
+                            + ((tabState[tid] && tabState[tid].pendingQueue
+                                && tabState[tid].pendingQueue.length) || 0)
+                            + (lang==='zh' ? ' 条）' : ' waiting)')"></span>
+              <button class="queue-paused-btn primary"
+                      @click="resumeQueueDrain(tid)"
+                      x-text="lang==='zh' ? '继续执行' : 'Resume'"></button>
+              <button class="queue-paused-btn"
+                      @click="discardQueue(tid)"
+                      x-text="lang==='zh' ? '清空队列' : 'Discard'"></button>
+            </div>
+
+            <div x-show="tabState[tid] && tabState[tid].compacting"
+                 class="msg assistant compact-pending">
+              <div class="msg-row">
+                <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
+                  <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
                 </span>
+                <div class="bubble pending">
+                  <span class="compact-pending-icon"><svg><use href="#i-package"/></svg></span>
+                  <span class="thinking-dots"><span></span><span></span><span></span></span>
+                  <span class="thinking-label" x-text="lang==='zh' ? '压缩对话中…' : 'Compacting conversation…'"></span>
+                </div>
               </div>
             </div>
-          </div>
 
+            <!-- The first-token placeholder belongs to the transcript pane in
+                 both single and split view. Keeping the single-view variant
+                 outside .chat-grid made the grid's 100% min-height insert a
+                 viewport-sized gap between the prompt and this row. -->
+            <div x-show="tabState[tid] && tabState[tid].streaming
+                         && (!paneMessages(tid).length
+                             || paneMessages(tid)[paneMessages(tid).length-1].role === 'user')"
+                 class="msg assistant first-token-pending">
+              <div class="msg-row">
+                <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
+                  <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
+                </span>
+                <div class="bubble pending">
+                  <span class="thinking-dots"><span></span><span></span><span></span></span>
+                  <span class="thinking-label">
+                    <span x-text="t('chat.thinking') + ' · ' + modelLabel((tabState[tid] && tabState[tid].streamingModel) || '')"></span>
+                    <span x-show="tabState[tid] && tabState[tid].streamElapsed > 1" class="stream-elapsed"
+                          x-text="' · ' + fmtStreamElapsed((tabState[tid] && tabState[tid].streamElapsed) || 0)"></span>
+                  </span>
+                </div>
+              </div>
+            </div>
+            </div>
+            <button class="jump-bottom"
+                    x-show="visibleChatPaneIds().length > 1 && tid === currentId
+                            && tabState[tid] && tabState[tid].atBottom === false"
+                    @click="scrollToBottom(true, tid)"
+                    :title="lang==='zh' ? '最新' : 'Jump to latest'"
+                    :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'">
+              <svg><use href="#i-arrow-down"/></svg>
+            </button>
+            <button class="chat-outline-fab"
+                    x-show="visibleChatPaneIds().length > 1 && tid === currentId
+                            && tabState[tid] && tabState[tid].atBottom === false"
+                    @click="msgOutlineOpen = true"
+                    :title="lang==='zh' ? '会话目录' : 'Outline'">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                   stroke-linecap="round" stroke-linejoin="round">
+                <line x1="8" y1="6" x2="21" y2="6"/>
+                <line x1="8" y1="12" x2="21" y2="12"/>
+                <line x1="8" y1="18" x2="21" y2="18"/>
+                <circle cx="4" cy="6" r="1" fill="currentColor"/>
+                <circle cx="4" cy="12" r="1" fill="currentColor"/>
+                <circle cx="4" cy="18" r="1" fill="currentColor"/>
+              </svg>
+            </button>
+            <button class="chat-prevuser-fab"
+                    x-show="visibleChatPaneIds().length > 1 && tid === currentId
+                            && tabState[tid] && tabState[tid].atBottom === false"
+                    @click="jumpToPrevUser()"
+                    :title="lang==='zh' ? '上一条提问' : 'Previous message'"
+                    :aria-label="lang==='zh' ? '跳到上一条用户消息' : 'Jump to previous user message'">
+              <svg><use href="#i-arrow-up"/></svg>
+            </button>
+            <button x-show="tid !== currentId && tabState[tid] && tabState[tid]._loaded"
+                    class="chat-grid-mask"
+                    @click.stop="activateGridPane(tid)"
+                    @wheel.prevent.stop="scrollGridPane(tid, $event)"
+                    :aria-label="(lang==='zh' ? '选中会话：' : 'Select session: ') + tabTitle(tid)">
+              <span x-text="lang==='zh' ? '点击选中会话' : 'Click to select session'"></span>
+            </button>
+          </section>
+          </template>
+          </div>
           <!-- Standalone .streaming-tail removed — its job is now done
                by .turn-footer inside the x-for loop, which renders on
                the tail block of each turn and shows dots while
                streaming + HH:MM once done. -->
 
-          <!-- Pending queue: messages the user sent while Muse was still
-               replying (or while a compact was running). They auto-drain on
-               the next done event / compact-finally / activateTab. Faded
-               + dashed border distinguishes them from real user bubbles. -->
-          <template x-for="(q, qi) in (tabState[currentId] && tabState[currentId].pendingQueue || [])"
-                    :key="q.id">
-            <div class="msg user queued">
-              <div class="msg-row queued-row">
-                <div class="bubble user-bubble queued-bubble">
-                  <div class="queued-header">
-                    <span class="queued-icon"><svg><use href="#i-clock"/></svg></span>
-                    <!-- "/N" uses _currentQueueLen() (which guards
-                         tabState[currentId] being undefined) instead of
-                         tabState[currentId].pendingQueue.length directly:
-                         during a tab switch, Alpine briefly re-evaluates
-                         this child binding while currentId already points
-                         at a fresh-but-uninitialized tabState entry,
-                         which threw "undefined is not an object" in the
-                         wild (reported via /api/log/client-error
-                         2026-05-22). -->
-                    <span class="queued-label"
-                          x-text="(lang==='zh' ? '已排队 ' : 'Queued ') + (qi+1) + ' / '
-                                   + _currentQueueLen()"></span>
-                    <span style="flex:1"></span>
-                    <button class="queued-act icon-btn sm"
-                            @click="editPendingQueueItem(currentId, qi)"
-                            :title="lang==='zh' ? '编辑' : 'Edit'">
-                      <svg><use href="#i-edit"/></svg>
-                    </button>
-                    <button class="queued-act icon-btn sm"
-                            @click="removePendingQueueItem(currentId, qi)"
-                            :title="lang==='zh' ? '移除' : 'Remove'">
-                      <svg><use href="#i-x"/></svg>
-                    </button>
-                  </div>
-                  <div class="queued-text" x-show="q.text" x-text="q.text"></div>
-                  <!-- FIX ③: the server resolves queued upload IDs against its
-                       in-memory store, so we can render real image thumbnails
-                       and named doc chips here — matching how a SENT message
-                       looks, instead of the old neutral "含附件" marker.
-                       Expired uploads (TTL) show a muted "附件已过期" chip. -->
-                  <div class="queued-attach" x-show="q.hasAttach">
-                    <template x-for="(im, ii) in (q.images || [])" :key="'qimg'+ii">
-                      <img class="queued-thumb" :src="im.src" loading="lazy" alt=""
-                           @error="$el.style.display='none'" />
-                    </template>
-                    <template x-for="(d, di) in (q.docs || [])" :key="'qdoc'+di">
-                      <span class="queued-doc-chip" :title="d.name + ' · ' + d.kind">
-                        <svg><use href="#i-file-text"/></svg>
-                        <span x-text="d.name"></span>
-                      </span>
-                    </template>
-                    <span class="queued-doc-chip queued-attach-expired"
-                          x-show="q.expiredCount > 0">
-                      <svg><use href="#i-alert-triangle"/></svg>
-                      <span x-text="lang==='zh' ? '附件已过期' : 'attachment expired'"></span>
-                    </span>
-                    <!-- Fallback: ids present but metadata not yet resolved
-                         (e.g. mid tab-switch before the queue sync lands). -->
-                    <span class="queued-doc-chip"
-                          x-show="!(q.images && q.images.length) && !(q.docs && q.docs.length) && !q.expiredCount">
-                      <svg><use href="#i-paperclip"/></svg>
-                      <span x-text="lang==='zh' ? '含附件' : 'has attachment'"></span>
-                    </span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </template>
-
-          <!-- Idle-with-items banner. Shows whenever the queue has items but
-               nothing is running on this session (not streaming, not
-               compacting, not mid-reattach). Two reasons this happens:
-                 1. An error / interrupt paused the queue server-side
-                    (_queuePaused) — the user fixes the root cause then resumes.
-                 2. Items left dormant after a process restart — the server
-                    intentionally does NOT auto-resume draining on boot, so
-                    they wait here for an explicit Resume.
-               While a turn is running, items just auto-drain server-side and
-               this banner stays hidden. -->
-          <div x-show="tabState[currentId]
-                        && tabState[currentId].pendingQueue
-                        && tabState[currentId].pendingQueue.length
-                        && !streaming
-                        && !(tabState[currentId].compacting)
-                        && !(tabState[currentId]._draining)"
-               class="queue-paused-banner">
-            <span class="queue-paused-icon"><svg><use href="#i-alert-triangle"/></svg></span>
-            <span class="queue-paused-text"
-                  x-text="((tabState[currentId] && tabState[currentId]._queuePaused)
-                            ? (lang==='zh' ? '上一条中断，队列已暂停（' : 'Queue paused (')
-                            : (lang==='zh' ? '队列等待中（' : 'Queue waiting (' ))
-                          + ((tabState[currentId] && tabState[currentId].pendingQueue
-                              && tabState[currentId].pendingQueue.length) || 0)
-                          + (lang==='zh' ? ' 条）' : ' waiting)')"></span>
-            <button class="queue-paused-btn primary"
-                    @click="resumeQueueDrain(currentId)"
-                    x-text="lang==='zh' ? '继续执行' : 'Resume'"></button>
-            <button class="queue-paused-btn"
-                    @click="discardQueue(currentId)"
-                    x-text="lang==='zh' ? '清空队列' : 'Discard'"></button>
-          </div>
-
-          <!-- Compact-in-progress placeholder bubble. Mirrors the streaming
-               pending bubble above so the user sees a familiar "something is
-               working" cue at the bottom of the chat (not just the silent
-               shimmer in the top ctx-meter). Appears for the full window
-               between native-compact POST and loadSession completing — can
-               be ~20-60s on a long session. -->
-          <div x-show="tabState[currentId] && tabState[currentId].compacting" class="msg assistant compact-pending">
-            <div class="msg-row">
-              <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
-                <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
-              </span>
-              <div class="bubble pending">
-                <span class="compact-pending-icon"><svg><use href="#i-package"/></svg></span>
-                <span class="thinking-dots"><span></span><span></span><span></span></span>
-                <span class="thinking-label" x-text="lang==='zh' ? '压缩对话中…' : 'Compacting conversation…'"></span>
-              </div>
-            </div>
-          </div>
-        </div>
         <button class="jump-bottom" x-show="!atBottom" @click="scrollToBottom(true)" :title="lang==='zh'?'最新':'Jump to latest'" :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'"><svg><use href="#i-arrow-down"/></svg></button>
         <!-- Outline FAB — sits right above jump-bottom in the same chat
              pane. Same visibility rule as jump-bottom (x-show="!atBottom")
@@ -2707,6 +2762,16 @@
                     :title="t('attach.title')">
               <svg><use href="#i-paperclip"/></svg>
             </button>
+            <select class="chat-toolbar-select chat-toolbar-workspace"
+                    :disabled="workspaceSwitching || _creatingSession"
+                    :value="currentWorkspacePath()"
+                    @change="chooseSessionWorkspace($event.target.value); $event.target.value = currentWorkspacePath()"
+                    :title="lang==='zh' ? '会话工作目录（切换会新建会话）' : 'Session workspace (switching creates a new session)'">
+              <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
+                <option :value="workspace.path" x-text="workspace.name"></option>
+              </template>
+              <option value="__custom__" x-text="lang==='zh' ? '自定义目录…' : 'Custom directory…'"></option>
+            </select>
             <!-- Command-palette opener lives in the chat pane's TOP bar
                  (global "files / sessions / actions" entry), not here.
                  This bottom toolbar is reserved for per-turn controls
@@ -2718,6 +2783,7 @@
                  See the header near the organize / scheduler buttons. -->
             <!-- Model selector -->
             <select x-model="model" @change="onModelChange()"
+                    :disabled="_sessionSettingsBusy(currentId)"
                     class="chat-toolbar-select"
                     :title="lang==='zh' ? '切换模型' : 'Switch model'">
               <template x-if="model && !availableModels.some(m => m.model === model)">
@@ -2732,7 +2798,9 @@
               </template>
             </select>
             <!-- Permission mode -->
-            <select x-model="permission" class="chat-toolbar-select chat-toolbar-permission"
+            <select x-model="permission" @change="onPermissionChange()"
+                    :disabled="_sessionSettingsBusy(currentId)"
+                    class="chat-toolbar-select chat-toolbar-permission"
                     :title="t('set.label.default_permission')">
               <option value="default" x-text="permissionLabel('default')"></option>
               <option value="plan" x-text="permissionLabel('plan')"></option>
@@ -2742,6 +2810,8 @@
                  means the model catalog's native default; explicit values are
                  sent as turn/start.effort and persist for later turns. -->
             <select x-model="effort" @change="onEffortChange()"
+                    :disabled="_sessionSettingsBusy(currentId)"
+                    x-effect="effort + ':' + model + ':' + availableModels.length; $nextTick(() => { $el.value = effort || '' })"
                     x-show="_supportsEffort(model)"
                     class="chat-toolbar-select chat-toolbar-effort"
                     :title="t('effort.title')">
@@ -2759,6 +2829,7 @@
               <button type="button"
                       class="chat-toolbar-btn chat-toolbar-more-btn"
                       :class="{ active: composerSettingsOpen }"
+                      :disabled="_sessionSettingsBusy(currentId)"
                       @click.stop="composerSettingsOpen = !composerSettingsOpen"
                       :title="lang==='zh' ? '会话设置（权限 / Effort）' : 'Session settings (permission / effort)'">
                 <svg><use href="#i-cog"/></svg>
@@ -2776,8 +2847,19 @@
                    @keydown.escape.window="composerSettingsOpen = false">
                 <div class="chat-toolbar-more-title" x-text="t('session.settings')"></div>
                 <label class="chat-toolbar-more-field">
+                  <span x-text="lang==='zh' ? '工作目录' : 'Workspace'"></span>
+                  <select :value="currentWorkspacePath()"
+                          @change="chooseSessionWorkspace($event.target.value); composerSettingsOpen = false">
+                    <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
+                      <option :value="workspace.path" x-text="workspace.name"></option>
+                    </template>
+                    <option value="__custom__" x-text="lang==='zh' ? '自定义目录…' : 'Custom directory…'"></option>
+                  </select>
+                </label>
+                <label class="chat-toolbar-more-field">
                   <span x-text="t('session.permission')"></span>
-                  <select x-model="permission">
+                  <select x-model="permission" @change="onPermissionChange()"
+                          :disabled="_sessionSettingsBusy(currentId)">
                     <option value="default" x-text="permissionLabel('default')"></option>
                     <option value="plan" x-text="permissionLabel('plan')"></option>
                     <option value="bypassPermissions" x-text="permissionLabel('bypassPermissions')"></option>
@@ -2785,7 +2867,9 @@
                 </label>
                 <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
                   <span x-text="t('session.intelligence')"></span>
-                  <select x-model="effort" @change="onEffortChange()">
+                  <select x-model="effort" @change="onEffortChange()"
+                          :disabled="_sessionSettingsBusy(currentId)"
+                          x-effect="effort + ':' + model + ':' + availableModels.length; $nextTick(() => { $el.value = effort || '' })">
                     <template x-for="opt in effortChoices(model)" :key="opt.value || 'auto'">
                       <option :value="opt.value" x-text="t(opt.labelKey)"></option>
                     </template>
@@ -2793,24 +2877,14 @@
                 </label>
               </div>
             </div>
-            <!-- Extended-thinking on/off. Default on. Turning it OFF is the
-                 escape hatch for the CLI streaming-interleaving 400 ("thinking
-                 blocks ... cannot be modified"): a thinking-free session can't
-                 produce the interleaved blocks that trip the API. Per-session,
-                 PATCH {thinking}; rebuilds the client on next turn. Shown for
-                 ALL providers whose endpoint honors the thinking config
-                 (provider-level supports_thinking from /api/chat/providers) —
-                 hidden only for vendors that reject it (e.g. Qianfan), where
-                 the switch would be a no-op. -->
-            <!-- Hidden because the runtime does not consistently honor a
-                 disabled thinking mode across current models. Backend plumbing
-                 and JS remain intact; flip
-                 x-show back to `_supportsThinking(model)` to restore once the
-                 CLI/model actually supports turning thinking off. -->
+            <!-- Native reasoning-summary visibility. Codex 0.144.1 exposes
+                 thread/settings/update.summary (auto / none); the backend also
+                 persists it for pre-first-turn threads and queue drains. -->
             <label class="chat-toolbar-think"
-                   x-show="false"
+                   x-show="_supportsThinking(model)"
                    :title="t('thinking.title')">
-              <input type="checkbox" x-model="thinkingEnabled" @change="onThinkingChange()">
+              <input type="checkbox" x-model="thinkingEnabled" @change="onThinkingChange()"
+                     :disabled="_sessionSettingsBusy(currentId)">
               <span x-text="t('thinking.label')"></span>
             </label>
             <!-- Context ring — % used. Click to compact. Right-click
@@ -2861,24 +2935,29 @@
                  tabState[currentId].pendingQueue. A small badge in the
                  corner surfaces the current backlog count. The title
                  swaps to reflect what the click will actually do, so
-                 the user always knows. The neighboring stop button only
-                 shows while streaming. Same shape + size + fill — they
-                 read as a sibling pair (blue send / red stop). -->
+                 the user always knows. The neighboring stop button follows
+                 the same session-scoped running predicate as the transcript,
+                 including a server-owned turn without a local EventSource.
+                 Same shape + size + fill — they read as a sibling pair
+                 (blue send / red stop). -->
             <button @click="send()"
                     :disabled="!availableModels.length || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
-                    :title="streaming ? t('queue.button_hint') : t('btn.send')">
+                    :title="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')">
               <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
               <span class="chat-toolbar-queue-badge"
                     x-show="_currentQueueLen() > 0"
                     x-text="_currentQueueLen()"></span>
             </button>
-            <button x-show="streaming" @click="stop()" class="btn-danger chat-toolbar-send"
-                    :title="_currentQueueLen() > 0
-                              ? (lang==='zh'
-                                  ? '撤回队尾（队列 ' + _currentQueueLen() + ' 条）'
-                                  : 'Pop last queued (' + _currentQueueLen() + ' waiting)')
-                              : (t('btn.stop') + ' (Esc)')">
+            <button x-show="isTabStreaming(currentId)" @click="stop()"
+                    :disabled="!!(tabState[currentId] && tabState[currentId]._stopping)"
+                    class="btn-danger chat-toolbar-send chat-toolbar-stop"
+                    :title="(tabState[currentId] && tabState[currentId]._stopping)
+                              ? t('btn.stopping')
+                              : (t('btn.stop') + ' (Esc)')"
+                    :aria-label="(tabState[currentId] && tabState[currentId]._stopping)
+                                  ? t('btn.stopping')
+                                  : t('btn.stop')">
               <span class="icon"><svg><use href="#i-square"/></svg></span><span x-text="t('btn.stop')"></span>
             </button>
           </div>
@@ -2935,143 +3014,6 @@
       </ul>
       <div x-show="outlineMessages().length === 0" class="msg-outline-empty"
            x-text="lang==='zh' ? '此会话还没有 user 消息' : 'No user messages yet'"></div>
-    </div>
-  </div>
-
-  <!-- ============ Codex / OpenAI image generation ============ -->
-  <div class="modal-backdrop image-gen-backdrop"
-       x-show="imageGen.show"
-       x-cloak
-       @click.self="closeImageGen()">
-    <div class="modal image-gen-modal"
-         @keydown.escape.window="closeImageGen()"
-         role="dialog" aria-modal="true"
-         :aria-label="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2 image generation'">
-      <div class="modal-head">
-        <span class="modal-title">
-          <svg class="modal-title-icon"><use href="#i-image"/></svg>
-          <span x-text="lang==='zh' ? 'Codex Image 2 生图' : 'Codex Image 2'"></span>
-        </span>
-        <button class="modal-close"
-                @click="closeImageGen()"
-                :disabled="imageGen.loading"
-                :title="lang==='zh' ? '关闭' : 'Close'">×</button>
-      </div>
-      <div class="modal-body image-gen-body">
-        <textarea x-ref="imageGenPrompt"
-                  x-model="imageGen.prompt"
-                  class="image-gen-prompt"
-                  rows="5"
-                  :placeholder="lang==='zh' ? '描述你想生成的图片……' : 'Describe the image you want…'"></textarea>
-        <div class="image-gen-controls">
-          <label>
-            <span x-text="lang==='zh' ? '模型' : 'Model'"></span>
-            <input x-model="imageGen.model" />
-          </label>
-          <label>
-            <span x-text="lang==='zh' ? '尺寸' : 'Size'"></span>
-            <select x-model="imageGen.size">
-              <option value="1024x1024">1024×1024</option>
-              <option value="1536x1024">1536×1024</option>
-              <option value="1024x1536">1024×1536</option>
-              <option value="auto">auto</option>
-            </select>
-          </label>
-          <label>
-            <span x-text="lang==='zh' ? '质量' : 'Quality'"></span>
-            <select x-model="imageGen.quality">
-              <option value="low">low</option>
-              <option value="medium">medium</option>
-              <option value="high">high</option>
-              <option value="auto">auto</option>
-            </select>
-          </label>
-          <label>
-            <span x-text="lang==='zh' ? '格式' : 'Format'"></span>
-            <select x-model="imageGen.output_format">
-              <option value="png">png</option>
-              <option value="jpeg">jpeg</option>
-              <option value="webp">webp</option>
-            </select>
-          </label>
-          <label>
-            <span x-text="lang==='zh' ? '张数' : 'Count'"></span>
-            <select x-model.number="imageGen.n">
-              <option :value="1">1</option>
-              <option :value="2">2</option>
-              <option :value="3">3</option>
-              <option :value="4">4</option>
-            </select>
-          </label>
-        </div>
-        <label class="image-gen-ref"
-               x-show="pendingImages.some(x => x && x.id && !x.uploading && !x.error)">
-          <input type="checkbox" x-model="imageGen.useReferences">
-          <span x-text="lang==='zh' ? '用当前待发送图片作为参考' : 'Use current pending images as references'"></span>
-        </label>
-        <div class="settings-hint warn" x-show="imageGen.error" x-text="imageGen.error"></div>
-        <div class="image-gen-history-head">
-          <span x-text="lang==='zh' ? '历史生成' : 'History'"></span>
-          <button class="btn-ghost sm" type="button"
-                  @click="refreshImageGenJobs()"
-                  :disabled="imageGen.jobsLoading"
-                  x-text="imageGen.jobsLoading ? (lang==='zh' ? '刷新中…' : 'Refreshing…') : (lang==='zh' ? '刷新' : 'Refresh')"></button>
-        </div>
-        <div class="image-gen-empty" x-show="!imageGen.jobs.length && !imageGen.jobsLoading"
-             x-text="lang==='zh' ? '还没有生成记录。' : 'No generated images yet.'"></div>
-        <div class="image-gen-results" x-show="imageGen.jobs.length">
-          <template x-for="job in imageGen.jobs" :key="job.id">
-            <div class="image-gen-job" :class="'status-' + job.status">
-              <div class="image-gen-job-head">
-                <div class="image-gen-job-title">
-                  <span class="image-gen-status" x-text="imageGenStatusLabel(job.status)"></span>
-                  <span x-text="job.provider || job.model || 'imagegen'"></span>
-                </div>
-                <div class="image-gen-job-actions">
-                  <button class="btn-ghost sm" type="button"
-                          @click="copyImageGenPrompt(job)"
-                          x-text="t('image_gen.copy_prompt')"></button>
-                  <button class="btn-ghost sm" type="button"
-                          @click="reuseImageGenPrompt(job)"
-                          x-text="t('image_gen.reuse_prompt')"></button>
-                  <span class="image-gen-job-time" x-text="fmtHM((job.updated_at || job.created_at) * 1000)"></span>
-                </div>
-              </div>
-              <div class="image-gen-job-prompt" x-text="job.prompt"></div>
-              <div class="settings-hint warn" x-show="job.error" x-text="job.error"></div>
-              <div class="image-gen-job-pending"
-                   x-show="job.status === 'queued' || job.status === 'running'">
-                <span class="thinking-dots"><span></span><span></span><span></span></span>
-                <span x-text="lang==='zh' ? '后台生成中，可以关闭这个窗口。' : 'Generating in the background. You can close this window.'"></span>
-              </div>
-              <div class="image-gen-job-grid" x-show="job.images && job.images.length">
-                <template x-for="img in (job.images || [])" :key="img.image_id">
-                  <div class="image-gen-card">
-                    <button type="button" class="image-gen-preview"
-                            @click="openLightbox(img.data_url || img.blob_url, img.name)">
-                      <img :src="img.data_url || img.blob_url" alt="" />
-                    </button>
-                    <div class="image-gen-card-foot">
-                      <span x-text="img.name"></span>
-                      <button class="btn-primary sm"
-                              @click="attachImageGenHistory(job, img)"
-                              x-text="lang==='zh' ? '加入消息' : 'Attach'"></button>
-                    </div>
-                  </div>
-                </template>
-              </div>
-            </div>
-          </template>
-        </div>
-      </div>
-      <div class="modal-foot">
-        <button class="btn-ghost" @click="closeImageGen()"
-                x-text="t('btn.cancel')"></button>
-        <button class="btn-primary"
-                @click="runImageGen()"
-                :disabled="imageGen.loading || !imageGen.prompt.trim()"
-                x-text="imageGen.loading ? (lang==='zh' ? '提交中…' : 'Submitting…') : (lang==='zh' ? '提交后台任务' : 'Submit job')"></button>
-      </div>
     </div>
   </div>
 
@@ -3194,7 +3136,7 @@
             <span class="settings-menu-title" x-text="t('set.sec.lang')"></span>
             <span class="settings-menu-chevron">›</span>
           </li>
-          <li class="settings-menu-item" x-show="runtimeKind === 'codex'" @click="openSettingsPage('native-providers')"
+          <li class="settings-menu-item" @click="openSettingsPage('native-providers')"
               :class="{ active: settings.activePage==='native-providers' }">
             <span class="settings-menu-icon"><svg><use href="#i-key"/></svg></span>
             <span class="settings-menu-title" x-text="t('set.sec.provider')"></span>
@@ -3275,7 +3217,7 @@
         </div>
 
         <div class="settings-section" data-page="native-providers"
-             x-show="runtimeKind === 'codex' && settings.activePage === 'native-providers'">
+             x-show="settings.activePage === 'native-providers'">
           <div class="settings-section-title">
             <span x-text="t('set.sec.provider')"></span>
             <span class="settings-save-mode live" x-text="lang==='zh' ? '即时生效' : 'Live'"></span>

@@ -191,13 +191,13 @@ async def test_native_item_timeout_falls_back_to_transcript_without_restart():
 
         async def read(self, thread_id, *, include_turns=True, timeout=None):
             assert include_turns is False
-            return {"id": thread_id}
+            return {"id": thread_id, "_settings": {"effort": "max"}}
 
     class Transcripts:
         async def read(self, _thread_id):
             return type("Snapshot", (), {
                 "items": ({"type": "agentMessage", "text": "cached"},),
-                "settings": {},
+                "settings": {"model": "gpt-test", "effort": "high"},
             })()
 
     runtime = Runtime()
@@ -209,4 +209,5 @@ async def test_native_item_timeout_falls_back_to_transcript_without_restart():
     assert result["turns"] == [{"items": [
         {"type": "agentMessage", "text": "cached"},
     ]}]
+    assert result["_settings"] == {"model": "gpt-test", "effort": "max"}
     assert runtime.restarts == 0

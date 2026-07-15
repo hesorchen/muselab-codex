@@ -127,16 +127,79 @@ def test_i18n_zh_en_key_parity():
     )
 
 
-def test_image_generation_history_prompt_actions_are_wired():
-    """History prompt actions need both Alpine handlers and template wiring."""
+def test_image_generation_toolbar_uses_native_chat_instead_of_removed_api():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     index = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    assert "copyImageGenPrompt(job)" in app
-    assert "reuseImageGenPrompt(job)" in app
-    assert '@click="copyImageGenPrompt(job)"' in index
-    assert '@click="reuseImageGenPrompt(job)"' in index
-    assert 'x-ref="imageGenPrompt"' in index
+    assert "promptNativeImageGeneration()" in app
+    assert '@click="promptNativeImageGeneration()"' in index
+    assert "/api/chat/image-generate" not in app
+    assert 'x-ref="imageGenPrompt"' not in index
+    assert "current.startsWith(lead) ? current : lead + current" in app
+
+
+def test_removed_background_task_compatibility_ui_cannot_call_dead_routes():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    for dead in (
+        "/api/chat/task-output", "task_started", "task_progress",
+        "task_notification", "openTaskOutput", "stopBackgroundTask",
+        "_ensureBgContPoller", "task_status",
+    ):
+        assert dead not in app
+        assert dead not in index
+
+
+def test_native_tab_menu_does_not_offer_unsupported_system_prompt_editor():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert "menuEditPrompt" not in app
+    assert "editSessionPrompt" not in app
+    assert "编辑 system prompt" not in index
+    assert "Edit system prompt" not in index
+
+
+def test_session_export_uses_header_auth_blob_and_surfaces_failures():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async menuExportMarkdown(id)")
+    end = app.index("\n    async menuDelete", start)
+    method = app[start:end]
+
+    assert "?token=" not in method
+    assert "{ headers: this.hdr() }" in method
+    assert "await r.blob()" in method
+    assert "URL.revokeObjectURL(href)" in method
+    assert '"导出失败"' in method
+
+
+def test_native_boot_does_not_poll_noop_interrupted_turn_sidecar():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert "/api/chat/interrupted-turns" not in app
+    assert "_checkInterruptedTurns" not in app
+
+
+def test_stream_transport_never_falls_back_to_prompt_or_token_query_params():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("// Ticket flow: POST the prompt")
+    end = app.index("const es = new EventSource(url)", start)
+    transport = app[start:end]
+
+    assert 'fetch("/api/chat/stream/start"' in transport
+    assert 'url = "/api/chat/stream?ticket="' in transport
+    assert '"?prompt="' not in transport
+    assert '"&token="' not in transport
+
+
+def test_attachment_uploads_have_a_real_timeout_and_do_not_log_filenames():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert app.count("() => uploadController.abort(), 5 * 60 * 1000") == 2
+    assert app.count("signal: uploadController.signal") == 2
+    assert app.count("clearTimeout(uploadTimeout)") == 2
+    assert "[muselab][upload]" not in app
 
 
 def test_slash_compact_uses_native_codex_path():
@@ -188,12 +251,12 @@ def test_shared_runtime_and_mcp_elicitation_are_wired():
 
 def test_context_ring_never_invents_a_model_window():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    start = app.index("async _refreshCtxMeter()")
+    start = app.index("async _refreshCtxMeter(")
     end = app.index("\n    async showCtxBreakdown()", start)
     method = app[start:end]
 
     assert "200000" not in method
-    assert "this.sessionUsage.context_limit" in method
+    assert "st.sessionUsage.context_limit" in method
 
 
 def test_native_session_mounts_tab_before_activating_it():
@@ -243,13 +306,62 @@ def test_default_permission_is_saved_separately_from_current_session():
     assert "'Ask as needed'" not in html
 
 
+def test_session_permission_is_persisted_with_owner_and_stale_response_guards():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    start = app.index("async onPermissionChange()")
+    end = app.index("\n    async onThinkingChange()", start)
+    method = app[start:end]
+
+    assert "const sid = this.currentId" in method
+    assert "++st._permissionPatchSeq" in method
+    assert "JSON.stringify({ permission: next })" in method
+    assert "this.tabState[sid] !== st" in method
+    assert "if (this.currentId === sid) this.permission" in method
+    assert html.count('@change="onPermissionChange()"') == 2
+    assert "_permissionPatchSeq: 0" in app
+    assert "st._permissionPatchSeq =" in app
+
+
+def test_session_setting_writes_are_serialized_before_server_persistence():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async _serializeTabSettingPatch")
+    end = app.index("\n    modelGroups()", start)
+    settings = app[start:end]
+
+    assert "const prior = st[tailKey] || Promise.resolve()" in settings
+    assert "Promise.resolve(prior).catch(() => {}).then(work)" in settings
+    assert '"_effortPatchTail"' in settings
+    assert '"_permissionPatchTail"' in settings
+    assert '"_thinkingPatchTail"' in settings
+
+
+def test_native_optimistic_session_resets_composer_settings_and_locks_controls():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    start = app.index("async _newServerSession()")
+    end = app.index("\n    newSession()", start)
+    method = app[start:end]
+
+    assert 'this.effort = ""' in method
+    assert "this.thinkingEnabled = true" in method
+    assert 'effort: ""' in method
+    assert "thinking: true" in method
+    assert "this.effort = meta.effort || \"\"" in method
+    assert "this.thinkingEnabled = meta.thinking !== false" in method
+    assert "_sessionCreatePromises && this._sessionCreatePromises[sid]" in app
+    assert "st._modelChanging" in app
+    assert "st._effortPatchTail" in app
+    assert html.count(':disabled="_sessionSettingsBusy(currentId)"') >= 7
+
+
 def test_mobile_session_settings_expose_permission_and_effort_without_clipping():
     """The gear popover must show both per-session controls above composer."""
     html = (FRONTEND / "index.html").read_text(encoding="utf-8")
     css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
 
     start = html.index('<div class="chat-toolbar-more">')
-    end = html.index("<!-- Extended-thinking", start)
+    end = html.index("<!-- Native reasoning-summary", start)
     popover = html[start:end]
 
     assert "t('session.permission')" in popover
@@ -268,18 +380,29 @@ def test_mobile_session_settings_expose_permission_and_effort_without_clipping()
 def test_turn_done_stamps_the_actual_tail_message_for_footer():
     """A trailing tool/task item must not leave completion footer empty."""
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    start = app.index("const _markDone = (cancelled = false) =>")
+    start = app.index("const _markDone = (cancelled = false, timing = {}) =>")
     end = app.index('es.addEventListener("done"', start)
     mark_done = app[start:end]
 
     assert "streamState.messages.splice(k, 1" in mark_done
-    assert "ts: m.ts || _now" in mark_done
+    assert "ts: _completedMs" in mark_done
+    assert "elapsed: _elapsed >= 1 ? _elapsed : 0" in mark_done
+    assert "Number(timing.elapsedMs)" in mark_done
     assert "if (m.role !== \"assistant\") continue" not in mark_done
+
+
+def test_reconnect_footer_timing_uses_relative_server_age():
+    """Phone/server clock skew must not leak into the elapsed counter."""
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+
+    assert "elapsedSeconds: d.elapsed_seconds" in app
+    assert "Date.now() - (_relativeAge * 1000)" in app
+    assert "elapsedMs: _doneElapsedMs" in app
 
 
 def test_stale_permission_card_is_marked_expired_on_404():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    start = app.index("async decidePermission(msg, decision)")
+    start = app.index("async decidePermission(msg, decision, sid = this.currentId)")
     end = app.index("\n    async togglePinSession", start)
     method = app[start:end]
 
@@ -294,7 +417,7 @@ def test_send_waits_for_native_id_when_started_from_an_optimistic_draft():
     method = app[start:end]
 
     pending = method.index("const pendingCreate")
-    snapshot = method.index("const sendSid = this.currentId")
+    snapshot = method.index("const sendSid = opts.sessionId || this.currentId")
     assert pending < snapshot
     assert "await pendingCreate" in method
     assert "return this.send(opts)" in method
@@ -305,7 +428,42 @@ def test_session_poll_is_single_flight_and_saved_tab_keys_are_sanitized():
 
     assert "if (this._sessionListPullPromise) return this._sessionListPullPromise" in app
     assert "async _pullSessionListOnce(" in app
+    assert "signal: controller.signal" in app
+    assert "this._reconcileOpenSession(this.sessions)" in app
     assert "[...new Set(p.openTabIds.filter(" in app
+
+
+def test_open_session_revision_is_only_advanced_after_transcript_load():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_reconcileOpenSession(next)")
+    end = app.index("\n    _sessionsEqual", start)
+    reconcile = app[start:end]
+
+    assert reconcile.index("st._seenUpdated = newU") > reconcile.index(
+        "if (!needsRefresh)"
+    )
+    assert "_reconcileTargetUpdated" in reconcile
+    assert "const stillBehind" in reconcile
+    assert "st._pendingExternalUpdate = true" in reconcile
+
+
+def test_delayed_session_list_preserves_pending_setting_echoes():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_retainExpectedSessionSettings(meta)")
+    end = app.index("\n    // Shared session-list applier", start)
+    helper = app[start:end]
+    equal_start = app.index("_sessionsEqual(a, b)")
+    equal_end = app.index("\n    // Generic select-rebind", equal_start)
+    equality = app[equal_start:equal_end]
+
+    assert '"_modelExpected"' in helper
+    assert '"_effortExpected"' in helper
+    assert '"_permissionExpected"' in helper
+    assert '"_thinkingExpected"' in helper
+    assert "expected.echoed = true" in helper
+    assert "next.map(meta => this._retainExpectedSessionSettings(meta))" in app
+    assert "const s = this._retainExpectedSessionSettings(await r.json())" in app
+    assert '(x.permission || "default") !== (y.permission || "default")' in equality
 
 
 def test_large_markdown_preview_skips_rich_dom_postprocessing():
@@ -353,6 +511,19 @@ def test_boot_paints_shell_before_deferred_tree_and_stats_work():
     assert "await this.fetchContextInfo()" not in boot
 
 
+def test_presence_restart_replaces_global_handlers_instead_of_stacking_them():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_startPresence()")
+    end = app.index("\n    async _pingHealth()", start)
+    presence = app[start:end]
+
+    assert 'document.removeEventListener(\n          "visibilitychange"' in presence
+    assert 'document.addEventListener(\n        "visibilitychange"' in presence
+    assert 'window.removeEventListener("pagehide"' in presence
+    assert 'window.addEventListener("pagehide"' in presence
+    assert presence.index("removeEventListener") < presence.index("addEventListener")
+
+
 def test_model_discovery_precedes_optional_rate_limit_and_retries():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async fetchStats()")
@@ -380,9 +551,249 @@ def test_codex_quota_labels_distinguish_equal_duration_limits():
     assert 'x-text="codexLimitWindowLabel(w) || w.key"' in html
 
 
-def test_chat_messages_use_one_flat_keyed_loop():
+def test_chat_grid_uses_stable_session_and_message_keys():
     index = (FRONTEND / "index.html").read_text(encoding="utf-8")
 
-    assert 'x-for="(m, i) in messages"' in index
-    assert 'x-for="tid in residentPaneIds()"' not in index
-    assert "paneMessages(tid)" not in index
+    assert 'x-for="tid in mountedChatPaneIds()" :key="tid"' in index
+    assert 'x-show="visibleChatPaneIds().includes(tid)"' in index
+    assert 'x-for="(m, i) in paneMessages(tid)"' in index
+    assert ":key=\"m._k || m.uuid || ('m-' + i)\"" in index
+
+
+def test_chat_messages_do_not_scan_long_text_for_unused_intrinsic_height():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    index = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert "estIntrinsicH" not in app
+    assert "contain-intrinsic-size" not in index
+
+
+def test_chat_grid_loads_are_single_flight_and_mark_panes_loaded():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async _ensureSessionLoaded(sid)")
+    end = app.index("\n    async loadSession", start)
+    loader = app[start:end]
+    grid_start = app.index("async createDefaultChatGrid()")
+    grid_end = app.index("\n    // <title> driver", grid_start)
+    grid = app[grid_start:grid_end]
+
+    assert "this._sessionLoadPromises[sid]" in loader
+    assert "if (ok) st._loaded = true" in loader
+    assert "await this._ensureSessionLoaded(id)" in grid
+    assert "if (!st._loaded) await this.loadSession(id)" not in grid
+
+
+def test_grid_state_and_render_helpers_are_session_scoped():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert "_normalizeChatGridState(preferredId" in app
+    assert "const origin = this.currentId" in app
+    assert "await this.openTab(id, false)" in app
+    assert "this.paneMessages(sid)" in app
+    assert "isLatestEditTool(i, m, tid)" in html
+    assert "isMsgExpanded(i, m, false, tid)" in html
+    assert "toolResultSummary(m, i, tid)" in html
+    assert "findToolUseFor(m, i, tid)" in html
+    assert "taskLogLine(m, tid)" in html
+
+
+def test_new_sessions_replace_selected_grid_pane_and_restore_on_failure():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async _newServerSession()")
+    end = app.index("\n    newSession()", start)
+    native_create = app[start:end]
+
+    assert "const gridBefore = this._activeGridSnapshot()" in native_create
+    assert "this._applyGridReplacement(gridBefore, draftId)" in native_create
+    assert "this._restoreGridSnapshot(gridBefore)" in native_create
+    assert "if (this.chatGridFocusId === draftId) this.chatGridFocusId = meta.id" in native_create
+
+
+def test_visible_grid_panes_reconcile_stream_and_scroll_independently():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    reconcile_start = app.index("_reconcileOpenSession(next)")
+    reconcile_end = app.index("\n    _sessionsEqual", reconcile_start)
+    reconcile = app[reconcile_start:reconcile_end]
+    send_start = app.index("async send(opts = {})")
+    send_end = app.index("\n    retryFailedMessage", send_start)
+    send = app[send_start:send_end]
+
+    assert "for (const sid of this.visibleChatPaneIds())" in reconcile
+    assert "sessionId: sid" in app[app.index("async _checkActiveTurn"):send_start]
+    assert "this.visibleChatPaneIds().includes(streamSid)" in send
+    assert "streamState.atBottom !== false" in send
+
+
+def test_single_pane_grid_background_is_transparent():
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert ".chat-body:not(.is-split) .chat-grid," in css
+    assert ".chat-body:not(.is-split) .chat-grid-pane" in css
+    assert ".chat-body.msgs-hidden .chat-grid-pane.active .msg" in css
+
+
+def test_async_queue_clear_only_removes_submitted_composer_snapshot():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async send(opts = {})")
+    end = app.index("\n    retryFailedMessage", start)
+    send = app[start:end]
+
+    assert "const draftInputSnapshot = this.input" in send
+    assert "if (this.input === draftInputSnapshot) this.input = \"\"" in send
+    assert "this.pendingImages.filter(im => !sentImages.has(im))" in send
+    assert "this.pendingDocs.filter(d => !sentDocs.has(d))" in send
+
+
+def test_grid_stream_placeholder_tolerates_uninitialized_tab_state():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert "modelLabel((tabState[tid] && tabState[tid].streamingModel) || '')" in html
+    assert "tabState[tid] && tabState[tid].streamElapsed > 1" in html
+    assert "fmtStreamElapsed((tabState[tid] && tabState[tid].streamElapsed) || 0)" in html
+
+
+def test_grid_message_actions_use_their_pane_stream_state():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    pane_start = html.index('<template x-for="tid in mountedChatPaneIds()"')
+    pane_end = html.index('<div class="chat-input">', pane_start)
+    panes = html[pane_start:pane_end]
+
+    assert 'x-show="!isTabStreaming(tid) && !m._editing"' in panes
+    assert 'x-show="!streaming && !m._editing"' not in panes
+
+
+def test_stop_control_follows_session_state_and_never_removes_queue_items():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    start = app.index("async stop() {")
+    end = app.index("\n    // ====== ask_user_question", start)
+    stop = app[start:end]
+
+    assert 'x-show="isTabStreaming(currentId)"' in html
+    assert "chat-toolbar-stop" in html
+    assert 'x-show="streaming" @click="stop()"' not in html
+    assert "撤回队尾" not in html
+    assert "removePendingQueueItem" not in stop
+    assert "await fetch(" in stop
+    assert "if (this.isTabStreaming(this.currentId)) { this.stop();" in app
+    assert 'if (this.isTabStreaming(this.currentId)) await this.stop();' in app
+
+
+def test_outline_fetch_throttles_failed_optimistic_draft_requests():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async refreshOutlineFromBackend(sid)")
+    end = app.index("\n    // Pull the next older window", start)
+    method = app[start:end]
+
+    assert method.index("st._outlineFetchedAt = now") < method.index("await fetch(")
+
+
+def test_multi_workspace_ui_uses_app_modal_and_preserves_grid_creation():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert "window.prompt" not in app
+    assert "await this.prompt({" in app
+    assert "cwd: seedCwd" in app
+    assert "const gridBefore = this._activeGridSnapshot()" in app
+    assert "chat-toolbar-workspace" in html
+    assert "chat-grid-pane-workspace" in html
+    assert ':title="tabTooltip(tid)"' in html
+
+
+def test_mobile_preview_header_prioritizes_title_and_controls():
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+
+    assert ".pane.preview .pane-fileinfo { display: none; }" in css
+    assert ".pane.preview .preview-title-stack {" in css
+    assert ".pane.preview .preview-mobile-path," in css
+    assert ".pane.preview .preview-mobile-mtime {\n    display: block;" in css
+    assert ".pane.preview .pane-head { height: 58px; }" in css
+    assert ".pane.preview .preview-keep-mobile { flex-shrink: 0; }" in css
+    assert "selected.slice(0, selected.lastIndexOf('/') + 1)" in html
+
+
+def test_history_jump_and_grid_paging_keep_their_session_owner():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    jump_start = app.index("_scrollToUserMsg(m, ownerSid = this.currentId)")
+    jump_end = app.index("\n    // Short preview text", jump_start)
+    jump = app[jump_start:jump_end]
+    paging_start = app.index("async loadEarlierMessages(sid)")
+    paging_end = app.index("\n    // Evict the oldest rendered", paging_start)
+    paging = app[paging_start:paging_end]
+
+    assert "const sid = ownerSid" in jump
+    assert "const body = this._chatScrollEl(sid)" in jump
+    assert "body && body.querySelector" in jump
+    assert "document.querySelector(" not in jump
+    assert "this._scrollToUserMsg(m, sid)" in jump
+    assert "if (sid === this.currentId) this.messages = st.messages" in jump
+    assert "const isVisible = this.visibleChatPaneIds().includes(sid)" in paging
+    assert "const scrollEl = isVisible ? this._chatScrollEl(sid) : null" in paging
+
+
+def test_tab_disposal_invalidates_late_loads_and_bounds_hover_cache():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    dispose_start = app.index("_disposeTabRuntime(sid)")
+    dispose_end = app.index("\n    async deleteSessionById", dispose_start)
+    dispose = app[dispose_start:dispose_end]
+    load_start = app.index("async loadSession(sid, opts = {})")
+    load_end = app.index("\n    // Warm OPEN-but-inactive tabs", load_start)
+    load = app[load_start:load_end]
+    prefetch_start = app.index("prefetchSession(sid)")
+    prefetch_end = app.index("\n    // One authoritative cold-load", prefetch_start)
+    prefetch = app[prefetch_start:prefetch_end]
+
+    assert "clearTimeout(st._reconcileRetryTimer)" in dispose
+    assert "delete this._sessionLoadPromises[sid]" in dispose
+    assert "st._queueSyncSeq =" in dispose
+    assert "delete this._cachedLatestEditIdxByTid[sid]" in dispose
+    assert "delete this._cachedTaskSubjectMaps[sid]" in dispose
+    assert "!key.startsWith(prefix)" in dispose
+    assert "delete this.tabState[sid]" in dispose
+    assert load.count("if (this.tabState[sid] !== st) return false") >= 3
+    assert "sid === this.currentId && this.tabState[sid] === st" in load
+    assert "const previous = this._hoverPrefetchedSid" in prefetch
+    assert "this._disposeTabRuntime(previous)" in prefetch
+    assert "this._prefetchTargetSid !== sid" in prefetch
+
+
+def test_failed_transcript_refresh_preserves_the_last_good_messages():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("async loadSession(sid, opts = {})")
+    end = app.index("\n    // Warm OPEN-but-inactive tabs", start)
+    load = app[start:end]
+    failed = load[
+        load.index("if (!r.ok) {"):
+        load.index("const s = this._retainExpectedSessionSettings(await r.json())")
+    ]
+
+    assert "return false" in failed
+    assert "st.messages.length = 0" not in failed
+    assert "this.messages = st.messages" not in failed
+
+
+def test_idle_preload_yields_to_every_visible_grid_stream():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index("_idlePreloadStep()")
+    end = app.index("\n    // ===== Lazy-loaded history controls", start)
+    method = app[start:end]
+
+    assert "this.visibleChatPaneIds().some" in method
+    assert "st && st.streaming" in method
+    assert "_idlePreloadRetryTimer" in method
+    assert "}, 1000)" in method
+
+
+def test_visible_session_management_calls_have_native_backend_routes():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    backend = (FRONTEND.parent / "backend" / "codex" / "api.py").read_text(
+        encoding="utf-8")
+
+    assert '@router.post("/sessions/organize"' in backend
+    assert '@router.post("/sessions/purge-old"' in backend
+    assert '"/sessions/{thread_id}/export"' in backend
+    assert '@router.get("/search"' in backend
+    assert "/api/chat/reset?" not in app

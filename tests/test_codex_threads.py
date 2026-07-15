@@ -60,13 +60,37 @@ async def test_thread_pin_metadata_survives_service_restart(tmp_path):
     requester = StubRequester({"thread": {"id": "thread-1"}})
     service = CodexThreadService(requester, tmp_path)
     service.set_pinned("thread-1", True)
+    service.set_effort("thread-1", "max")
+    service.set_permission("thread-1", "bypassPermissions")
+    await service.set_thinking("thread-1", False)
 
     restarted = CodexThreadService(requester, tmp_path)
-    assert (await restarted.read("thread-1"))["pinned"] is True
+    restored = await restarted.read("thread-1")
+    assert restored["pinned"] is True
+    assert restored["_settings"]["effort"] == "max"
+    assert restored["_settings"]["permission"] == "bypassPermissions"
+    assert restored["_settings"]["thinking"] is False
+    assert restarted.reasoning_summary("thread-1") == "none"
 
     restarted.set_pinned("thread-1", False)
     reloaded = CodexThreadService(requester, tmp_path)
-    assert (await reloaded.read("thread-1"))["pinned"] is False
+    unpinned = await reloaded.read("thread-1")
+    assert unpinned["pinned"] is False
+    assert unpinned["_settings"]["effort"] == "max"
+    assert unpinned["_settings"]["permission"] == "bypassPermissions"
+    assert unpinned["_settings"]["thinking"] is False
+
+    # Empty is an explicit auto override, not absence: it must beat the last
+    # rollout's non-empty effort after another process restart.
+    reloaded.set_effort("thread-1", "")
+    auto = await CodexThreadService(requester, tmp_path).read("thread-1")
+    assert auto["_settings"]["effort"] == ""
+    assert auto["_settings"]["permission"] == "bypassPermissions"
+    assert auto["_settings"]["thinking"] is False
+
+    with pytest.raises(ValueError, match="unknown permission mode"):
+        auto_service = CodexThreadService(requester, tmp_path)
+        auto_service.set_permission("thread-1", "acceptEdits")
 
 
 class StubRequester:
@@ -116,6 +140,22 @@ async def test_list_cache_reuses_page_and_explicit_invalidation_refreshes(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_list_cache_is_bounded_for_many_search_terms(tmp_path):
+    requester = StubRequester({"data": [], "nextCursor": None})
+    service = CodexThreadService(requester, tmp_path)
+
+    for index in range(40):
+        await service.list(search_term=f"query-{index}")
+
+    assert len(service._list_cache) == 32
+    assert len(requester.calls) == 40
+
+    await service.list(search_term="query-0")
+    assert len(requester.calls) == 41
+    assert len(service._list_cache) == 32
+
+
+@pytest.mark.asyncio
 async def test_resume_preserves_persisted_approval_and_sandbox(tmp_path):
     requester = StubRequester({"thread": {"id": "thread-1"}})
     service = CodexThreadService(
@@ -134,11 +174,48 @@ async def test_resume_preserves_persisted_approval_and_sandbox(tmp_path):
 
     assert requester.calls == [("thread/resume", {
         "threadId": "thread-1",
-        "cwd": str(tmp_path.resolve()),
         "model": "gpt-test",
         "modelProvider": "openai",
         "config": {"model_reasoning_effort": "high"},
     }, None)]
+
+
+@pytest.mark.asyncio
+async def test_registered_workspaces_scope_list_and_custom_start(tmp_path):
+    extra = tmp_path / "other-project"
+    extra.mkdir()
+    requester = StubRequester({"data": [], "nextCursor": None})
+    service = CodexThreadService(requester, tmp_path)
+
+    entry = service.register_workspace(extra, "Other")
+    assert entry.path == str(extra.resolve())
+    assert entry.name == "Other"
+    assert entry.primary is False
+    assert service.contains_workspace(str(extra)) is True
+    assert service.contains_workspace(str(tmp_path / "unregistered")) is False
+
+    await service.list()
+    assert requester.calls[-1][1]["cwd"] == [str(tmp_path.resolve()), str(extra.resolve())]
+
+    requester.result = {"thread": {"id": "thread-2", "cwd": str(extra.resolve())}}
+    await service.start(cwd=str(extra))
+    assert requester.calls[-1][1]["cwd"] == str(extra.resolve())
+
+    restarted = CodexThreadService(requester, tmp_path)
+    assert [item.path for item in restarted.list_workspaces()] == [
+        str(tmp_path.resolve()), str(extra.resolve())]
+
+
+def test_workspace_registration_rejects_unregistered_and_unsafe_paths(tmp_path):
+    service = CodexThreadService(StubRequester({}), tmp_path)
+    with pytest.raises(ValueError, match="not registered"):
+        service.resolve_workspace(tmp_path / "missing")
+    with pytest.raises(ValueError, match="existing directory"):
+        service.register_workspace(tmp_path / "missing")
+    with pytest.raises(ValueError, match="broad or sensitive"):
+        service.register_workspace("/")
+    with pytest.raises(ValueError, match="cannot be removed"):
+        service.remove_workspace(tmp_path)
 
 
 @pytest.mark.asyncio

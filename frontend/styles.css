@@ -838,9 +838,44 @@ a:hover { color: var(--c-accent-hover); text-decoration: underline; }
      reload tap. */
   .pane.preview .pane-head .icon-btn:not(.preview-keep-mobile) { display: none; }
   .pane.preview .pane-head .btn-primary { display: none; }
-  /* Keep the path + mtime strip on mobile too (user wants it visible): the
-     two-line stacked layout + 10px font fits the cramped head, and min-width:0
-     ellipsis on the path keeps the action icons right-aligned. */
+  /* The basename already identifies the file on phones. Path + mtime used to
+     collapse into a few pixels between the title and zoom controls, wrapping
+     the date vertically over the zoom percentage. Keep that metadata on
+     wider layouts and reserve mobile header width for actual controls. */
+  .pane.preview .pane-fileinfo { display: none; }
+  .pane.preview .preview-title-stack {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    line-height: 1.1;
+  }
+  .pane.preview .pane-head { height: 58px; }
+  .pane.preview .pane-title {
+    display: block;
+    width: 100%;
+  }
+  .pane.preview .preview-mobile-path,
+  .pane.preview .preview-mobile-mtime {
+    display: block;
+    overflow: hidden;
+    color: var(--c-fg-4);
+    font-size: var(--fs-2xs);
+    font-weight: var(--fw-normal);
+    font-variant-numeric: tabular-nums;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pane.preview .preview-mobile-path {
+    width: 100%;
+    direction: rtl;
+    text-align: left;
+    unicode-bidi: plaintext;
+  }
+  .pane.preview .preview-zoom,
+  .pane.preview .preview-keep-mobile { flex-shrink: 0; }
 
   /* Chat toolbar: keep attach + model + permission + effort + ctx-ring + send.
      Permission restored on mobile (2026-05-28): the prior "low-frequency,
@@ -1051,12 +1086,11 @@ body.kb-open .layout:focus-within .pane {
    would strand the user with no way to switch panes). Hide it only while
    the composer truly holds focus. */
 body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
-/* Safety net: even on browsers where layout shrink fails, scrollIntoView
-   on focus (see app.js onTextareaFocus) needs the textarea to have
-   actual room below to scroll-stop against. scroll-margin-bottom keeps a
-   gap so the bottom-most position lands above the keyboard, not flush
-   against it (cramped one-line height where you can't see what you
-   typed). */
+/* Native focus panning may still consult scroll-margin even though app.js
+   deliberately never calls textarea.scrollIntoView(): that API scrolls the
+   root visual viewport on iOS PWA and can strand an equal clipped-header /
+   blank-bottom band after keyboard dismissal. Keep a small native breathing
+   gap without initiating any root scroll ourselves. */
 .chat-input-textarea {
   scroll-margin-bottom: var(--sp-4);
 }
@@ -1430,7 +1464,8 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
      order would otherwise keep the gear hidden on phones. */
   .chat-toolbar-more { display: inline-flex !important; }
   .chat-toolbar-permission,
-  .chat-toolbar-effort { display: none !important; }
+  .chat-toolbar-effort,
+  .chat-toolbar-workspace { display: none !important; }
   /* Model name truncates on phones (full name is in the dropdown anyway) — cap
      it so attach · model · gear · ring · rl · send all fit one row. */
   .chat-toolbar-select { max-width: 6.5em; }
@@ -1497,6 +1532,9 @@ body.kb-open .layout:focus-within .mobile-tab-bar { display: none; }
 }
 .pane-head .pane-title .icon { color: var(--c-accent); }   /* 三栏 header 图标用主色锚定 */
 .pane-head .spacer { flex: 1; }
+.preview-title-stack { display: contents; }
+.preview-mobile-path,
+.preview-mobile-mtime { display: none; }
 /* Preview-header path + mtime strip. flex:1 + min-width:0 lets it both fill
    the gap (acting as the old spacer) and shrink/ellipsis a long path instead
    of shoving the action icons off-screen. */
@@ -2790,6 +2828,24 @@ pre.text {
   content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px;
   background: var(--c-accent);
 }
+.chat-workspace-tab {
+  border: 0;
+  border-right: 1px solid var(--c-border);
+  min-width: max-content;
+  color: var(--c-fg-2);
+  font-family: inherit;
+}
+.chat-workspace-tab svg {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+  flex: 0 0 auto;
+}
+.chat-workspace-tab.active {
+  color: var(--c-accent);
+}
 /* Drop target during a drag-reorder — left edge bar shows where it'll land. */
 .chat-tab.drag-over::before {
   content: ""; position: absolute; top: 4px; bottom: 4px; left: -1px;
@@ -2878,7 +2934,12 @@ pre.text {
 .chat-tab-new {
   background: none; border: none; cursor: pointer;
   color: var(--c-fg-2); font-size: 18px; line-height: 1;
-  padding: 0 10px;
+  padding: 0;
+  width: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
 }
 .chat-tab-new:hover { color: var(--c-accent); }
@@ -2934,6 +2995,40 @@ pre.text {
 .chk .icon svg { width: 14px; height: 14px; }
 
 .chat-scroll-wrap { flex: 1; position: relative; display: flex; flex-direction: column; min-height: 0; }
+.chat-grid-drop-overlay {
+  position: absolute;
+  inset: 8px;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 2px dashed var(--c-accent);
+  border-radius: var(--r-lg);
+  background: color-mix(in srgb, var(--c-bg-0) 78%, transparent);
+  backdrop-filter: blur(2px);
+}
+.chat-grid-drop-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 18px 24px;
+  border: 1px solid var(--c-border-strong);
+  border-radius: var(--r-lg);
+  background: var(--c-bg-1);
+  color: var(--c-fg-1);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28);
+  pointer-events: none;
+}
+.chat-grid-drop-card svg {
+  width: 42px;
+  height: 30px;
+  fill: none;
+  stroke: var(--c-accent);
+  stroke-width: 1.2;
+}
+.chat-grid-drop-card strong { font-size: var(--fs-base); }
+.chat-grid-drop-card span { color: var(--c-fg-3); font-size: var(--fs-xs); }
 .chat-body {
   flex: 1; overflow-y: auto;
   /* overflow-x: hidden is a hard safety net — any single misbehaving
@@ -2972,6 +3067,254 @@ pre.text {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+}
+
+/* Multi-session chat grid. The composer remains global; only currentId is
+   interactive. Non-active panes keep painting live stream updates beneath a
+   light click-to-activate veil. */
+.chat-grid {
+  display: grid;
+  min-height: 100%;
+  gap: 1px;
+  background: var(--c-border);
+}
+.chat-grid.panes-1 {
+  grid-template-columns: minmax(0, 1fr);
+}
+.chat-grid.panes-2 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: minmax(0, 1fr);
+}
+.chat-grid.panes-2.panes-2-rows {
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+.chat-grid.panes-3 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+/* Recent single-view panes remain mounted with display:none. Explicit order
+   classes therefore drive the three-pane spans; :first/last-of-type would
+   accidentally select a hidden LRU pane and leave a visible blank cell. */
+.chat-grid.panes-3 .chat-grid-pane.grid-first { grid-row: 1 / span 2; }
+.chat-grid.panes-3.panes-3-secondary .chat-grid-pane.grid-first {
+  grid-row: auto;
+}
+.chat-grid.panes-3.panes-3-secondary .chat-grid-pane.grid-last {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+}
+.chat-grid.panes-4 {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
+}
+.chat-grid-pane {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  background: var(--c-bg-1);
+  border: 1px solid transparent;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+/* The grid wrapper is also reused for ordinary single-session rendering. Its
+   separator background must not fill the unused min-height below a short
+   conversation (the large grey block visible on mobile). */
+.chat-body:not(.is-split) .chat-grid,
+.chat-body:not(.is-split) .chat-grid-pane {
+  background: transparent;
+}
+.chat-grid.panes-1 .chat-grid-pane {
+  overflow: visible;
+}
+.chat-grid-pane.active { border-color: var(--c-accent); }
+/* A single conversation reuses the grid-pane DOM for rendering performance,
+   but it is not visually a split pane. Keep the active outline exclusive to
+   multi-session mode. */
+.chat-grid.panes-1 .chat-grid-pane.active { border-color: transparent; }
+.chat-grid-pane.drag-over { box-shadow: inset 0 0 0 2px var(--c-accent); }
+.chat-grid-pane-head {
+  display: none;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  flex: 0 0 30px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--c-border);
+  background: var(--c-bg-2);
+  cursor: grab;
+  user-select: none;
+}
+.chat-body.is-split .chat-grid-pane-head { display: flex; }
+.chat-grid-pane-status {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--c-fg-3); flex: 0 0 auto;
+}
+.chat-grid-pane-status.streaming { background: var(--c-accent); box-shadow: 0 0 0 3px var(--c-accent-soft); }
+.chat-grid-pane-status.unread { background: var(--c-success); }
+.chat-grid-pane-title { flex: 1; min-width: 0; font-size: 12px; color: var(--c-fg-2); }
+.chat-grid-pane.active .chat-grid-pane-title { color: var(--c-fg-0); font-weight: 600; }
+.chat-grid-pane-workspace {
+  max-width: 34%;
+  padding: 2px 6px;
+  border-radius: var(--r-sm);
+  background: var(--c-bg-3);
+  color: var(--c-fg-3);
+  font-size: 10px;
+}
+.chat-grid-pane-close {
+  width: 22px; height: 22px; border: 0; border-radius: 5px;
+  background: transparent; color: var(--c-fg-3); cursor: pointer;
+}
+.chat-grid-pane-close:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.chat-grid-pane-loading {
+  position: absolute;
+  inset: 30px 0 0;
+  z-index: 7;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: color-mix(in srgb, var(--c-fg-0) 4%, var(--c-bg-1));
+  color: var(--c-fg-3);
+  font-size: var(--fs-md);
+}
+.chat-grid-pane-loading::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, transparent 35%,
+    color-mix(in srgb, var(--c-fg-0) 5%, transparent) 50%, transparent 65%);
+  transform: translateX(-100%);
+  animation: grid-pane-loading 1.6s ease-in-out infinite;
+}
+.chat-grid-pane-loading span { position: relative; }
+@keyframes grid-pane-loading {
+  to { transform: translateX(100%); }
+}
+.chat-grid-mask {
+  position: absolute;
+  inset: 30px 0 0;
+  z-index: 8;
+  border: 0;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--c-fg-0) 7%, transparent);
+  cursor: pointer;
+  color: var(--c-fg-2);
+  transition: background var(--t-fast), color var(--t-fast);
+}
+.chat-grid-mask:hover {
+  background: color-mix(in srgb, var(--c-fg-0) 11%, transparent);
+  color: var(--c-fg-1);
+}
+.chat-grid-mask span {
+  padding: 0 var(--sp-4);
+  font-size: clamp(24px, 1.75vw, 30px);
+  font-weight: var(--fw-medium);
+  letter-spacing: 0.04em;
+  text-align: center;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.38);
+}
+.chat-body.is-split {
+  overflow: hidden;
+  padding: 0;
+  display: flex;
+}
+.chat-body.is-split > :not(.chat-grid) { display: none !important; }
+.chat-body.is-split .chat-grid {
+  flex: 1;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+.chat-body.is-split .msg-pane {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--sp-3);
+  padding-inline: max(var(--sp-3), calc(50% - 440px));
+}
+
+.chat-grid-menu-wrap {
+  position: relative;
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+}
+.chat-grid-toggle {
+  width: 34px;
+  height: 34px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--c-fg-2);
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-grid-toggle:hover { background: var(--c-bg-3); color: var(--c-fg-0); }
+.chat-grid-toggle.active { background: var(--c-accent-soft); color: var(--c-accent); }
+.chat-grid-toggle svg {
+  width: 17px;
+  height: 17px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.4;
+}
+.chat-grid-menu {
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  z-index: 1800;
+  width: 180px;
+  padding: 6px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--r-md);
+  background: var(--c-bg-1);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+}
+.chat-grid-menu-title {
+  padding: 4px 7px 7px;
+  color: var(--c-fg-3);
+  font-size: var(--fs-xs);
+}
+.chat-grid-menu button {
+  width: 100%;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--c-fg-1);
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+.chat-grid-menu button:hover:not(:disabled) { background: var(--c-bg-3); }
+.chat-grid-menu button:disabled { opacity: 0.35; cursor: not-allowed; }
+.chat-grid-menu button svg {
+  width: 28px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.15;
+  flex: 0 0 auto;
+}
+
+@media (max-width: 900px), (pointer: coarse) and (max-height: 500px) {
+  /* Multi-view is a desktop workspace feature. Mobile always renders the
+     selected conversation as one pane; keep desktop split preferences stored
+     so returning to a larger screen restores the workspace unchanged. */
+  .chat-grid-menu-wrap { display: none !important; }
+  .chat-grid { display: block; min-height: 100%; }
+  .chat-grid-pane-head, .chat-grid-mask { display: none !important; }
 }
 .msg {
   display: flex;
@@ -3375,7 +3718,7 @@ html[data-theme="light"] .msg.user .bubble { color: white; }
 /* FIX ⑤: keep already-mounted message rows hidden behind the skeleton until
    loadSession finishes highlighting (messagesReady). Prevents the half-rendered
    "partway then stuck" flash on big sessions, especially on mobile. */
-.chat-body.msgs-hidden .msg { display: none; }
+.chat-body.msgs-hidden .chat-grid-pane.active .msg { display: none; }
 .chat-skeleton-msg {
   display: flex; gap: 10px;
   align-items: flex-start;
@@ -4261,223 +4604,6 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
 @keyframes chip-upload-slide {
   from { background-position: 100% 0; }
   to   { background-position: -100% 0; }
-}
-.image-gen-modal {
-  width: min(760px, 92vw);
-  max-height: min(86vh, 780px);
-}
-.image-gen-body {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.image-gen-prompt {
-  width: 100%;
-  min-height: 120px;
-  resize: vertical;
-  padding: 10px 12px;
-  border: 1px solid var(--c-border-strong);
-  border-radius: var(--r-md);
-  background: var(--c-bg-1);
-  color: var(--c-fg-0);
-  font: inherit;
-  line-height: 1.5;
-}
-.image-gen-controls {
-  display: grid;
-  grid-template-columns: minmax(140px, 1.2fr) repeat(4, minmax(90px, 1fr));
-  gap: 10px;
-}
-.image-gen-controls label {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  min-width: 0;
-  font-size: var(--fs-xs);
-  color: var(--c-fg-3);
-}
-.image-gen-controls input,
-.image-gen-controls select {
-  min-width: 0;
-  height: 32px;
-  padding: 0 8px;
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-sm);
-  background: var(--c-bg-1);
-  color: var(--c-fg-1);
-  font: inherit;
-}
-.image-gen-ref {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  font-size: var(--fs-sm);
-  color: var(--c-fg-2);
-}
-.image-gen-results {
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
-.image-gen-history-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding-top: 2px;
-  font-size: var(--fs-sm);
-  font-weight: 650;
-  color: var(--c-fg-1);
-}
-.image-gen-empty {
-  padding: 16px;
-  border: 1px dashed var(--c-border);
-  border-radius: var(--r-md);
-  color: var(--c-fg-3);
-  font-size: var(--fs-sm);
-  text-align: center;
-}
-.image-gen-job {
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-md);
-  background: var(--c-bg-1);
-  padding: 10px;
-}
-.image-gen-job.status-failed {
-  border-color: color-mix(in srgb, var(--c-warning, #b45309) 45%, var(--c-border));
-}
-.image-gen-job-head,
-.image-gen-job-title,
-.image-gen-job-pending {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-.image-gen-job-head {
-  justify-content: space-between;
-  min-width: 0;
-  flex-wrap: wrap;
-}
-.image-gen-job-actions {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-}
-.image-gen-job-title {
-  min-width: 0;
-  color: var(--c-fg-2);
-  font-size: var(--fs-xs);
-}
-.image-gen-status {
-  display: inline-flex;
-  align-items: center;
-  height: 22px;
-  padding: 0 8px;
-  border-radius: 999px;
-  background: var(--c-bg-2);
-  color: var(--c-fg-1);
-  font-size: var(--fs-xs);
-  white-space: nowrap;
-}
-.status-running .image-gen-status,
-.status-queued .image-gen-status {
-  background: color-mix(in srgb, var(--c-accent) 14%, var(--c-bg-2));
-  color: var(--c-accent);
-}
-.status-succeeded .image-gen-status {
-  background: color-mix(in srgb, #10b981 14%, var(--c-bg-2));
-  color: #047857;
-}
-.status-failed .image-gen-status {
-  background: color-mix(in srgb, var(--c-warning, #b45309) 16%, var(--c-bg-2));
-  color: var(--c-warning, #b45309);
-}
-.image-gen-job-time {
-  color: var(--c-fg-3);
-  font-size: var(--fs-xs);
-  white-space: nowrap;
-}
-.image-gen-job-prompt {
-  margin-top: 8px;
-  color: var(--c-fg-1);
-  font-size: var(--fs-sm);
-  line-height: 1.45;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-}
-.image-gen-job-pending {
-  margin-top: 10px;
-  color: var(--c-fg-3);
-  font-size: var(--fs-sm);
-}
-.image-gen-job-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
-  gap: 10px;
-  margin-top: 10px;
-}
-.image-gen-card {
-  border: 1px solid var(--c-border);
-  border-radius: var(--r-md);
-  background: var(--c-bg-1);
-  overflow: hidden;
-}
-.image-gen-preview {
-  display: block;
-  width: 100%;
-  aspect-ratio: 1 / 1;
-  padding: 0;
-  border: 0;
-  background: var(--c-bg-0);
-  cursor: zoom-in;
-}
-.image-gen-preview img {
-  width: 100%;
-  height: 100%;
-  display: block;
-  object-fit: cover;
-}
-.image-gen-card-foot {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px;
-}
-.image-gen-card-foot span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--c-fg-3);
-  font-size: var(--fs-xs);
-}
-.image-gen-card-foot .sm {
-  height: 28px;
-  padding: 0 10px;
-  font-size: var(--fs-xs);
-  white-space: nowrap;
-}
-@media (max-width: 720px) {
-  .image-gen-modal {
-    width: 100dvw;
-    max-height: 100dvh;
-  }
-  .image-gen-controls {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-  .image-gen-controls label:first-child {
-    grid-column: 1 / -1;
-  }
-  .image-gen-results {
-    gap: 10px;
-  }
-  .image-gen-job-grid {
-    grid-template-columns: 1fr;
-  }
 }
 .img-chip-x {
   position: absolute; top: 2px; right: 2px;
@@ -5389,59 +5515,11 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   white-space: pre-wrap; word-break: break-word;
   max-height: 200px; overflow-y: auto;
 }
-/* SDK-native background-task status row (run_in_background=true). */
-.subagent-task {
-  display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2);
-  margin-top: var(--sp-2); padding-top: var(--sp-2);
-  border-top: 1px dashed var(--c-border-strong);
-  font-size: var(--fs-xs);
-}
-.subagent-task-badge {
-  font-weight: var(--fw-semibold); white-space: nowrap;
-}
-.subagent-task.is-running .subagent-task-badge { color: #8b5cf6; }
-.subagent-task.is-completed .subagent-task-badge,
-.subagent-task.is-done .subagent-task-badge { color: var(--c-ok, #16a34a); }
-.subagent-task.is-failed .subagent-task-badge { color: var(--c-err, #dc2626); }
-.subagent-task.is-stopped .subagent-task-badge { color: var(--c-fg-3); }
-.subagent-task-summary {
-  color: var(--c-fg-2); word-break: break-word; flex: 1 1 auto;
-}
 .subagent-task-open {
   color: var(--c-accent); cursor: pointer; white-space: nowrap;
   text-decoration: none;
 }
 .subagent-task-open:hover { text-decoration: underline; }
-.subagent-task-stop {
-  color: var(--c-danger, #d33); cursor: pointer; white-space: nowrap;
-  text-decoration: none;
-}
-.subagent-task-stop:hover { text-decoration: underline; }
-
-/* Background-task status pill for non-subagent tool cards (Bash
-   run_in_background). The .tool card is a compact one-liner, so this sits
-   inline after the args as a status pill rather than a bordered block. */
-.tool-task {
-  display: inline-flex; flex-wrap: wrap; align-items: center;
-  gap: var(--sp-2); margin-left: var(--sp-2); font-size: var(--fs-xs);
-}
-.tool-task-badge { font-weight: var(--fw-semibold); white-space: nowrap; }
-.tool-task.is-running .tool-task-badge { color: #8b5cf6; }
-.tool-task.is-completed .tool-task-badge,
-.tool-task.is-done .tool-task-badge { color: var(--c-ok, #16a34a); }
-.tool-task.is-failed .tool-task-badge { color: var(--c-err, #dc2626); }
-.tool-task.is-stopped .tool-task-badge { color: var(--c-fg-3); }
-.tool-task-summary { color: var(--c-fg-2); word-break: break-word; }
-.tool-task-open {
-  color: var(--c-accent); cursor: pointer; white-space: nowrap;
-  text-decoration: none;
-}
-.tool-task-open:hover { text-decoration: underline; }
-.tool-task-stop {
-  color: var(--c-danger, #d33); cursor: pointer; white-space: nowrap;
-  text-decoration: none;
-}
-.tool-task-stop:hover { text-decoration: underline; }
 
 /* ===== ExitPlanMode plan card ===== */
 .plan-card {
@@ -5755,6 +5833,7 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
   box-shadow: 0 0 0 2px var(--c-accent-soft);
 }
 .chat-toolbar-select option { background: var(--c-bg-1); color: var(--c-fg-0); }
+.chat-toolbar-select:disabled { opacity: 0.55; cursor: wait; }
 
 /* Composer "more" group — gear that collapses permission/effort on mobile.
    Hidden on desktop (the inline selects stay); CSS in the pointer:coarse
@@ -6242,36 +6321,6 @@ html[data-theme="eyecare"] .bash-meta.interrupted { color: #7a5a20; background: 
      footer + the existing border-top is enough separation, and matches
      how Linear / Notion / GitHub render modal action bars now. */
   background: transparent; border-radius: 0 0 var(--r-lg) var(--r-lg);
-}
-
-/* Image generation modal. Keep this after the global .modal rules: those set
-   max-width:480px and generic input margins for small confirm dialogs. */
-.modal.image-gen-modal {
-  width: min(760px, 92vw);
-  max-width: min(760px, 92vw);
-  max-height: min(86vh, 780px);
-  display: flex;
-  flex-direction: column;
-}
-.modal.image-gen-modal .image-gen-body {
-  flex: 1 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-}
-.modal.image-gen-modal .image-gen-controls input,
-.modal.image-gen-modal .image-gen-controls select {
-  width: 100%;
-  margin-top: 0;
-}
-@media (max-width: 720px) {
-  .modal.image-gen-modal {
-    width: 100vw;
-    width: 100dvw;
-    max-width: 100vw;
-    max-width: 100dvw;
-    max-height: 100dvh;
-    border-radius: 0;
-  }
 }
 
 /* ---- Modal choice list (disambiguation picker) ---- */

@@ -215,7 +215,8 @@ async def _lifespan(app: FastAPI):
     app.state.codex_runtime = runtime
     app.state.codex_attachments = CodexAttachmentService(ROOT)
     app.state.codex_usage = CodexUsageService(ROOT)
-    app.state.codex_queue = CodexQueueService()
+    app.state.codex_queue = CodexQueueService(
+        ROOT / ".muselab-codex" / "queues")
     app.state.codex_threads = CodexThreadService(runtime, ROOT)
     app.state.codex_mcp = CodexMcpService(
         runtime,

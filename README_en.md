@@ -48,7 +48,7 @@ independent runtime.
 | **Codex-native agent harness** | `codex app-server` owns threads, turns, tools, approvals, sandboxing, Skills, MCP, and account limits |
 | **Durable local context** | `MUSELAB_ROOT`, `AGENTS.md`, Memory, and workspace files form an inspectable context system |
 | **File workspace** | Tree, full-text search, upload, edit, trash, and previews for Markdown, code, images, PDF, CSV, XLSX, and HTML |
-| **Multi-thread workflows** | Streaming, replay, message queues, fork, compact, sub-agent threads, and concurrent browser tabs |
+| **Multi-thread workflows** | Streaming, replay, message queues, fork, compact, sub-agent threads, and up to four visible conversations |
 | **Native extensions** | Skills, MCP servers, OAuth state, approvals, and structured user questions are surfaced directly from Codex |
 | **Scheduler and terminal** | Run saved prompts on a schedule and supervise background terminal processes |
 | **Self-hosted and mobile** | Localhost defaults, systemd, launchd, Docker, PWA, HTTPS reverse proxy, and Web Push |
@@ -105,7 +105,7 @@ There is no separate chunking or application-owned RAG index. Every workspace ch
 ## Practical details
 
 - **Three-pane workspace** — Coordinate the file tree, preview pane, and chat; preview Markdown, code, images, PDF, CSV, XLSX, and HTML.
-- **Multi-thread tabs** — Open a new thread immediately, then replay, rename, fork, compact, or queue messages.
+- **Multi-thread grid** — Drag tabs into the chat area or use “Add to chat grid” to watch up to four conversations. Click a veil to select the sole composer target while the other panes keep updating; clicking an existing tab outside the grid or creating a new thread replaces the selected pane instead of leaving multi-view.
 - **Bilingual and themeable** — Switch languages without a reload; use light, dark, or eye-care themes and the mobile PWA.
 - **One native runtime** — Copy the remote command from Settings → About to enter the same live thread state from Codex CLI.
 - **Observable agent state** — See health, account usage, context usage, tool progress, approvals, and MCP questions in the browser.

@@ -83,7 +83,7 @@ app-server notification 是一条共享流。如果每个浏览器 SSE 连接都
 ## thread、turn 与浏览器会话
 
 - Codex thread ID 是会话主键，transcript 以 Codex 原生历史为准。
-- 浏览器可以同时打开多个 thread；每个标签页维护自己的消息、stream 和滚动状态。
+- 浏览器可以同时打开多个 thread；每个标签页维护自己的消息和 stream 状态。桌面端可把最多四个 thread 拖入会话网格同时观察，只有当前活动面板接收全局输入框的操作；移动端保持单面板。输入区可在显式登记的任一工作目录中新建 thread，同时文件浏览器仍严格受 `MUSELAB_ROOT` 边界约束。
 - 同一个 thread 同时只允许一个活动 turn；用户在运行期间继续发送的消息进入应用队列。
 - fork 使用 Codex 原生 thread 分支；compact 在同一个 thread 内压缩活动上下文，并在 transcript 中记录压缩边界。
 - app-server 进程重启后，持久 thread 会按 runtime generation 执行一次 `thread/resume`，再启动新 turn。

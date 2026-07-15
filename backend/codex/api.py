@@ -11,6 +11,7 @@ import secrets
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import (
     APIRouter,
@@ -33,6 +34,7 @@ from .attachments import CodexAttachmentService
 from .elicitation import CodexElicitationBroker
 from .process import AppServerError, AppServerResponseError
 from .providers import model_for_provider, provider_for_model
+from .queue import CodexQueueService
 from .threads import CodexThreadService
 from .turns import (
     CodexTurnService,
@@ -60,6 +62,24 @@ _SSE_HEADERS = {
 _STREAM_TICKET_TTL = 60.0
 _STREAM_TICKET_LIMIT = 64
 _STREAM_TICKETS: dict[str, tuple[float, dict[str, str]]] = {}
+_ORGANIZE_INITIAL_MESSAGE = {
+    "zh": (
+        "请作为我的档案整理助手开始一次安全整理：先只读扫描当前工作区和 "
+        "AGENTS.md，概括现状、重复内容、命名或归档问题，并列出按收益排序的建议。"
+        "如果 AGENTS.md 有未填写但确实需要我提供的信息，请一次只问一个简短问题。"
+        "任何创建、移动、改名、覆盖或删除文件的操作，都必须先说明具体改动并等我确认；"
+        "不要自行写入个人信息，也不要碰工作区之外的文件。"
+    ),
+    "en": (
+        "Act as my archive curator. First inspect the current workspace and "
+        "AGENTS.md read-only, summarize its structure, duplicates, naming or "
+        "filing issues, and propose improvements ordered by impact. If "
+        "AGENTS.md has genuinely useful gaps, ask one short question at a "
+        "time. Before creating, moving, renaming, overwriting, or deleting "
+        "anything, describe the exact change and wait for my confirmation. "
+        "Never invent personal information or touch files outside this workspace."
+    ),
+}
 
 
 class CreateSessionRequest(BaseModel):
@@ -69,6 +89,7 @@ class CreateSessionRequest(BaseModel):
     model_provider: str = ""
     permission: str = "default"
     open_ids: list[str] | None = None
+    cwd: str = ""
 
 
 class PatchSessionRequest(BaseModel):
@@ -77,6 +98,7 @@ class PatchSessionRequest(BaseModel):
     model_provider: str | None = None
     effort: str | None = None
     thinking: bool | None = None
+    permission: str | None = None
     pinned: bool | None = None
     system_prompt: str | None = None
 
@@ -85,6 +107,26 @@ class ForkSessionRequest(BaseModel):
     last_turn_id: str | None = None
     model: str = ""
     model_provider: str = ""
+    effort: str = ""
+    cwd: str = ""
+
+
+class OrganizeSessionRequest(BaseModel):
+    name: str = ""
+    model: str = ""
+    model_provider: str = ""
+    cwd: str = ""
+
+
+class PurgeOldRequest(BaseModel):
+    days: int = Field(default=7, ge=1, le=3650)
+    keep_id: str = ""
+    dry_run: bool = False
+
+
+class WorkspaceRequest(BaseModel):
+    path: str
+    name: str = ""
 
 
 class StreamStartRequest(BaseModel):
@@ -115,6 +157,10 @@ class QueueEnqueueRequest(BaseModel):
     model: str = ""
     model_provider: str = ""
     effort: str = ""
+    # The browser enqueues only because its last known state was busy. The
+    # turn may settle while this POST is in flight; opt in to an immediate
+    # idle drain so the item cannot miss the completion callback forever.
+    drain_if_idle: bool = False
     source_device_kind: str = Field(
         default="unknown", pattern="^(mobile|desktop|unknown)$")
 
@@ -160,6 +206,32 @@ def _services(request: Request) -> tuple[CodexThreadService, CodexTurnService]:
     return request.app.state.codex_threads, request.app.state.codex_turns
 
 
+@router.get("/workspaces", dependencies=[Depends(require_token)])
+async def list_workspaces(request: Request) -> dict[str, Any]:
+    threads, _ = _services(request)
+    return {"workspaces": [entry.__dict__ for entry in threads.list_workspaces()]}
+
+
+@router.post("/workspaces", dependencies=[Depends(require_token)])
+async def register_workspace(request: Request, body: WorkspaceRequest) -> dict[str, Any]:
+    threads, _ = _services(request)
+    try:
+        entry = threads.register_workspace(body.path, body.name or None)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return entry.__dict__
+
+
+@router.delete("/workspaces", dependencies=[Depends(require_token)])
+async def remove_workspace(request: Request, path: str = Query(...)) -> dict[str, bool]:
+    threads, _ = _services(request)
+    try:
+        threads.remove_workspace(path)
+    except ValueError as exc:
+        raise _http_error(exc) from exc
+    return {"ok": True}
+
+
 @router.get("/sessions", dependencies=[Depends(require_token)])
 async def list_sessions(
     request: Request,
@@ -169,13 +241,42 @@ async def list_sessions(
     q: str = Query(""),
     if_none_match: str | None = Header(default=None),
 ) -> Any:
-    del ids
     threads, turns = _services(request)
     try:
         page = await threads.list(limit=limit or 100, search_term=q.strip() or None)
+        data = list(page.data)
+        listed_ids = {str(thread.get("id") or "") for thread in data}
+        requested_ids = list(dict.fromkeys(
+            value.strip() for value in ids.split(",") if value.strip()
+        ))[:32]
+        missing_ids = [thread_id for thread_id in requested_ids
+                       if thread_id not in listed_ids]
+
+        async def read_missing(thread_id: str) -> dict[str, Any] | None:
+            try:
+                return await threads.read(thread_id, include_turns=False)
+            except AppServerResponseError as exc:
+                if exc.code in {-32004, -32600}:
+                    return None
+                raise
+
+        # Open tabs outside the recent window are independent reads. Issue
+        # them together so restoring several old tabs costs one app-server
+        # round trip rather than N serial round trips.
+        forced_threads = await asyncio.gather(*(
+            read_missing(thread_id) for thread_id in missing_ids
+        ))
+        for thread in forced_threads:
+            if thread is None:
+                continue
+            # A caller may know an unrelated Codex thread id. Exact workspace
+            # membership remains the authorization boundary for forced rows.
+            if threads.contains_workspace(thread.get("cwd")):
+                data.append(thread)
+                listed_ids.add(str(thread.get("id") or ""))
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
-    sessions = [_session_meta(thread, turns) for thread in page.data]
+    sessions = [_session_meta(thread, turns) for thread in data]
     payload = {
         "sessions": sessions,
         "total": len(sessions),
@@ -210,11 +311,124 @@ async def create_session(request: Request, body: CreateSessionRequest) -> dict[s
             model=body.model or None,
             model_provider=provider or None,
             config=config,
+            cwd=body.cwd or None,
         )
+        threads.set_permission(thread["id"], body.permission)
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
     return _session_meta(
         thread, turns, model=body.model, permission=body.permission)
+
+
+@router.post("/sessions/organize", dependencies=[Depends(require_token)])
+async def create_organize_session(
+    request: Request,
+    body: OrganizeSessionRequest,
+) -> dict[str, Any]:
+    """Create the curator chat that the visible Organize action promises."""
+    threads, turns = _services(request)
+    try:
+        provider = _native_provider_id(body.model, body.model_provider)
+        config = (
+            request.app.state.codex_providers.thread_config(provider)
+            if provider else None
+        )
+        thread = await threads.start(
+            name=body.name or "[Organize]",
+            model=body.model or None,
+            model_provider=provider or None,
+            config=config,
+            cwd=body.cwd or None,
+        )
+    except (AppServerError, ValueError) as exc:
+        raise _http_error(exc) from exc
+    return {
+        **_session_meta(thread, turns, model=body.model),
+        "initial_message": dict(_ORGANIZE_INITIAL_MESSAGE),
+    }
+
+
+@router.post("/sessions/purge-old", dependencies=[Depends(require_token)])
+async def purge_old_sessions(
+    request: Request,
+    body: PurgeOldRequest,
+) -> dict[str, Any]:
+    """Delete stale unpinned threads across the full paginated workspace."""
+    threads, turns = _services(request)
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    candidates: list[dict[str, Any]] = []
+    try:
+        while True:
+            page = await threads.list(cursor=cursor, limit=100)
+            candidates.extend(page.data)
+            cursor = page.next_cursor
+            if cursor is None:
+                break
+            if cursor in seen_cursors:
+                raise ValueError("thread/list returned a repeated cursor")
+            seen_cursors.add(cursor)
+    except (AppServerError, ValueError) as exc:
+        raise _http_error(exc) from exc
+
+    cutoff = time.time() - body.days * 86_400
+    keep_id = body.keep_id.strip()
+
+    def is_old(thread: dict[str, Any]) -> bool:
+        try:
+            updated = float(
+                thread.get("updatedAt") or thread.get("createdAt") or 0)
+        except (TypeError, ValueError):
+            return False
+        return updated < cutoff
+
+    victims = [
+        str(thread.get("id") or "")
+        for thread in candidates
+        if isinstance(thread.get("id"), str)
+        and thread.get("id") != keep_id
+        and not bool(thread.get("pinned"))
+        and is_old(thread)
+    ]
+    victims = list(dict.fromkeys(thread_id for thread_id in victims if thread_id))
+    if body.dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "count": len(victims),
+            "ids": victims,
+            "days": body.days,
+        }
+
+    deleted: list[str] = []
+    skipped: list[str] = []
+    for thread_id in victims:
+        # A stale timestamp is not permission to kill work that became active
+        # after the initial list snapshot.
+        if turns.busy(thread_id):
+            skipped.append(thread_id)
+            continue
+        try:
+            await threads.delete(thread_id)
+        except AppServerResponseError as exc:
+            if exc.code not in {-32004, -32600}:
+                skipped.append(thread_id)
+                continue
+        except (AppServerError, ValueError):
+            skipped.append(thread_id)
+            continue
+        await asyncio.to_thread(
+            request.app.state.codex_attachments.delete_thread, thread_id)
+        request.app.state.codex_usage.delete(thread_id)
+        request.app.state.codex_queue.clear(thread_id)
+        deleted.append(thread_id)
+    return {
+        "ok": True,
+        "deleted": len(deleted),
+        "ids": deleted,
+        "skipped": skipped,
+        "days": body.days,
+    }
 
 
 @router.get("/sessions/{thread_id}", dependencies=[Depends(require_token)])
@@ -257,6 +471,79 @@ async def get_session(
     }
 
 
+@router.get(
+    "/sessions/{thread_id}/export",
+    dependencies=[Depends(require_token_header_or_query)],
+)
+async def export_session_markdown(
+    request: Request,
+    thread_id: str,
+) -> Response:
+    """Download a Codex-owned transcript as a readable Markdown document."""
+    _threads, turns = _services(request)
+    try:
+        thread = await request.app.state.codex_history.read(thread_id)
+    except AppServerResponseError as exc:
+        if exc.code in {-32004, -32600}:
+            raise HTTPException(404, "session not found") from exc
+        raise _http_error(exc) from exc
+    except (AppServerError, ValueError) as exc:
+        raise _http_error(exc) from exc
+
+    meta = _session_meta(thread, turns)
+    messages = _thread_messages(thread, request.app.state.codex_attachments)
+    name = str(meta.get("name") or "session").replace("\r", " ").replace("\n", " ")
+    lines = [f"# {name}", ""]
+    if meta.get("model"):
+        lines.extend([f"*Model: {meta['model']}*", ""])
+    for message in messages:
+        role = str(message.get("role") or "")
+        text = str(message.get("text") or message.get("preview") or "").strip()
+        if role == "user":
+            lines.extend(["---", "", "### User", ""])
+        elif role == "assistant":
+            lines.extend(["### Muse", ""])
+        elif role == "thinking":
+            if text:
+                lines.extend([
+                    "<details><summary>Reasoning</summary>", "", text, "",
+                    "</details>", "",
+                ])
+            continue
+        else:
+            # Tool internals are available in the original Codex transcript;
+            # keep the portable export focused on the actual conversation.
+            continue
+        if text:
+            lines.extend([text, ""])
+        docs = message.get("docs")
+        if isinstance(docs, list):
+            for doc in docs:
+                if isinstance(doc, dict) and doc.get("name"):
+                    lines.append(f"- Attachment: {doc['name']}")
+            if docs:
+                lines.append("")
+        images = message.get("images")
+        if isinstance(images, list) and images:
+            lines.extend([f"- Image attachment ({len(images)})", ""])
+
+    body = "\n".join(lines).rstrip() + "\n"
+    safe_slug = re.sub(r"[^A-Za-z0-9_.-]+", "_", name).strip("_") or "session"
+    safe_slug = safe_slug[:60]
+    encoded = quote(name, safe="")
+    return Response(
+        content=body,
+        media_type="text/markdown; charset=utf-8",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{safe_slug}.md"; '
+                f"filename*=UTF-8''{encoded}.md"
+            ),
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
 @router.get("/sessions/{thread_id}/outline", dependencies=[Depends(require_token)])
 async def get_session_outline(request: Request, thread_id: str) -> dict[str, Any]:
     _threads, _turns = _services(request)
@@ -286,6 +573,10 @@ async def patch_session(
     if unsupported:
         raise HTTPException(400, "field is not supported by the Codex-native runtime")
     try:
+        if (body.permission is not None and body.permission not in {
+            "default", "plan", "bypassPermissions",
+        }):
+            raise ValueError("unknown permission mode")
         if body.name is not None:
             await threads.rename(thread_id, body.name)
         if body.model is not None or body.effort is not None:
@@ -302,6 +593,16 @@ async def patch_session(
                 model_provider=provider or None,
                 config=config or None,
             )
+            if body.effort is not None:
+                # Stable app-server thread reads omit resume.config. Keep the
+                # effective next-turn override in the thread service's local
+                # compatibility metadata so list/read cannot regress it to
+                # auto before a new rollout records the setting.
+                threads.set_effort(thread_id, body.effort)
+        if body.thinking is not None:
+            await threads.set_thinking(thread_id, body.thinking)
+        if body.permission is not None:
+            threads.set_permission(thread_id, body.permission)
         thread = await threads.read(thread_id, include_turns=False)
         if body.pinned is not None:
             threads.set_pinned(thread_id, body.pinned)
@@ -336,6 +637,7 @@ async def delete_session(request: Request, thread_id: str) -> dict[str, Any]:
     await asyncio.to_thread(
         request.app.state.codex_attachments.delete_thread, thread_id)
     request.app.state.codex_usage.delete(thread_id)
+    request.app.state.codex_queue.clear(thread_id)
     return {"ok": True}
 
 
@@ -350,21 +652,31 @@ async def fork_session(
         raise HTTPException(409, "thread operation still running")
     try:
         provider = _native_provider_id(body.model, body.model_provider)
-        config = request.app.state.codex_providers.thread_config(provider) if provider else None
+        config = dict(
+            request.app.state.codex_providers.thread_config(provider)
+            if provider else {}
+        )
+        # A model switch forks the source thread.  Apply the target effort to
+        # that NEW thread in the same native operation; patching the source
+        # before the confirmation was the reason cancelled switches silently
+        # reset Effort to auto.
+        config["model_reasoning_effort"] = body.effort or None
         thread = await threads.fork(
             thread_id,
             last_turn_id=body.last_turn_id or None,
             model=body.model or None,
             model_provider=provider or None,
-            config=config,
+            config=config or None,
+            cwd=body.cwd or None,
         )
+        threads.set_effort(str(thread["id"]), body.effort)
     except AppServerResponseError as exc:
         if exc.code in {-32004, -32600}:
             raise HTTPException(404, "session not found") from exc
         raise _http_error(exc) from exc
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
-    return _session_meta(thread, turns, model=body.model)
+    return _session_meta(thread, turns, model=body.model, effort=body.effort)
 
 
 @router.get("/sessions/{thread_id}/children", dependencies=[Depends(require_token)])
@@ -396,20 +708,44 @@ async def active_session(request: Request, thread_id: str) -> dict[str, Any]:
         return {"active": False}
     return {
         "active": True,
+        # Lets the browser distinguish the just-finished turn from a newly
+        # drained queued turn during the narrow completion/active race.
+        "turn_id": stream.turn_id,
         "model": stream.model,
         "started_at": stream.started_at,
+        # Relative age is safe to combine with a browser-local clock. Sending
+        # only started_at made reconnect timing depend on phone/server clock
+        # synchronization.
+        "elapsed_seconds": stream.elapsed_seconds,
         "events_so_far": len(stream.events),
-        "continuation": False,
         "user_text": stream.user_text,
         "user_images": stream.user_images,
         "user_docs": stream.user_docs,
     }
 
 
+def _queue_state(request: Request, thread_id: str) -> dict[str, Any]:
+    """Decorate queue records with path-free staged attachment metadata."""
+    state = request.app.state.codex_queue.get(thread_id)
+    attachments: CodexAttachmentService = request.app.state.codex_attachments
+    items: list[dict[str, Any]] = []
+    for raw in state.get("items", []):
+        item = dict(raw)
+        try:
+            item["attachments"] = attachments.describe_staged(
+                str(item.get("image_ids") or ""))
+        except ValueError:
+            # Queue records are application-owned, but an older/corrupt file
+            # must not make the whole conversation queue unreadable.
+            item["attachments"] = []
+        items.append(item)
+    return {"items": items, "paused": bool(state.get("paused"))}
+
+
 @router.get("/sessions/{thread_id}/queue", dependencies=[Depends(require_token)])
 async def get_queue(request: Request, thread_id: str) -> dict[str, Any]:
     try:
-        return request.app.state.codex_queue.get(thread_id)
+        return _queue_state(request, thread_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -433,7 +769,15 @@ async def enqueue_queue(request: Request, thread_id: str,
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    return {"ok": True, "item": item, **request.app.state.codex_queue.get(thread_id)}
+    started = False
+    if body.drain_if_idle:
+        started = await request.app.state.codex_queue_drain.drain(thread_id)
+    return {
+        "ok": True,
+        "item": item,
+        "started": started,
+        **_queue_state(request, thread_id),
+    }
 
 
 @router.delete("/sessions/{thread_id}/queue/{item_id}", dependencies=[Depends(require_token)])
@@ -441,7 +785,7 @@ async def remove_queue(request: Request, thread_id: str, item_id: str) -> dict[s
     try:
         if not request.app.state.codex_queue.remove(thread_id, item_id):
             raise HTTPException(404, "queue item not found")
-        return {"ok": True, **request.app.state.codex_queue.get(thread_id)}
+        return {"ok": True, **_queue_state(request, thread_id)}
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -450,7 +794,7 @@ async def remove_queue(request: Request, thread_id: str, item_id: str) -> dict[s
 async def clear_queue(request: Request, thread_id: str) -> dict[str, Any]:
     try:
         request.app.state.codex_queue.clear(thread_id)
-        return {"ok": True, **request.app.state.codex_queue.get(thread_id)}
+        return {"ok": True, **_queue_state(request, thread_id)}
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -459,10 +803,10 @@ async def clear_queue(request: Request, thread_id: str) -> dict[str, Any]:
 async def pause_queue(request: Request, thread_id: str,
                       body: QueuePauseRequest) -> dict[str, Any]:
     try:
-        result = request.app.state.codex_queue.pause(thread_id, body.paused)
+        request.app.state.codex_queue.pause(thread_id, body.paused)
         if not body.paused:
             await request.app.state.codex_queue_drain.drain(thread_id)
-        return result
+        return _queue_state(request, thread_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -471,7 +815,8 @@ async def pause_queue(request: Request, thread_id: str,
 async def reorder_queue(request: Request, thread_id: str,
                         body: QueueReorderRequest) -> dict[str, Any]:
     try:
-        return request.app.state.codex_queue.reorder(thread_id, body.order)
+        request.app.state.codex_queue.reorder(thread_id, body.order)
+        return _queue_state(request, thread_id)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
 
@@ -597,6 +942,98 @@ async def cost_dashboard(
             days=days, tz_offset_minutes=tz_offset_minutes)
 
 
+@router.get("/search", dependencies=[Depends(require_token)])
+async def search_chat_messages(
+    request: Request,
+    q: str = Query(default="", max_length=200),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> dict[str, Any]:
+    """Use app-server's native full-text thread search for the palette."""
+    query = q.strip()
+    if not query:
+        return {"hits": [], "total": 0}
+    threads, turns = _services(request)
+    rows: list[dict[str, Any]] = []
+    try:
+        result = await request.app.state.codex_runtime.request(
+            "thread/search",
+            {
+                "searchTerm": query,
+                # Search has no cwd filter.  Over-fetch, then enforce the
+                # registered workspace boundary below.
+                "limit": min(100, max(limit * 4, limit)),
+                "sortKey": "updated_at",
+                "sortDirection": "desc",
+            },
+            timeout=8,
+        )
+        if not isinstance(result, dict) or not isinstance(result.get("data"), list):
+            raise ValueError("thread/search returned an invalid result")
+        rows = [row for row in result["data"] if isinstance(row, dict)]
+    except AppServerResponseError as exc:
+        if exc.code not in {-32600, -32601}:
+            raise _http_error(exc) from exc
+        # Compatibility fallback: older app-server builds can still find
+        # titles, even though message-body search is unavailable there.
+        page = await threads.list(limit=limit, search_term=query)
+        rows = [{"thread": thread, "snippet": thread.get("preview") or ""}
+                for thread in page.data]
+    except (AppServerError, ValueError) as exc:
+        raise _http_error(exc) from exc
+
+    needle = query.casefold()
+    hits: list[dict[str, Any]] = []
+    for row in rows:
+        thread = row.get("thread")
+        if not isinstance(thread, dict) or not threads.contains_workspace(
+            thread.get("cwd")
+        ):
+            continue
+        sid = str(thread.get("id") or "")
+        if not sid:
+            continue
+        role = ""
+        anchor_uuid = ""
+        local_snippet = ""
+        last_user_uuid = ""
+        for message in _thread_messages(
+            thread, request.app.state.codex_attachments
+        ):
+            if message.get("role") == "user":
+                last_user_uuid = str(message.get("uuid") or "")
+            text = str(message.get("text") or "")
+            match_at = text.casefold().find(needle)
+            if match_at < 0:
+                continue
+            role = str(message.get("role") or "")
+            anchor_uuid = str(message.get("uuid") or last_user_uuid)
+            start = max(0, match_at - 70)
+            end = min(len(text), match_at + len(query) + 90)
+            local_snippet = re.sub(r"\s+", " ", text[start:end]).strip()
+            if start:
+                local_snippet = "…" + local_snippet
+            if end < len(text):
+                local_snippet += "…"
+            break
+        meta = _session_meta(thread, turns)
+        snippet = local_snippet or str(row.get("snippet") or meta["name"])
+        try:
+            updated_at = float(thread.get("updatedAt") or 0)
+        except (TypeError, ValueError):
+            updated_at = 0.0
+        hits.append({
+            "sid": sid,
+            "name": meta["name"],
+            "uuid": anchor_uuid,
+            "role": role,
+            "snippet": snippet,
+            "ts": updated_at,
+        })
+        if len(hits) >= limit:
+            break
+    return {"hits": hits, "total": len(hits)}
+
+
 @router.get("/context-info", dependencies=[Depends(require_token)])
 async def context_info(request: Request) -> dict[str, Any]:
     """Describe native Codex context sources without exposing prompt content."""
@@ -638,20 +1075,6 @@ async def context_info(request: Request) -> dict[str, Any]:
         "global_agents_path": str(global_agents),
         "workspace_root": str(root),
     }
-
-
-@router.get("/interrupted-turns", dependencies=[Depends(require_token)])
-async def interrupted_turns() -> dict[str, Any]:
-    # Codex app-server owns turn persistence; it has no equivalent to the
-    # There is no application-owned active-turn sidecar. Returning an explicit empty result keeps
-    # the browser contract honest and avoids reading legacy session files.
-    return {"turns": [], "runtime": "codex"}
-
-
-@router.post("/interrupted-turns/{thread_id}/dismiss", dependencies=[Depends(require_token)])
-async def dismiss_interrupted_turn(thread_id: str) -> dict[str, Any]:
-    del thread_id
-    return {"ok": True, "runtime": "codex"}
 
 
 @router.get("/context-breakdown/{thread_id}", dependencies=[Depends(require_token)])
@@ -893,35 +1316,19 @@ async def stream_start(body: StreamStartRequest) -> dict[str, str]:
 async def stream(
     request: Request,
     ticket: str = Query(""),
-    prompt: str = Query(""),
-    session_id: str = Query(""),
-    model: str = Query(""),
-    model_provider: str = Query(""),
-    permission: str = Query("default"),
-    effort: str = Query(""),
-    image_ids: str = Query(""),
-    source_device_kind: str = Query("unknown"),
-    token: str = Query(""),
 ):
-    if ticket:
-        entry = _STREAM_TICKETS.pop(ticket, None)
-        if entry is None or entry[0] <= time.monotonic():
-            raise HTTPException(401, "invalid or expired stream ticket")
-        params = entry[1]
-        prompt = params["prompt"]
-        session_id = params["session_id"]
-        model = params["model"]
-        model_provider = params["model_provider"]
-        permission = params["permission"]
-        effort = params["effort"]
-        image_ids = params["image_ids"]
-        source_device_kind = params["source_device_kind"]
-    else:
-        from ..auth import _token_ok
-        if not _token_ok(token):
-            raise HTTPException(401, "bad token")
-        if not session_id:
-            raise HTTPException(422, "session_id required")
+    entry = _STREAM_TICKETS.pop(ticket, None) if ticket else None
+    if entry is None or entry[0] <= time.monotonic():
+        raise HTTPException(401, "invalid or expired stream ticket")
+    params = entry[1]
+    prompt = params["prompt"]
+    session_id = params["session_id"]
+    model = params["model"]
+    model_provider = params["model_provider"]
+    permission = params["permission"]
+    effort = params["effort"]
+    image_ids = params["image_ids"]
+    source_device_kind = params["source_device_kind"]
 
     _threads, turns = _services(request)
     if prompt.strip() or image_ids.strip():
@@ -977,6 +1384,21 @@ async def stream(
 async def upload_attachment(request: Request, file: UploadFile = File(...)) -> dict[str, Any]:
     attachments: CodexAttachmentService = request.app.state.codex_attachments
     return await attachments.upload(file)
+
+
+@router.get(
+    "/queued-image/{attachment_id}",
+    dependencies=[Depends(require_token_query)],
+)
+async def get_queued_image(request: Request, attachment_id: str) -> FileResponse:
+    """Serve a staged image thumbnail source without consuming the upload."""
+    attachments: CodexAttachmentService = request.app.state.codex_attachments
+    path, mime = attachments.resolve_staged_image(attachment_id)
+    return FileResponse(
+        path,
+        media_type=mime,
+        headers={"Cache-Control": "private, max-age=300"},
+    )
 
 
 @router.get(
@@ -1041,6 +1463,17 @@ async def submit_user_input(
 @router.post("/interrupt", dependencies=[Depends(require_token_header_or_query)])
 async def interrupt(request: Request, session_id: str) -> dict[str, Any]:
     _threads, turns = _services(request)
+    queue: CodexQueueService = request.app.state.codex_queue
+    # Pause before yielding to turn/interrupt. Otherwise the interrupted turn
+    # can settle between those operations and a queue drain can start the next
+    # message immediately — exactly the opposite of the user's stop intent.
+    try:
+        queue_state = queue.get(session_id)
+        queue_paused = bool(queue_state["items"])
+        if queue_paused:
+            queue.pause(session_id, True)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
     try:
         interrupted = await turns.interrupt(session_id)
     except AppServerError as exc:
@@ -1048,6 +1481,7 @@ async def interrupt(request: Request, session_id: str) -> dict[str, Any]:
     return {
         "ok": True,
         "interrupted": [session_id] if interrupted else [],
+        "queue_paused": queue_paused,
     }
 
 
@@ -1116,6 +1550,7 @@ def _session_meta(
         "name": str(name),
         "model": resolved_model,
         "model_provider": str(thread.get("modelProvider") or ""),
+        "cwd": str(thread.get("cwd") or ""),
         "system_prompt": "",
         "created_at": created,
         "updated_at": updated,
@@ -1130,7 +1565,10 @@ def _session_meta(
             if permission is not None
             else str(settings.get("permission") or "default")
         ),
-        "thinking": True,
+        "thinking": (
+            settings["thinking"]
+            if isinstance(settings.get("thinking"), bool) else True
+        ),
         "parent_thread_id": (
             thread["parentThreadId"]
             if isinstance(thread.get("parentThreadId"), str) else None

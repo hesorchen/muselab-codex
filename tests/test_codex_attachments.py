@@ -41,6 +41,32 @@ async def test_upload_prepare_and_restore_history(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_staged_attachment_can_be_described_and_previewed_before_queue_drain(
+    tmp_path,
+):
+    service = CodexAttachmentService(tmp_path)
+    uploaded = await service.upload(_upload(
+        "queue-shot.png", b"\x89PNG\r\n\x1a\nqueued", "image/png"))
+
+    assert service.describe_staged(uploaded["id"]) == [{
+        "id": uploaded["id"],
+        "kind": "image",
+        "name": "queue-shot.png",
+        "mime": "image/png",
+        "available": True,
+    }]
+    path, mime = service.resolve_staged_image(uploaded["id"])
+    assert path.read_bytes().endswith(b"queued")
+    assert mime == "image/png"
+
+    service.prepare("thread-1", uploaded["id"])
+    assert service.describe_staged(uploaded["id"])[0]["available"] is False
+    with pytest.raises(HTTPException) as missing:
+        service.resolve_staged_image(uploaded["id"])
+    assert missing.value.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_document_sidecar_survives_app_server_dropping_mention(tmp_path):
     service = CodexAttachmentService(tmp_path)
     uploaded = await service.upload(_upload(

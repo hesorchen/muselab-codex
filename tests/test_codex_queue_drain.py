@@ -75,5 +75,29 @@ async def test_busy_or_paused_queue_does_not_consume_item():
     assert await drain.drain("thread-1") is False
     assert queue.get("thread-1")["items"]
     queue.pause("thread-1", True)
-    assert await CodexQueueDrainService(queue, Turns(), Attachments()).drain("thread-1") is False
+    assert await CodexQueueDrainService(
+        queue, Turns(), Attachments()).drain("thread-1") is False
     assert queue.get("thread-1")["items"]
+
+
+def test_queue_survives_service_restart_and_persists_every_mutation(tmp_path):
+    state_dir = tmp_path / "queues"
+    first = CodexQueueService(state_dir)
+    queued = first.enqueue(
+        "thread-1", "survive restart", image_ids="a" * 32,
+        permission="plan", model="gpt-test", effort="high",
+        source_device_kind="mobile",
+    )
+    first.pause("thread-1", True)
+
+    restored = CodexQueueService(state_dir)
+    state = restored.get("thread-1")
+    assert state["paused"] is True
+    assert state["items"] == [queued]
+
+    restored.pause("thread-1", False)
+    assert restored.take_next("thread-1") == queued
+    assert not (state_dir / "thread-1.json").exists()
+    assert CodexQueueService(state_dir).get("thread-1") == {
+        "items": [], "paused": False,
+    }

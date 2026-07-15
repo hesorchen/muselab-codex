@@ -53,11 +53,18 @@ def backend_url(tmp_path_factory):
     env.pop("ANTHROPIC_AUTH_TOKEN", None)
 
     repo_root = Path(__file__).resolve().parents[2]
+    # Never leave a chatty long-running server attached to an unread PIPE.
+    # A full browser suite easily fills the OS pipe buffer; the next logging
+    # write then blocks the event loop and every later page.goto times out.
+    # A throwaway file stays bounded by the isolated test lifetime and still
+    # gives us useful startup diagnostics.
+    log_path = root / "backend.log"
+    log_file = log_path.open("wb")
     proc = subprocess.Popen(
         [sys.executable, "-m", "backend.main"],
         cwd=repo_root,
         env=env,
-        stdout=subprocess.PIPE,
+        stdout=log_file,
         stderr=subprocess.STDOUT,
     )
     base = f"http://127.0.0.1:{port}"
@@ -66,7 +73,9 @@ def backend_url(tmp_path_factory):
     import urllib.request
     while time.time() < deadline:
         if proc.poll() is not None:
-            out = proc.stdout.read().decode("utf-8", errors="replace") if proc.stdout else ""
+            log_file.flush()
+            out = log_path.read_text(encoding="utf-8", errors="replace")
+            log_file.close()
             raise RuntimeError(f"backend died during startup:\n{out}")
         try:
             urllib.request.urlopen(f"{base}/static/app.js", timeout=0.5).close()
@@ -75,6 +84,8 @@ def backend_url(tmp_path_factory):
             time.sleep(0.2)
     else:
         proc.kill()
+        proc.wait(timeout=5)
+        log_file.close()
         raise RuntimeError("backend never became ready")
 
     yield base
@@ -83,6 +94,9 @@ def backend_url(tmp_path_factory):
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         proc.kill()
+        proc.wait(timeout=5)
+    finally:
+        log_file.close()
 
 
 @pytest.fixture(scope="session")
