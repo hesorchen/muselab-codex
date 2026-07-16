@@ -769,8 +769,32 @@ def test_codex_quota_labels_distinguish_equal_duration_limits():
 
     assert "window.limit_name" in labeler
     assert 'limitId === "codex" ? "Codex" : limitId' in labeler
-    assert "`${name} · ${period}`" in labeler
+    assert "/codex[- ]spark/i" in labeler
+    assert "`${name} ${period}额度`" in labeler
+    assert "`${name} ${period} allowance`" in labeler
     assert 'x-text="codexLimitWindowLabel(w) || w.key"' in html
+
+
+def test_codex_quota_dashboard_has_clear_hierarchy_and_progress_semantics():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+
+    assert 'class="codex-quota-updated"' in html
+    assert "t('set.cost.updated'" in html
+    assert 'class="codex-quota-metric-label"' in html
+    assert "t('set.cost.remaining')" in html
+    assert 'role="progressbar"' in html
+    assert ':aria-valuenow="w.remaining_percent === null ? null : w.remaining_percent"' in html
+    assert 'class="codex-quota-fill"' in html
+    assert "codexLimitResetText(w.resets_at)" in html
+    assert "t('set.cost.token_usage')" in html
+    assert "codexLimitResetText(epoch)" in app
+    assert "const days = Math.floor(secs / 86_400)" in app
+    assert 'if ((item.limit_id || "").toLowerCase() === "codex") return 0' in app
+    assert ".codex-quota-track" in css
+    assert ".codex-quota-footnote" in css
+    assert "@media (max-width: 420px)" in css
 
 
 def test_chat_transcript_uses_stable_session_and_message_keys():
@@ -940,9 +964,13 @@ def test_multi_workspace_ui_is_app_level_and_new_sessions_inherit_it():
 
     assert "window.prompt" not in app
     assert "cwd: seedCwd" in app
-    assert 'headers["X-Muselab-Workspace"] = encodeURIComponent(this.activeWorkspace)' in app
+    assert "primaryWorkspacePath()" in app
+    assert "fileWorkspacePath()" in app
+    assert 'headers["X-Muselab-Workspace"] = encodeURIComponent(cwd)' in app
     assert '"&workspace=" + encodeURIComponent(workspace)' in app
     assert "workspace-picker" in html
+    assert 'class="workspace-info-btn"' in html
+    assert "workspace.help" in html
     workspace_picker = html.index('class="workspace-picker chat-head-workspace"')
     assert html.rfind('<header class="pane-head">', 0, workspace_picker) > html.index(
         '<aside class="pane chat"')
@@ -960,21 +988,19 @@ def test_multi_workspace_ui_is_app_level_and_new_sessions_inherit_it():
     assert app.count("await this._refreshSessionsAfterWorkspaceRegistryChange()") == 2
 
 
-def test_workspace_switch_restores_runtime_cache_before_background_refresh():
+def test_workspace_switch_changes_conversation_only_and_keeps_archive_surface():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    capture_start = app.index("_captureWorkspaceSurface(path = \"\")")
-    switch_start = app.index("async _changeWorkspaceSurface(path)", capture_start)
-    switch_end = app.index("\n    async switchWorkspace(path)", switch_start)
-    capture = app[capture_start:switch_start]
-    switch = app[switch_start:switch_end]
+    start = app.index("async switchWorkspace(path)")
+    end = app.index("\n    closeWorkspaceBrowser()", start)
+    switch = app[start:end]
 
-    assert "_workspaceRuntimeCaches" in app
-    assert "previewCache: this._previewCache" in capture
-    assert "visible: (this.visible || []).map" in capture
-    assert switch.index("this.visible = runtime") < switch.index("this.loadRoot()")
-    assert "this._previewCache = new Map(runtime" in switch
-    assert "const refreshSurface = Promise.allSettled([this.loadRoot(), this.loadTrash()])" in switch
-    assert "if (!runtime) await refreshSurface" in switch
+    assert "this.activeWorkspace = path" in switch
+    assert "await this.fetchContextInfo()" in switch
+    assert "_changeWorkspaceSurface" not in switch
+    assert "_confirmLoseEdits" not in switch
+    assert "loadRoot()" not in switch
+    assert "loadTrash()" not in switch
+    assert "_clearPreviewState" not in switch
 
 
 def test_global_activity_center_and_app_badge_are_cross_workspace():
@@ -1052,15 +1078,15 @@ def test_workspace_async_file_surfaces_reject_late_previous_owner_results():
     palette = app[palette_start:palette_end]
 
     assert "const loadSeq = ++this._trashLoadSeq" in trash
-    assert "ownerWorkspace === this.currentWorkspacePath()" in trash
+    assert "ownerWorkspace === this.fileWorkspacePath()" in trash
     assert trash.count("if (!isOwner()) return") >= 2
     assert "const loadSeq = ++this._selectedMetaSeq" in meta
-    assert "ownerWorkspace === this.currentWorkspacePath()" in meta
+    assert "ownerWorkspace === this.fileWorkspacePath()" in meta
     assert "this.selected === path" in meta
-    assert "opts.ownerWorkspace || this.currentWorkspacePath()" in children
+    assert "opts.ownerWorkspace || this.fileWorkspacePath()" in children
     assert "this._workspaceIsCurrent(ownerWorkspace)" in children
     assert "stale.staleWorkspace = true" in children
-    assert "ownerWorkspace = this.currentWorkspacePath()" in upload
+    assert "ownerWorkspace = this.fileWorkspacePath()" in upload
     assert "if (!this._workspaceIsCurrent(ownerWorkspace)) return" in upload
     assert save.index("if (!sameOwner) return") < save.index(
         "this._previewCacheDel(savePath)")
@@ -1085,7 +1111,7 @@ def test_workspace_and_activity_caches_are_bounded_and_revalidated():
 
 def test_preview_metadata_cache_is_workspace_scoped_and_bounded():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
-    assert 'return `${this.currentWorkspacePath()}\\0${path || ""}`' in app
+    assert 'return `${this.fileWorkspacePath()}\\0${path || ""}`' in app
     assert "Date.now() - Number(metaEntry.savedAt || 0) < 5000" in app
     assert "while (this._fileMetaCache.size > 64)" in app
 
@@ -1227,3 +1253,28 @@ def test_visible_session_management_calls_have_native_backend_routes():
     assert '"/sessions/{thread_id}/export"' in backend
     assert '@router.get("/search"' in backend
     assert "/api/chat/reset?" not in app
+
+
+def test_activity_center_uses_two_compact_numberless_status_dots():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    start = html.index('class="activity-center-btn"')
+    button = html[start:html.index("</button>", start)]
+
+    assert 'class="activity-running"' in button
+    assert 'x-show="activity.summary.running"' in button
+    assert 'class="activity-unread"' in button
+    assert 'x-show="activity.summary.unread"' in button
+    assert "x-text=" not in button
+
+    def compact_rule(selector: str) -> str:
+        pos = css.index(selector)
+        return re.sub(r"\s+", "", css[pos:css.index("}", pos)])
+
+    running = compact_rule(".activity-center-btn .activity-running {")
+    unread = compact_rule(".activity-center-btn .activity-unread {")
+    assert "width:10px" in running and "height:10px" in running
+    assert "background:var(--c-running)" in running
+    assert "width:10px" in unread and "height:10px" in unread
+    assert "min-width" not in unread and "padding" not in unread
+    assert "background:var(--c-success)" in unread

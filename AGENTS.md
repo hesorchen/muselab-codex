@@ -63,12 +63,13 @@ version and schema digest in the change that upgrades the protocol baseline.
   across tab switches. Session-scoped transient rows such as first-token,
   compaction, and queue placeholders must stay inside that session's
   `.msg-pane`, not as direct `.chat-body` children.
-- Treat the active workspace as one application-level context: session tabs,
-  new-session cwd, file tree, and preview must switch together. Relative file
-  requests may resolve only against a backend-registered workspace; use the
-  validated workspace header for fetches and a validated query parameter for
-  browser-owned raw/download requests. Never let a late response from one
-  workspace update another workspace's tree or preview.
+- Keep conversation cwd and the archive surface separate. The active workspace
+  controls session tabs, project instructions, and new-session cwd only; file
+  tree, preview, editor, search, and trash remain rooted at primary
+  `MUSELAB_ROOT`. File requests and browser-owned raw/download URLs must resolve
+  against that primary root. When a primary-root file is mentioned from another
+  cwd, use its canonical absolute path. Never let a late file response overwrite
+  a newer file selection.
 - Never calculate a duration by subtracting a server epoch from a browser
   epoch. Browser and backend may run on different devices; expose a relative,
   monotonic server duration for reconnect and completion timing, with a local

@@ -459,8 +459,8 @@ function portal() {
     _layoutEpoch: 0,
     _creatingSession: false,
     sessionWorkspaces: [],
-    // Workspace is an application-level context: file tree, preview tabs,
-    // visible chat tabs and the next new conversation all follow it together.
+    // Workspace controls only conversation cwd/session grouping. File tree and
+    // preview remain rooted at the primary MUSELAB_ROOT.
     // Each native Codex thread remains permanently bound to its own cwd.
     activeWorkspace: "",
     workspaceMenuOpen: false,
@@ -474,6 +474,7 @@ function portal() {
       truncated: false, requestSeq: 0,
     },
     workspaceLastSession: {},
+    _loadedPrefsSchema: 4,
     workspaceSurfaces: {},
     // Ephemeral per-workspace file/preview snapshots. Unlike workspaceSurfaces
     // these are intentionally not persisted to localStorage: they can contain
@@ -1660,6 +1661,9 @@ function portal() {
       this._startHeartbeat();
       this._startPresence();
       this._startSessionsSync();
+      // Restoring a saved current thread means the user is already looking at
+      // it; clear any completion that landed before this page loaded.
+      this.ackCurrentActivity();
     },
 
     // FIX ⑪: near-real-time multi-device sync for the session LIST while the
@@ -1785,6 +1789,7 @@ function portal() {
         // might still get a phone push for a turn that finishes in the
         // first 15s of being back.
         ping();                  // presence: re-arm push suppression
+        this.ackCurrentActivity(); // visible current thread is already viewed
         this._pingHealth();      // health: refresh conn state immediately
         // Refresh the session list in case another device created/deleted
         // sessions while this tab was hidden (drives the active-dot state).
@@ -3827,7 +3832,7 @@ function portal() {
     // entry came from the API). For chat-link clicks the path comes from
     // model output and may not exist — surface the failure as a toast.
     async openByPathToasted(path) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       // Reuse the exact header snapshot for every fallback request. Otherwise
       // a workspace switch between the parent lookup and suffix search could
       // resolve the same relative filename against a different project.
@@ -3948,13 +3953,20 @@ function portal() {
     },
 
     hdr() {
-      const headers = { "X-Auth-Token": this.token };
-      // Header values must stay ByteString-safe in browsers. Percent-encoding
-      // preserves workspaces containing Chinese or emoji; backend/files.py
-      // decodes and validates it against the registered workspace list.
-      if (this.activeWorkspace) {
-        headers["X-Muselab-Workspace"] = encodeURIComponent(this.activeWorkspace);
-      }
+      // Global/file requests intentionally omit a workspace header: backend
+      // file APIs then use their safe default, the primary MUSELAB_ROOT.
+      return { "X-Auth-Token": this.token };
+    },
+    conversationHdr(path = "") {
+      const headers = this.hdr();
+      const cwd = path || this.currentWorkspacePath();
+      if (cwd) headers["X-Muselab-Workspace"] = encodeURIComponent(cwd);
+      return headers;
+    },
+    fileHdr() {
+      const headers = this.hdr();
+      const root = this.fileWorkspacePath();
+      if (root) headers["X-Muselab-Workspace"] = encodeURIComponent(root);
       return headers;
     },
 
@@ -4208,16 +4220,14 @@ function portal() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
-      this._captureWorkspaceSurface();
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 3,
+        schema: 4,
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
         openTabIds: this.openTabIds,
         activeWorkspace: this.activeWorkspace,
         workspaceLastSession: this.workspaceLastSession,
-        workspaceSurfaces: this.workspaceSurfaces,
         previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
         expanded: Array.from(this.expanded),
@@ -4255,7 +4265,8 @@ function portal() {
     loadPrefs() {
       try {
         const p = JSON.parse(localStorage.getItem("muselab_prefs") || "{}");
-        if ((p.schema || 1) < 2) {
+        this._loadedPrefsSchema = Number(p.schema || 1);
+        if (this._loadedPrefsSchema < 2) {
           // Prefs format changed — clear stale data to avoid partial restore
           try { localStorage.removeItem("muselab_prefs"); } catch (_) {}
           return;
@@ -4328,7 +4339,9 @@ function portal() {
     },
 
     async fetchContextInfo() {
-      const { ok, data } = await this.api("/api/chat/context-info");
+      const { ok, data } = await this.api("/api/chat/context-info", {
+        headers: this.conversationHdr(),
+      });
       if (!ok || !data) return;
       data._fetched = true;
       this.contextInfo = data;
@@ -4497,19 +4510,29 @@ function portal() {
 
     codexLimitWindowLabel(window) {
       if (!window) return "";
-      const period = this.rateLimitWindowLabel(window.rate_limit_type || "");
+      const type = window.rate_limit_type || "";
+      const compactPeriod = this.rateLimitWindowLabel(type);
+      const periods = this.lang === "zh"
+        ? { five_hour: "5 小时", one_day: "1 天", seven_day: "7 天", thirty_day: "30 天", monthly: "每月" }
+        : { five_hour: "5-hour", one_day: "1-day", seven_day: "7-day", thirty_day: "30-day", monthly: "monthly" };
+      const period = periods[type] || compactPeriod;
       const nativeName = typeof window.limit_name === "string"
         ? window.limit_name.trim()
         : "";
       const limitId = typeof window.limit_id === "string"
         ? window.limit_id.trim()
         : "";
-      // `codex` is the native id for the regular account allowance. Other
-      // allowances (for example Codex Spark) provide a human-readable name.
-      // Keep the id as a last-resort discriminator so two equal-duration
-      // windows never become indistinguishable again.
-      const name = nativeName || (limitId === "codex" ? "Codex" : limitId);
-      if (name && period) return `${name} · ${period}`;
+      // Native Spark labels include a model version, which makes the compact
+      // quota card much harder to scan. Keep the product identity but drop the
+      // volatile model prefix; unknown allowances retain their native name/id.
+      const name = /codex[- ]spark/i.test(nativeName)
+        ? "Codex Spark"
+        : (nativeName || (limitId === "codex" ? "Codex" : limitId));
+      if (name && period) {
+        return this.lang === "zh"
+          ? `${name} ${period}额度`
+          : `${name} ${period} allowance`;
+      }
       return name || period;
     },
 
@@ -6526,13 +6549,21 @@ function portal() {
       return `${h[0]}${h[1]}${h[2]}${h[3]}-${h[4]}${h[5]}-${h[6]}${h[7]}-` +
              `${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
     },
+    primaryWorkspacePath() {
+      return ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
+    },
+    fileWorkspacePath() {
+      return this.primaryWorkspacePath();
+    },
     currentWorkspacePath() {
       if (this.activeWorkspace) return this.activeWorkspace;
       const session = this.sessions.find(s => s.id === this.currentId);
-      return (session && session.cwd) ||
-        (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      return (session && session.cwd) || this.primaryWorkspacePath();
     },
     _workspaceIsCurrent(path) {
+      return String(path || "") === String(this.fileWorkspacePath() || "");
+    },
+    _conversationWorkspaceIsCurrent(path) {
       return String(path || "") === String(this.currentWorkspacePath() || "");
     },
     workspaceLabel(path = "") {
@@ -6565,35 +6596,35 @@ function portal() {
             savedAt: Date.now(), workspaces: this.sessionWorkspaces,
           }));
         } catch (_) { /* best-effort cache */ }
+        const primaryFileRoot = this.primaryWorkspacePath();
+        if (this._loadedPrefsSchema < 4 && primaryFileRoot) {
+          const surface = this.workspaceSurfaces[primaryFileRoot];
+          if (surface && typeof surface === "object") {
+            this.tabs = this._workspacePreviewTabs(surface);
+            this._pendingPreviewSelected = typeof surface.previewSelected === "string"
+              ? surface.previewSelected : "";
+            this.showHidden = typeof surface.showHidden === "boolean"
+              ? surface.showHidden : this.showHidden;
+            this.openFilesCollapsed = !!surface.openFilesCollapsed;
+            this.openFilesHeight = typeof surface.openFilesHeight === "number"
+              ? surface.openFilesHeight : null;
+            this._pendingExpanded = Array.isArray(surface.expanded) ? surface.expanded : [];
+          } else if (this.activeWorkspace && this.activeWorkspace !== primaryFileRoot) {
+            this.tabs = [];
+            this._pendingPreviewSelected = "";
+            this._pendingExpanded = [];
+          }
+          this._loadedPrefsSchema = 4;
+        }
         const valid = new Set(this.sessionWorkspaces.map(w => w.path));
         const session = this.sessions.find(s => s.id === this.currentId);
         const fallback = (session && valid.has(session.cwd) && session.cwd)
           || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
         const requested = this.activeWorkspace;
-        if (!valid.has(requested)) {
-          this.activeWorkspace = fallback;
-          // A persisted workspace may have been removed outside this browser.
-          // In that case restore the fallback workspace's own file surface,
-          // rather than showing the removed project's relative tabs under the
-          // primary tree. An empty requested path is the legacy single-root
-          // format, whose top-level prefs already belong to primary.
-          if (requested && fallback) {
-            const surface = this.workspaceSurfaces[fallback] || {};
-            this.tabs = this._workspacePreviewTabs(surface);
-            this._pendingPreviewSelected = typeof surface.previewSelected === "string"
-              ? surface.previewSelected : "";
-            this.showHidden = typeof surface.showHidden === "boolean"
-              ? surface.showHidden : false;
-            this.openFilesCollapsed = !!surface.openFilesCollapsed;
-            this.openFilesHeight = typeof surface.openFilesHeight === "number"
-              ? surface.openFilesHeight : null;
-            this.expanded = new Set(Array.isArray(surface.expanded) ? surface.expanded : []);
-            this._pendingExpanded = Array.from(this.expanded);
-          }
-        }
-        // Restore only directory metadata; the authoritative loadRoot() still
-        // runs shortly afterwards and replaces it if anything changed.
-        const warmPath = this.activeWorkspace || fallback;
+        if (!valid.has(requested)) this.activeWorkspace = fallback;
+        // File tree cache belongs only to primary MUSELAB_ROOT; conversation cwd
+        // must never select a different archive surface.
+        const warmPath = this.fileWorkspacePath() || fallback;
         if (warmPath && !this.visible.length) {
           const warm = this._loadPersistedWorkspaceTree(warmPath);
           if (warm) {
@@ -6851,10 +6882,12 @@ function portal() {
         this.toast(this.lang === "zh" ? "工作目录未登记" : "Workspace is not registered", "error");
         return;
       }
-      if (!this._confirmLoseEdits()) return;
       this.workspaceSwitching = true;
       try {
-        await this._changeWorkspaceSurface(path);
+        // Workspace selection changes only the conversation cwd. The file tree,
+        // preview tabs and editor remain rooted at primary MUSELAB_ROOT.
+        this.activeWorkspace = path;
+        await this.fetchContextInfo();
         const remembered = this.workspaceLastSession[path];
         const target = this.sessions.find(s => s.id === remembered && s.cwd === path)
           || this.workspaceOpenTabIds(path).map(id => this.sessions.find(s => s.id === id)).find(Boolean)
@@ -7004,7 +7037,10 @@ function portal() {
       try {
         if (this.activeWorkspace === path) {
           const primary = this.sessionWorkspaces.find(w => w.primary);
-          if (primary) await this._changeWorkspaceSurface(primary.path);
+          if (primary) {
+            this.activeWorkspace = primary.path;
+            await this.fetchContextInfo();
+          }
         }
         const response = await fetch(
           "/api/chat/workspaces?path=" + encodeURIComponent(path),
@@ -8484,13 +8520,8 @@ function portal() {
           this.toast(this.lang === "zh" ? "该会话的工作目录尚未登记" : "That session workspace is not registered", "warn");
           return;
         }
-        if (!this._confirmLoseEdits()) return;
-        this.workspaceSwitching = true;
-        try {
-          await this._changeWorkspaceSurface(targetWorkspace);
-        } finally {
-          this.workspaceSwitching = false;
-        }
+        this.activeWorkspace = targetWorkspace;
+        this.fetchContextInfo();
       }
       this.currentId = tid;
       this.workspaceLastSession = {
@@ -8684,7 +8715,7 @@ function portal() {
       this._dragCounter = 0;
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite("", files);
       if (!uploadContext) return;
       // Always upload to the archive root (MUSELAB_ROOT), regardless of
@@ -8770,7 +8801,7 @@ function portal() {
     async _syncUploadedFiles(
       results,
       uploadContext = {},
-      ownerWorkspace = this.currentWorkspacePath(),
+      ownerWorkspace = this.fileWorkspacePath(),
     ) {
       if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const uploaded = (results || [])
@@ -9295,6 +9326,7 @@ function portal() {
         `.chat-session-pane[data-pane-id="${CSS.escape(targetSid)}"] .msg-pane`);
       this._promoteResident(targetSid);
       this._activateTabState(targetSid);
+      this.ackCurrentActivity();
       if (cur) {
         const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
         const cwd = cur.cwd || primary;
@@ -10524,9 +10556,40 @@ function portal() {
         const used = typeof w.used_percent === "number" ? w.used_percent : null;
         const remaining = typeof w.remaining_percent === "number"
           ? w.remaining_percent
-          : (used === null ? null : Math.max(0, 100 - used));
-        return { key, ...w, remaining_percent: remaining };
+          : (used === null ? null : 100 - used);
+        const clamp = (value) => value === null
+          ? null
+          : Math.min(100, Math.max(0, Math.round(value * 10) / 10));
+        return {
+          key,
+          ...w,
+          used_percent: clamp(used),
+          remaining_percent: clamp(remaining),
+        };
+      }).sort((a, b) => {
+        const rank = (item) => {
+          if ((item.limit_id || "").toLowerCase() === "codex") return 0;
+          if (/codex[- ]spark/i.test(item.limit_name || item.limit_id || "")) return 1;
+          return 2;
+        };
+        return rank(a) - rank(b) || a.key.localeCompare(b.key);
       });
+    },
+    codexLimitResetText(epoch) {
+      if (!epoch) return "";
+      const secs = epoch - Math.floor(Date.now() / 1000);
+      if (secs <= 0) return "";
+      const days = Math.floor(secs / 86_400);
+      const hours = Math.floor((secs % 86_400) / 3600);
+      const minutes = Math.floor((secs % 3600) / 60);
+      if (this.lang === "zh") {
+        if (days > 0) return `${days} 天${hours > 0 ? ` ${hours} 小时` : ""}`;
+        if (hours > 0) return `${hours} 小时${minutes > 0 ? ` ${minutes} 分钟` : ""}`;
+        return `${minutes} 分钟`;
+      }
+      if (days > 0) return `${days}d${hours > 0 ? ` ${hours}h` : ""}`;
+      if (hours > 0) return `${hours}h${minutes > 0 ? ` ${minutes}m` : ""}`;
+      return `${minutes}m`;
     },
     codexLimitUpdatedText() {
       const ts = this.codexLimit && this.codexLimit.updated_at;
@@ -11199,7 +11262,7 @@ function portal() {
     // edge case without bespoke logic.
     async _refreshParentInTree(
       restoredPath,
-      ownerWorkspace = this.currentWorkspacePath(),
+      ownerWorkspace = this.fileWorkspacePath(),
     ) {
       if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
       if (!restoredPath) return this.reloadTree();
@@ -11269,7 +11332,7 @@ function portal() {
       return true;
     },
     async fetchChildren(path, opts = {}) {
-      const ownerWorkspace = opts.ownerWorkspace || this.currentWorkspacePath();
+      const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
       const isOwner = () => this._workspaceIsCurrent(ownerWorkspace)
         && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
       if (!isOwner()) {
@@ -11538,7 +11601,7 @@ function portal() {
       // same children, corrupting the flat `visible` array. Re-check after the
       // async fetch so the loser bails out instead of inserting duplicates.
       if (this.expanded.has(n.path)) return;
-      const ownerWorkspace = opts.ownerWorkspace || this.currentWorkspacePath();
+      const ownerWorkspace = opts.ownerWorkspace || this.fileWorkspacePath();
       let children;
       try {
         children = await this.fetchChildren(n.path, {
@@ -11650,7 +11713,7 @@ function portal() {
     },
     async doNewFile(dirNode) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建文件" : "New file",
         // Root has no meaningful path to show ("在 /" reads broken); a
@@ -11692,7 +11755,7 @@ function portal() {
     },
     async doNewDir(dirNode) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: dirNode.path
           ? (zh ? "新建子目录" : "New subdirectory")
@@ -11742,7 +11805,7 @@ function portal() {
     },
     async doRename(n) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const newName = await this.prompt({
         title: zh ? "重命名" : "Rename",
         body: (zh ? "当前路径:" : "Current path: ") + n.path,
@@ -11797,7 +11860,7 @@ function portal() {
     // "Copy as .bak" menu (dst_dir omitted → same-dir duplicate) and
     // the Ctrl+V paste path (dst_dir = selected directory).
     async _postCopyBak(srcPath, dstDir) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const body = dstDir ? { src: srcPath, dst_dir: dstDir }
                           : { src: srcPath };
       let r;
@@ -11867,7 +11930,7 @@ function portal() {
     },
     async doDelete(n) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       // Soft-delete now: backend moves the target into <ROOT>/.muselab-dustbin/
       // and returns a trash_id. Confirm copy says "move to trash" rather
       // than "permanently delete"; the prior "(only empty dirs)" caveat
@@ -11958,9 +12021,9 @@ function portal() {
       // until login/_bootApp re-invokes us.
       if (!this.token) return;
       const loadSeq = ++this._trashLoadSeq;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const isOwner = () => loadSeq === this._trashLoadSeq
-        && ownerWorkspace === this.currentWorkspacePath();
+        && ownerWorkspace === this.fileWorkspacePath();
       this.trash.loading = true;
       try {
         const r = await fetch("/api/files/trash/list", { headers: this.hdr() });
@@ -11988,7 +12051,7 @@ function portal() {
       this.trash.modalOpen = false;
     },
     async restoreTrash(tid) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       let r;
       try {
         r = await fetch("/api/files/trash/restore", {
@@ -12030,7 +12093,7 @@ function portal() {
     },
     async purgeTrash(tid) {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const ok = await this.confirm({
         title: zh ? "彻底删除" : "Permanently delete",
         body: zh ? "这一项将被永久删除，无法恢复。继续？"
@@ -12065,7 +12128,7 @@ function portal() {
     async emptyTrash() {
       const zh = this.lang === "zh";
       if (!this.trash.items.length) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const ok = await this.confirm({
         title: zh ? "清空垃圾桶" : "Empty trash",
         body: zh ? `${this.trash.items.length} 项将被永久删除，无法恢复。继续？`
@@ -12139,7 +12202,7 @@ function portal() {
     async _trashManyPaths(paths) {
       if (!this._canRemovePreviewPaths(paths)) return;
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
           method: "DELETE",
@@ -12170,7 +12233,7 @@ function portal() {
     async _sendToTrash(path) {
       if (!this._canRemovePreviewPaths([path])) return;
       const name = path.split("/").pop() || path;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       let r;
       try {
         r = await fetch("/api/files/delete", {
@@ -12569,7 +12632,7 @@ function portal() {
       this._fileMetaCache.delete(this._fileMetaKey(path));
     },
     _fileMetaKey(path) {
-      return `${this.currentWorkspacePath()}\0${path || ""}`;
+      return `${this.fileWorkspacePath()}\0${path || ""}`;
     },
     // Restore preview-pane reactive state from a cache entry; mirrors the
     // post-fetch assignments in openFile's per-mode branches.
@@ -13335,9 +13398,9 @@ function portal() {
     // failed/404 stat clears the strip rather than showing stale numbers.
     async loadSelectedMeta(path) {
       const loadSeq = ++this._selectedMetaSeq;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const isOwner = () => loadSeq === this._selectedMetaSeq
-        && ownerWorkspace === this.currentWorkspacePath()
+        && ownerWorkspace === this.fileWorkspacePath()
         && this.selected === path;
       if (!path) { this.selectedMeta = null; return; }
       const metaKey = this._fileMetaKey(path);
@@ -13387,7 +13450,7 @@ function portal() {
 
     rawUrl(p, opts = {}) {
       const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
-      const workspace = this.currentWorkspacePath();
+      const workspace = this.fileWorkspacePath();
       const ws = workspace ? "&workspace=" + encodeURIComponent(workspace) : "";
       // preview=1 asks the backend to inject the image + scroll bridge into
       // HTML (see files.py). Only the html preview iframe passes it; images,
@@ -13487,7 +13550,7 @@ function portal() {
       this.loadSelectedMeta(path);
     },
     downloadUrl(p) {
-      const workspace = this.currentWorkspacePath();
+      const workspace = this.fileWorkspacePath();
       const ws = workspace ? "&workspace=" + encodeURIComponent(workspace) : "";
       return "/api/files/download?path=" + encodeURIComponent(p)
         + "&token=" + encodeURIComponent(this.token) + ws;
@@ -14441,7 +14504,7 @@ function portal() {
       // the upload button silently uploaded just the first one.
       const files = Array.from(ev.target.files || []);
       if (!files.length) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite("", files);
       if (!uploadContext) {
         ev.target.value = "";
@@ -14486,7 +14549,7 @@ function portal() {
       ev.target.value = "";
     },
     async uploadFileTo(dirPath, file) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite(dirPath, [file]);
       if (!uploadContext) return;
       const fd = new FormData();
@@ -14687,7 +14750,7 @@ function portal() {
     // multi-file drop doesn't serialize.
     async _uploadFilesToDir(targetDir, files) {
       if (!files.length) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite(targetDir, files);
       if (!uploadContext) return;
       const results = await Promise.allSettled(
@@ -14756,7 +14819,7 @@ function portal() {
     },
     async moveTreeItem(srcPath, targetDir) {
       if (!srcPath) return;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const srcName = srcPath.split("/").pop();
       const srcParent = srcPath.split("/").slice(0, -1).join("/");
       // Same-parent drop = no-op (user dragged a file inside its own
@@ -14817,7 +14880,7 @@ function portal() {
     // open tabs ONCE. No backend batch endpoint — same parallel-then-refresh
     // pattern as _uploadFilesToDir.
     async moveTreeItems(srcPaths, targetDir) {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const list = this._pruneDescendants((srcPaths || []).filter(Boolean));
       if (!list.length) return;
       if (list.length === 1) {
@@ -14879,7 +14942,7 @@ function portal() {
     // sync tabs. No per-item Undo for batches — items are still recoverable
     // from the trash modal.
     async deleteSelected() {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const paths = this._pruneDescendants(Array.from(this.selectedPaths));
       if (paths.length <= 1) {
         const p = paths[0] || this.treeFocusPath || this.selected;
@@ -15028,7 +15091,7 @@ function portal() {
     },
     async mkdirPrompt() {
       const zh = this.lang === "zh";
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建目录" : "New directory",
         body: zh ? "输入相对根的路径，例如 archives/2026"
@@ -15389,7 +15452,7 @@ function portal() {
       }
       if (!this.selected) return;
       const targetPath = this.selected;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const targetMode = this.previewMode;
       // Entering the editor takes ownership of the file body. Cancel any
       // preview/CSV transport and invalidate deferred markdown rendering so it
@@ -15474,7 +15537,7 @@ function portal() {
         // rawText sync) reads this.editText, so refresh it first.
         if (!this.selected) return;
         const savePath = this.selected;
-        const ownerWorkspace = this.currentWorkspacePath();
+        const ownerWorkspace = this.fileWorkspacePath();
         const saveMode = this.previewMode;
         const saveLang = this.previewLang;
         const saveText = this._cm ? this._cm.getValue() : this.editText;
@@ -15556,10 +15619,14 @@ function portal() {
 
     // ===== @ mention =====
     insertFileMention(path) {
-      const mention = "@" + path + " ";
+      const fileRoot = this.fileWorkspacePath();
+      const mentionPath = this.currentWorkspacePath() === fileRoot
+        ? path
+        : fileRoot.replace(/\/$/, "") + "/" + String(path || "").replace(/^\//, "");
+      const mention = "@" + mentionPath + " ";
       this.input = (this.input || "") + (this.input && !this.input.endsWith(" ") ? " " : "") + mention;
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
-      this.toast(this.t("toast.mention_added", { path }), "success", 1500);
+      this.toast(this.t("toast.mention_added", { path: mentionPath }), "success", 1500);
       // Mobile: @ mention is a chat-side action, jump to the chat pane
       if (this._isMobileLayout()) this.setMobileTab("chat");
     },
@@ -16022,7 +16089,7 @@ function portal() {
     },
 
     async quickNewNote() {
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const name = await this.prompt({
         title: this.t("preview.new_note_title"),
         body: this.t("preview.new_note_body"),
@@ -17762,10 +17829,13 @@ function portal() {
           completedAt: d.completed_at,
         });
         _stopTimer();
-        if (this.currentId === streamSid && document.visibilityState === "visible") {
-          // The backend finalizes the durable activity entry just after it
-          // publishes `done`; defer so the ack cannot beat creation.
-          setTimeout(() => this.ackActivityThread(streamSid), 500);
+        const _viewedStream = this.currentId === streamSid
+          || (this.tabState && this.tabState[this.currentId] === streamState);
+        if (_viewedStream) {
+          // Codex publishes `done` before the durable activity callback settles.
+          // Resolve through currentId so first-turn id adoption cannot make the
+          // acknowledgement miss the durable native-thread activity row.
+          this.ackCurrentActivity(3);
         }
         // We rendered this reply live — re-baseline the open-session resync
         // cursor so the post-done list poll (updated_at now advanced) doesn't
@@ -18572,7 +18642,7 @@ function portal() {
       const requestSeq = ++this._paletteFileSeq;
       this.palette.fileQuery = q;
       this.palette.fileLoading = true;
-      const ownerWorkspace = this.currentWorkspacePath();
+      const ownerWorkspace = this.fileWorkspacePath();
       const isOwner = () => requestSeq === this._paletteFileSeq
         && this._workspaceIsCurrent(ownerWorkspace)
         && this.palette.query.trim() === q;
@@ -18813,7 +18883,12 @@ function portal() {
         this._syncAppBadge();
       } catch (_) {}
     },
-    async ackActivityThread(threadId) {
+    ackCurrentActivity(retries = 0) {
+      if (!this.currentId || typeof document === "undefined"
+          || document.visibilityState !== "visible") return;
+      return this.ackActivityThread(this.currentId, retries);
+    },
+    async ackActivityThread(threadId, retries = 0) {
       if (!threadId) return;
       try {
         const r = await fetch(`/api/activity/thread/${encodeURIComponent(threadId)}/ack`, {
@@ -18822,7 +18897,16 @@ function portal() {
         if (!r.ok) return;
         const data = await r.json();
         if (data.summary) this.activity.summary = data.summary;
+        if (Number(data.changed) > 0) {
+          for (const item of this.activity.events || []) {
+            if (item.thread_id === threadId) item.read = true;
+          }
+        }
         this._syncAppBadge();
+        if (Number(data.changed) === 0 && retries > 0
+            && this.currentId === threadId && document.visibilityState === "visible") {
+          setTimeout(() => this.ackActivityThread(threadId, retries - 1), 400);
+        }
       } catch (_) {}
     },
     _syncAppBadge() {
