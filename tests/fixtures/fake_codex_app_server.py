@@ -196,6 +196,11 @@ def main():
                             "reasoningEffort": "medium",
                             "description": "Medium",
                         }],
+                        "serviceTiers": [{
+                            "id": "priority",
+                            "name": "Fast",
+                            "description": "1.5x speed, increased usage",
+                        }],
                     }],
                     "nextCursor": None,
                 },

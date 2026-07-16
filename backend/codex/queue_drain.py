@@ -44,6 +44,7 @@ class CodexQueueDrainService:
                     model_provider=str(item.get("model_provider") or ""),
                     permission=str(item.get("permission") or "default"),
                     effort=str(item.get("effort") or ""),
+                    service_tier=item.get("service_tier"),
                     inputs=prepared.inputs,
                     user_images=prepared.images,
                     user_docs=prepared.docs,

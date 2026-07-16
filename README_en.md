@@ -46,9 +46,9 @@ independent runtime.
 | Capability | What it provides |
 |---|---|
 | **Codex-native agent harness** | `codex app-server` owns threads, turns, tools, approvals, sandboxing, Skills, MCP, and account limits |
-| **Durable local context** | `MUSELAB_ROOT`, `AGENTS.md`, Memory, and workspace files form an inspectable context system |
+| **Durable local context** | `MUSELAB_ROOT` is the default workspace and more local directories can be registered; `AGENTS.md`, Memory, and workspace files form an inspectable context system |
 | **File workspace** | Tree, full-text search, upload, edit, trash, and previews for Markdown, code, images, PDF, CSV, XLSX, and HTML |
-| **Multi-thread workflows** | Streaming, replay, message queues, fork, compact, sub-agent threads, and up to four visible conversations |
+| **Multi-thread workflows** | Streaming, replay, message queues, fork, compact, sub-agent threads, native Fast mode, and workspace-scoped session tabs |
 | **Native extensions** | Skills, MCP servers, OAuth state, approvals, and structured user questions are surfaced directly from Codex |
 | **Scheduler and terminal** | Run saved prompts on a schedule and supervise background terminal processes |
 | **Self-hosted and mobile** | Localhost defaults, systemd, launchd, Docker, PWA, HTTPS reverse proxy, and Web Push |
@@ -105,7 +105,8 @@ There is no separate chunking or application-owned RAG index. Every workspace ch
 ## Practical details
 
 - **Three-pane workspace** — Coordinate the file tree, preview pane, and chat; preview Markdown, code, images, PDF, CSV, XLSX, and HTML.
-- **Multi-thread grid** — Drag tabs into the chat area or use “Add to chat grid” to watch up to four conversations. Click a veil to select the sole composer target while the other panes keep updating; clicking an existing tab outside the grid or creating a new thread replaces the selected pane instead of leaving multi-view.
+- **Multiple workspaces** — Register and switch among local directories. The file tree, previews, session tabs, and new-thread cwd switch together, while each workspace retains its own tree expansion and preview tabs.
+- **Native thread controls** — Effort, reasoning summaries, and the Fast service tier stay independent. Fast appears only for models that advertise it through `model/list` and persists per thread.
 - **Bilingual and themeable** — Switch languages without a reload; use light, dark, or eye-care themes and the mobile PWA.
 - **One native runtime** — Copy the remote command from Settings → About to enter the same live thread state from Codex CLI.
 - **Observable agent state** — See health, account usage, context usage, tool progress, approvals, and MCP questions in the browser.
@@ -166,7 +167,7 @@ node --check frontend/app.js
 
 ## Security note
 
-Anyone holding `MUSELAB_TOKEN` can operate on files under `MUSELAB_ROOT` and drive approved Codex tools. Keep `MUSELAB_HOST=127.0.0.1` by default. For remote access, add HTTPS and another access-control layer. Never commit `.env`, `CODEX_HOME`, or a real workspace.
+Anyone holding `MUSELAB_TOKEN` can operate on files under `MUSELAB_ROOT` and every registered workspace, and can drive approved Codex tools. Keep `MUSELAB_HOST=127.0.0.1` by default. For remote access, add HTTPS and another access-control layer. Never commit `.env`, `CODEX_HOME`, or a real workspace.
 
 ## Project status
 

@@ -266,11 +266,20 @@ function portal() {
     // concrete pixel value and stop auto-fitting.
     openFilesHeight: null,
     previewMode: "", rawText: "", renderedMd: "", previewLang: "plaintext",
+    // HTML reports are stateful mini-apps: replacing one shared iframe's src
+    // reruns scripts, loses form/UI state, and visibly repaints from the top.
+    // Keep a tiny LRU of live sandboxed browsing contexts instead. Entries are
+    // deliberately session-only and bounded because hidden reports may still
+    // own timers/resources while resident.
+    htmlPreviewFrames: [],   // [{path, lastUsed}]
+    _htmlPreviewFrameClock: 0,
+    HTML_PREVIEW_CACHE_MAX: 4,
     // On-disk metadata for the currently-selected file ({path, name, is_dir,
     // size, mtime} | null). Drives the preview-header path + last-modified
     // strip. Loaded by a $watch on `selected` → loadSelectedMeta(); null while
     // nothing is open or the stat fetch 404s (stale/phantom tab).
     selectedMeta: null,
+    _selectedMetaSeq: 0,
     // Set when a preview READ fails (404/413/403/…), so the unsupported empty
     // state can show a status-aware reason instead of always blaming the file
     // type. null = no error (genuine "unsupported type" or normal preview).
@@ -296,6 +305,7 @@ function portal() {
     // when the user pages forward.
     csvPath: "", csvData: null, csvOffset: 0, csvLimit: 200, csvLoading: false,
     _csvLoadSeq: 0, _csvAbort: null,
+    _trashLoadSeq: 0,
     // Bumped whenever an assistant tool_use edits a file. Used as a cache
     // buster on iframe / read URLs so the preview reflects the new content
     // without the user needing to manually refresh the page.
@@ -339,7 +349,10 @@ function portal() {
     editorView: "split",
     livePreviewHtml: "",
     _livePreviewTimer: null,
-    tabs: [],   // open file tabs: [{path, name}]
+    // Open file tabs. `view` is tab-owned reading state (outer/inner scroll,
+    // active workbook sheet, CSV page) so switching files does not reset the
+    // reader to the beginning. It is serialized with the workspace surface.
+    tabs: [],   // [{path, name, preview, view?}]
     editorTabPickerOpen: false,  // open-tabs quick-switch dropdown (left tab bar)
     editorTabPickerStyle: "",    // inline fixed-position style, set on open
 
@@ -430,30 +443,35 @@ function portal() {
       messageQuery: "",
       messageLoading: false,
     },
+    _paletteFileSeq: 0,
     // Editor-style tab strip. `openTabIds` is the visible order; each
     // entry is a session id (also present in `sessions`). currentId is the
     // active tab. Tabs can be opened from the session picker, closed via × on
     // the tab, or created by the "+ new" button.
     openTabIds: [],
-    // Desktop chat grid. Up to four open sessions can stay visible at once;
-    // currentId remains the sole interactive/composer target. Keeping the
-    // grid ids separate from openTabIds means removing a pane never closes
-    // the underlying tab or its live stream.
-    splitPaneIds: [],
-    // Layout variant for equal pane counts. Kept separate from splitPaneIds
-    // so choices such as two rows and secondary-primary survive refreshes.
-    chatGridLayout: "auto",
-    chatViewMode: "single",
-    chatGridFocusId: "",
-    splitDragOverId: "",
-    chatGridMenuOpen: false,
     _layoutEpoch: 0,
     _creatingSession: false,
     sessionWorkspaces: [],
+    // Workspace is an application-level context: file tree, preview tabs,
+    // visible chat tabs and the next new conversation all follow it together.
+    // Each native Codex thread remains permanently bound to its own cwd.
+    activeWorkspace: "",
+    workspaceMenuOpen: false,
     workspaceSwitching: false,
+    // Server-side folder picker used by "Add workspace". Browsers cannot open
+    // the host machine's native Open Folder dialog, so the backend returns a
+    // bounded directory-only view and this modal mirrors the VS Code flow.
+    workspaceBrowser: {
+      show: false, loading: false, error: "", path: "", name: "", parent: "",
+      directories: [], selected: "", registered: false, selectable: false,
+      truncated: false, requestSeq: 0,
+    },
+    workspaceLastSession: {},
+    workspaceSurfaces: {},
     _sessionCreatePromises: {},
-    // Deduplicate cold history loads per session. Grid restore, hover-prefetch
-    // and a user click can all ask for the same transcript in the same frame;
+    // Deduplicate cold history loads per session. Resident-pane restore,
+    // hover-prefetch and a user click can all ask for the same transcript in
+    // the same frame;
     // only the first request should hit the backend and render markdown.
     _sessionLoadPromises: {},
     _sessionsInitialized: false,
@@ -514,7 +532,8 @@ function portal() {
     // uses this to display the actual inherited access level rather than the
     // implementation detail "Codex default".
     nativeDefaultPermission: "default",
-    // Mobile-only: collapses the per-session settings (permission / effort)
+    // Mobile-only: collapses per-session settings (permission / effort /
+    // Fast / reasoning summary)
     // behind a gear in the composer toolbar so the row stays single-line on
     // narrow phones. Desktop shows those selects inline and ignores this.
     composerSettingsOpen: false,
@@ -522,6 +541,10 @@ function portal() {
     // SDK pick adaptively (the existing default). Persisted on the session
     // via PATCH so each tab keeps its own setting across reloads.
     effort: "",
+    // Codex Fast mode is a service tier, not a reasoning-effort level. Keep it
+    // as an independent per-session mirror and expose it only when model/list
+    // advertises the native `fast` tier for the selected model.
+    fastModeEnabled: false,
     // Native reasoning-summary visibility for the current session. Codex maps
     // this boolean to thread/settings/update.summary = auto / none and the
     // backend persists it for empty threads too.
@@ -902,21 +925,23 @@ function portal() {
           return;
         }
         if (ev.key === "Tab") {
-          if (!this.openTabIds.length) return;
+          const tabs = this.workspaceOpenTabIds();
+          if (!tabs.length) return;
           ev.preventDefault();
-          const cur = Math.max(0, this.openTabIds.indexOf(this.currentId));
+          const cur = Math.max(0, tabs.indexOf(this.currentId));
           const next = ev.shiftKey
-            ? (cur - 1 + this.openTabIds.length) % this.openTabIds.length
-            : (cur + 1) % this.openTabIds.length;
-          this.activateTab(this.openTabIds[next]);
+            ? (cur - 1 + tabs.length) % tabs.length
+            : (cur + 1) % tabs.length;
+          this.activateTab(tabs[next]);
           return;
         }
         // Ctrl+1..9
         if (/^[1-9]$/.test(ev.key)) {
           const i = parseInt(ev.key, 10) - 1;
-          if (i < this.openTabIds.length) {
+          const tabs = this.workspaceOpenTabIds();
+          if (i < tabs.length) {
             ev.preventDefault();
-            this.activateTab(this.openTabIds[i]);
+            this.activateTab(tabs[i]);
           }
           return;
         }
@@ -1103,17 +1128,25 @@ function portal() {
         this.osFileDragging = false;
       });
 
-      // Click-to-zoom bridge for HTML previews. The sandboxed (opaque-origin)
-      // preview iframe can't be reached from here to intercept image clicks,
-      // so files.py injects a script that postMessages the clicked image's
-      // src up. Validate the message came from OUR preview iframe (not some
-      // other framed content posting to window) before opening the lightbox.
+      // HTML-preview bridge. Its opaque sandbox origin prevents direct DOM
+      // access, so files.py injects a script that forwards image clicks and
+      // document scroll coordinates. Multiple resident frames may be alive;
+      // resolve the exact source owner and never let a hidden report mutate
+      // the selected report's lightbox / scroll state.
       window.addEventListener("message", (e) => {
-        const f = this.$refs.htmlFrame;
-        if (!f || e.source !== f.contentWindow) return;
+        const ownerPath = this._htmlPreviewMessageOwner(e.source);
+        if (!ownerPath) return;
         const d = e.data;
-        if (!d || d.__muselab !== "preview-img" || typeof d.src !== "string") return;
-        this.openLightbox(d.src, typeof d.alt === "string" ? d.alt : "");
+        if (!d || typeof d.__muselab !== "string") return;
+        if (d.__muselab === "preview-img" && typeof d.src === "string") {
+          if (ownerPath === this.selected && this.previewMode === "html") {
+            this.openLightbox(d.src, typeof d.alt === "string" ? d.alt : "");
+          }
+        } else if (d.__muselab === "preview-scroll") {
+          this.onHtmlPreviewScrollMessage(d, ownerPath);
+        } else if (d.__muselab === "preview-ready") {
+          this.onPreviewFrameLoad("html", ownerPath);
+        }
       });
 
       // Listen for SW → page messages. The service worker posts
@@ -1163,10 +1196,8 @@ function portal() {
         if (mq.addEventListener) mq.addEventListener("change", handler);
         else if (mq.addListener) mq.addListener(handler);
       }
-      // Grid visibility also changes at 900px (and in short coarse-pointer
-      // landscape), which the 721px Settings media query above does not cover.
-      // Bump a reactive epoch so visibleChatPaneIds()/chatGridIsActive()
-      // re-evaluate on resize and orientation changes without a reload.
+      // Keep layout-dependent helpers reactive across resize/orientation
+      // changes without forcing a reload.
       let layoutFrame = 0;
       window.addEventListener("resize", () => {
         if (layoutFrame) cancelAnimationFrame(layoutFrame);
@@ -1530,7 +1561,7 @@ function portal() {
       // stats refresh below from issuing a duplicate model/list request.
       this._fetchModels({ retries: 2 });
       this.fetchNativeSettings();
-      this.fetchSessionWorkspaces();
+      const workspaceReady = this.fetchSessionWorkspaces();
 
       // Restore the two user-visible working surfaces first and independently.
       // A long transcript must not block the selected file, and vice versa.
@@ -1538,7 +1569,7 @@ function portal() {
       // `/?session=<id>` in a fresh tab. After sessions load, jump to that
       // session so the user lands in the conversation they were pinged about
       // (the already-open-tab case is handled via the SW postMessage above).
-      this.initSessions().then(() => {
+      workspaceReady.then(() => this.initSessions()).then(() => {
         try {
           const sid = new URLSearchParams(location.search).get("session");
           if (sid) this._openSessionFromDeeplink(sid);
@@ -1547,13 +1578,11 @@ function portal() {
       // The file tree can involve many directory reads and keyed DOM inserts.
       // Start it after current preview/session requests have entered flight and
       // after the browser has had a chance to paint their loading skeletons.
-      setTimeout(() => { this.loadRoot().catch(() => {}); }, 150);
+      setTimeout(() => {
+        workspaceReady.then(() => this.loadRoot()).catch(() => {});
+      }, 150);
       // Stats/providers are toolbar enrichment, never first-paint data.
       setTimeout(() => { this.fetchStats(); }, 300);
-      // Trash badge state — light fetch (just count), gated by token
-      // which is already verified at this point. Fire-and-forget;
-      // failures degrade silently to "no badge styling".
-      this.loadTrash();
       // First-run hint — surface key shortcuts so the user doesn't have to
       // hunt for them. Flagged in localStorage so it only fires once. Short
       // delay lets the splash clear first.
@@ -1567,30 +1596,28 @@ function portal() {
           this._setLS("muselab_seen_help", "1");
         }, 1500);
       }
-      // Same preview-file restore that login() does — covers the
-      // already-authed boot path (page refresh with saved token).
-      if (this._pendingPreviewSelected) {
-        const path = this._pendingPreviewSelected;
-        this._pendingPreviewSelected = null;
-        // Preserve the restored tab's preview/pinned state — restoring the
-        // selection must not silently pin a tab that was left in preview.
-        const _restored = this.tabs.find(t => t.path === path);
-        this.openFile({ path, name: path.split("/").pop() },
-                      { preview: !!(_restored && _restored.preview) })
-            .catch(() => { /* file gone — silent */ });
-      }
-      // Restore mobile tab choice AFTER openFile (which would otherwise
-      // force-switch us to "preview" on mobile every reopen). $nextTick
-      // ensures the openFile-induced mobileTab="preview" assignment
-      // settles before we override it back to the user's actual last tab.
-      // Desktop ignores mobileTab entirely so this is a no-op there.
-      if (this._pendingMobileTab) {
-        const wantTab = this._pendingMobileTab;
-        this._pendingMobileTab = null;
-        this.$nextTick(() => {
-          if (this._isMobileLayout()) this.mobileTab = wantTab;
-        });
-      }
+      // Browser-owned preview URLs and every file fetch must wait until the
+      // saved workspace has been validated. Otherwise a removed workspace can
+      // briefly load the primary tree with stale tabs (or emit avoidable 400s).
+      workspaceReady.then(async () => {
+        this.loadTrash();
+        if (this._pendingPreviewSelected) {
+          const path = this._pendingPreviewSelected;
+          this._pendingPreviewSelected = null;
+          const restored = this.tabs.find(t => t.path === path);
+          try {
+            await this.openFile({ path, name: path.split("/").pop() },
+                                { preview: !!(restored && restored.preview) });
+          } catch (_) { /* file gone — silent */ }
+        }
+        if (this._pendingMobileTab) {
+          const wantTab = this._pendingMobileTab;
+          this._pendingMobileTab = null;
+          this.$nextTick(() => {
+            if (this._isMobileLayout()) this.setMobileTab(wantTab);
+          });
+        }
+      });
       // Context is useful for labels/onboarding but not a paint dependency.
       this.fetchContextInfo().catch(() => { /* heartbeat retries */ });
       this._startLiveConnections();
@@ -1641,6 +1668,11 @@ function portal() {
             await this.initSessions({ skipRefresh: true });
           }
         } catch (_) { /* best-effort; next tick retries */ }
+        // A phone can keep an EventSource object marked open even after its
+        // receive side has stopped delivering bytes. The list poll alone sees
+        // only "active" and cannot repair that state; probe only streams that
+        // have been silent longer than the server heartbeat window.
+        await this._recoverStalledStream(this.currentId);
       }, 10_000);
     },
 
@@ -1805,6 +1837,7 @@ function portal() {
           this.connState = "ok";
         }
         this._connFails = 0;
+        this._recoverStalledStream(this.currentId);
         // Refresh scheduler unread count — cheap (single JSON, no auth
         // round-trip beyond what /api/meta already costs) and keeps the
         // bell badge live without forcing the user to open the drawer.
@@ -2934,7 +2967,7 @@ function portal() {
       // Repeated toolbar taps should focus the prepared request, not prepend
       // the instruction over and over.
       this.input = current.startsWith(lead) ? current : lead + current;
-      if (this._isMobileLayout()) this.mobileTab = "chat";
+      if (this._isMobileLayout()) this.setMobileTab("chat");
       this.$nextTick(() => {
         const ta = this.$refs.chatInput;
         if (ta) { this.autoGrow(ta); ta.focus(); }
@@ -3002,13 +3035,13 @@ function portal() {
       const uuid = m && m.uuid;
       const sid = ownerSid;
       if (!uuid || !sid) return;
-      if (this._isMobileLayout()) this.mobileTab = "chat";
+      if (this._isMobileLayout()) this.setMobileTab("chat");
       const activeState = this.tabState && this.tabState[sid];
       if (activeState) activeState.atBottom = false;
       if (sid === this.currentId) this.atBottom = false;
       const tryScroll = () => {
-        // Never search the whole document: grid panes can contain bubbles with
-        // the same server id while a quiet refresh is morphing their DOM.  The
+        // Never search the whole document: resident hidden sessions can contain
+        // the same server id while a quiet refresh is morphing their DOM. The
         // jump belongs to the session that owned the outline click.
         const body = this._chatScrollEl(sid);
         const el = body && body.querySelector(
@@ -3020,7 +3053,7 @@ function portal() {
         return true;
       };
       this.$nextTick(() => {
-        if (!this.visibleChatPaneIds().includes(sid)) return;
+        if (sid !== this.currentId) return;
         if (tryScroll()) return;
         // Target not in DOM — it lives in the lazy stash. Find it there
         // and pull everything from that index forward into visible
@@ -3041,14 +3074,12 @@ function portal() {
           if (st && st._loadedOffset > 0 && !st._fetchingOlder) {
             (async () => {
               const pulled = await this._fetchOlderWindow(sid);
-              if (this.tabState[sid] !== st
-                  || !this.visibleChatPaneIds().includes(sid)) return;
+              if (this.tabState[sid] !== st || sid !== this.currentId) return;
               if (pulled > 0) {
                 this.$nextTick(() => this._scrollToUserMsg(m, sid));
               } else if (!st._fullLoaded) {
                 await this.loadSession(sid, { full: true });
-                if (this.tabState[sid] === st
-                    && this.visibleChatPaneIds().includes(sid)) {
+                if (this.tabState[sid] === st && sid === this.currentId) {
                   this.$nextTick(() => this._scrollToUserMsg(m, sid));
                 }
               }
@@ -3058,8 +3089,7 @@ function portal() {
           if (st && !st._fullLoaded) {
             (async () => {
               await this.loadSession(sid, { full: true });
-              if (this.tabState[sid] === st
-                  && this.visibleChatPaneIds().includes(sid)) {
+              if (this.tabState[sid] === st && sid === this.currentId) {
                 this.$nextTick(() => this._scrollToUserMsg(m, sid));
               }
             })();
@@ -3080,8 +3110,7 @@ function portal() {
         st._hasMoreHistory =
           (st._earlierMessages || []).length > 0 || st._loadedOffset > 0;
         this.$nextTick(() => {
-          if (this.tabState[sid] !== st
-              || !this.visibleChatPaneIds().includes(sid)) return;
+          if (this.tabState[sid] !== st || sid !== this.currentId) return;
           if (oldScrollEl) {
             const newScrollHeight = oldScrollEl.scrollHeight;
             oldScrollEl.scrollTop = oldScrollTop + (newScrollHeight - oldScrollHeight);
@@ -3737,10 +3766,10 @@ function portal() {
     // ROOT-relative path whose full path ends with the clicked path (same
     // file, just a missing prefix). Caller decides: 0 → not-found toast,
     // 1 → open, >1 → disambiguation picker. Returns [{path,name}, ...].
-    async _findBySuffix(path, name) {
+    async _findBySuffix(path, name, requestHeaders = this.hdr()) {
       try {
         const r = await fetch("/api/files/search?q=" + encodeURIComponent(name) + "&limit=50",
-          { headers: this.hdr() });
+          { headers: requestHeaders });
         if (!r.ok) return [];
         const d = await r.json();
         const suffix = "/" + path.replace(/^\/+/, "");
@@ -3772,6 +3801,11 @@ function portal() {
     // entry came from the API). For chat-link clicks the path comes from
     // model output and may not exist — surface the failure as a toast.
     async openByPathToasted(path) {
+      const ownerWorkspace = this.currentWorkspacePath();
+      // Reuse the exact header snapshot for every fallback request. Otherwise
+      // a workspace switch between the parent lookup and suffix search could
+      // resolve the same relative filename against a different project.
+      const requestHeaders = this.hdr();
       // HEAD-equivalent check via list on the parent dir is fragile (binary
       // files, images etc. don't go through /api/files/read). Just delegate
       // to openFile and let it set previewMode='unsupported' / pdf / img,
@@ -3781,10 +3815,14 @@ function portal() {
       const name = path.split("/").pop();
       try {
         const r = await fetch("/api/files/list?path=" + encodeURIComponent(parent),
-          { headers: this.hdr() });
-        const hit = r.ok
-          ? ((await r.json()).entries || []).find(e => e.name === name)
-          : null;
+          { headers: requestHeaders });
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        let hit = null;
+        if (r.ok) {
+          const data = await r.json();
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+          hit = (data.entries || []).find(e => e.name === name) || null;
+        }
         // Direct ROOT-relative lookup missed. The model commonly emits a path
         // relative to a SUBDIR of the archive root (e.g. "learning/x.html"
         // when the file actually lives at "workspace/learning/x.html").
@@ -3792,7 +3830,8 @@ function portal() {
         // path ends with the clicked path — same file, just a missing prefix.
         // Generic (no hardcoded dir) and safe (suffix + exact-name + sole-match).
         if (!hit) {
-          const matches = await this._findBySuffix(path, name);
+          const matches = await this._findBySuffix(path, name, requestHeaders);
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           let resolved = "";
           if (matches.length === 1) {
             resolved = matches[0].path;
@@ -3805,10 +3844,12 @@ function portal() {
                 : `"${path}" matches ${matches.length} files. Pick one to open:`,
               choices: matches.map(m => ({ label: m.path, value: m.path })),
             });
+            if (!this._workspaceIsCurrent(ownerWorkspace)) return;
             if (!resolved) return;   // cancelled
           }
           if (resolved) {
             await this.openFile({ path: resolved, name });
+            if (!this._workspaceIsCurrent(ownerWorkspace)) return;
             this.revealInTree(resolved, { mode: "background" }).catch(() => {});
             return;
           }
@@ -3820,6 +3861,7 @@ function portal() {
           return;
         }
         await this.openFile({ path, name });
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         // Mirror the click into the file tree: expand parents + scroll the
         // row into view so the user sees where the file lives. Use background
         // mode — a chat-link click wants the file's CONTENT (the preview
@@ -3827,7 +3869,9 @@ function portal() {
         // "files". Best-effort: never let a tree-sync hiccup swallow the open.
         this.revealInTree(path, { mode: "background" }).catch(() => {});
       } catch (e) {
-        this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast(this.lang === "zh" ? `打开失败：${path}` : `Open failed: ${path}`, "warn");
+        }
       }
     },
 
@@ -3840,6 +3884,7 @@ function portal() {
         this._setLS("muselab_token", this.token);
         this.authed = true;
         this.loadPrefs();
+        await this.fetchSessionWorkspaces();
         await this.loadRoot();
         await this.initSessions();
         this.fetchStats();
@@ -3869,7 +3914,16 @@ function portal() {
       location.reload();
     },
 
-    hdr() { return { "X-Auth-Token": this.token }; },
+    hdr() {
+      const headers = { "X-Auth-Token": this.token };
+      // Header values must stay ByteString-safe in browsers. Percent-encoding
+      // preserves workspaces containing Chinese or emoji; backend/files.py
+      // decodes and validates it against the registered workspace list.
+      if (this.activeWorkspace) {
+        headers["X-Muselab-Workspace"] = encodeURIComponent(this.activeWorkspace);
+      }
+      return headers;
+    },
 
     // ===== unified fetch wrapper =====
     // Consolidates the ~60 hand-written fetch calls. Auto-attaches token
@@ -4096,7 +4150,7 @@ function portal() {
     // browser state (scroll position, open file tabs, typed draft, etc.).
     async refreshChat() {
       this.toast(this.lang === "zh" ? "刷新中…" : "Refreshing…", "info", 1500);
-      const targets = [...new Set(this.visibleChatPaneIds())];
+      const target = this.currentId;
       // Manual refresh re-pulls server-side data (context, session list,
       // stats) and reloads the current session. The tab strip is
       // device-local, so there's no cross-device tab state to merge.
@@ -4105,16 +4159,15 @@ function portal() {
         this.refreshSessions(),
         this.fetchStats(),
       ]);
-      // Refresh every pane the user could see when they tapped the button.
-      // Warm panes use the scroll-preserving morph path; the previous default
+      // Refresh the session the user could see when they tapped the button.
+      // A warm transcript uses the scroll-preserving morph path; the previous default
       // load reset atBottom and yanked a reader to the newest message even
       // though this control promises a soft refresh.
-      await Promise.all(targets.map(async sid => {
-        if (!this.visibleChatPaneIds().includes(sid)) return;
-        const st = this.tabState && this.tabState[sid];
-        if (st && st._loaded) await this.loadSession(sid, { quiet: true });
-        else await this._ensureSessionLoaded(sid);
-      }));
+      if (target && target === this.currentId) {
+        const st = this.tabState && this.tabState[target];
+        if (st && st._loaded) await this.loadSession(target, { quiet: true });
+        else await this._ensureSessionLoaded(target);
+      }
     },
 
     // ===== prefs =====
@@ -4122,19 +4175,17 @@ function portal() {
       // Preview-pane state (tabs, selected) persists too so a refresh restores
       // the exact files the user was looking at — matches the chat-tab strip's
       // behavior via openTabIds.
+      this._captureWorkspaceSurface();
       this._setLS("muselab_prefs", JSON.stringify({
-        schema: 2,          // bump when prefs format changes incompatibly
+        schema: 3,
         model: this.model, defaultModel: this.defaultModel,
         permission: this.permission, defaultPermission: this.defaultPermission,
         currentId: this.currentId,
         openTabIds: this.openTabIds,
-        splitPaneIds: this.splitPaneIds,
-        chatGridLayout: this.chatGridLayout,
-        // Mobile renders one pane via chatGridIsActive(), but must not destroy
-        // the desktop workspace mode merely by saving preferences on a phone.
-        chatViewMode: this.chatViewMode,
-        chatGridFocusId: this.chatGridFocusId,
-        previewTabs: this.tabs.map(t => ({ path: t.path, name: t.name, preview: !!t.preview })),
+        activeWorkspace: this.activeWorkspace,
+        workspaceLastSession: this.workspaceLastSession,
+        workspaceSurfaces: this.workspaceSurfaces,
+        previewTabs: this.tabs.map(t => this._previewTabSnapshot(t)),
         previewSelected: this.selected,
         expanded: Array.from(this.expanded),
         leftOpen: this.leftOpen, rightOpen: this.rightOpen,
@@ -4195,33 +4246,21 @@ function portal() {
           this.openTabIds = [...new Set(p.openTabIds.filter(
             id => typeof id === "string" && id))];
         }
-        if (Array.isArray(p.splitPaneIds)) {
-          this.splitPaneIds = [...new Set(p.splitPaneIds.filter(
-            id => typeof id === "string" && id))].slice(0, 4);
+        if (typeof p.activeWorkspace === "string") this.activeWorkspace = p.activeWorkspace;
+        if (p.workspaceLastSession && typeof p.workspaceLastSession === "object") {
+          this.workspaceLastSession = { ...p.workspaceLastSession };
         }
-        if (["auto", "columns", "rows", "primary", "secondary", "quad"].includes(p.chatGridLayout)) {
-          this.chatGridLayout = p.chatGridLayout;
-        }
-        if (["single", "grid"].includes(p.chatViewMode)) {
-          this.chatViewMode = p.chatViewMode;
-        }
-        if (typeof p.chatGridFocusId === "string") {
-          this.chatGridFocusId = p.chatGridFocusId;
+        if (p.workspaceSurfaces && typeof p.workspaceSurfaces === "object") {
+          this.workspaceSurfaces = { ...p.workspaceSurfaces };
         }
         // Preview tabs — restore the strip; the actual content fetch happens
         // lazily when the user clicks back to one (or via restorePreviewSelected
         // which runs once after login).
         if (Array.isArray(p.previewTabs)) {
-          // Three keyed x-for views consume this same array. Duplicate/empty
-          // paths from old prefs corrupt Alpine's per-template lookup and the
-          // next preview click then dies at `elForSpot.after(...)`.
-          const seen = new Set();
-          this.tabs = p.previewTabs.filter(t => {
-            const path = t && typeof t.path === "string" ? t.path : "";
-            if (!path || seen.has(path)) return false;
-            seen.add(path);
-            return true;
-          });
+          // Three keyed x-for views consume this same array. Normalize through
+          // the workspace helper so duplicate/empty paths and malformed saved
+          // view positions are repaired before the templates mount.
+          this.tabs = this._workspacePreviewTabs({ previewTabs: p.previewTabs });
         }
         if (typeof p.previewSelected === "string") this._pendingPreviewSelected = p.previewSelected;
         // Stash the mobile tab choice in a "pending" slot — actually applying
@@ -4496,6 +4535,7 @@ function portal() {
       return !!(st && (
         st._modelChanging
         || st._effortPatchTail
+        || st._serviceTierPatchTail
         || st._permissionPatchTail
         || st._thinkingPatchTail
       ));
@@ -4531,14 +4571,19 @@ function portal() {
       targetState._modelChanging = true;
       targetState._modelTarget = newM;
       const oldEffort = this.effort || "";
+      const oldServiceTier = this.fastModeEnabled
+        ? ((cur && cur.service_tier) || this._fastServiceTier(oldM)) : "";
       // Compute the target model's compatible effort, but do NOT persist it
       // yet.  The previous implementation PATCHed the source session to auto
       // before the model-switch confirmation; cancelling the dialog therefore
       // still destroyed the user's effort choice.
       const nextEffort = this._effortAllowed(oldEffort, newM)
         ? oldEffort : "";
+      const nextServiceTier = this.fastModeEnabled
+        ? this._fastServiceTier(newM) : "";
       let modelExpected = null;
       let modelEffortExpected = null;
+      let modelServiceTierExpected = null;
 
       // Decide empty vs has-messages from BOTH the persisted message_count
       // AND the in-memory messages array — take the max. Two failure modes
@@ -4577,6 +4622,14 @@ function portal() {
           };
           targetState._effortExpected = modelEffortExpected;
         }
+        if (nextServiceTier !== oldServiceTier) {
+          modelServiceTierExpected = {
+            seq: targetState._serviceTierPatchSeq,
+            value: nextServiceTier,
+            fallback: oldServiceTier,
+          };
+          targetState._serviceTierExpected = modelServiceTierExpected;
+        }
         try {
           const r = await fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
             method: "PATCH",
@@ -4588,6 +4641,7 @@ function portal() {
               model: newM,
               model_provider: this._modelProvider(newM),
               effort: nextEffort,
+              service_tier: nextServiceTier,
             }),
           });
           if (!r.ok) {
@@ -4596,6 +4650,9 @@ function portal() {
             }
             if (targetState._effortExpected === modelEffortExpected) {
               targetState._effortExpected = null;
+            }
+            if (targetState._serviceTierExpected === modelServiceTierExpected) {
+              targetState._serviceTierExpected = null;
             }
             if (this.currentId === sid) this.model = oldM;
             this.toast(this.t("slash.failed"), "error");
@@ -4607,10 +4664,12 @@ function portal() {
             updated.model = newM;
             updated.model_provider = this._modelProvider(newM);
             updated.effort = nextEffort;
+            updated.service_tier = nextServiceTier;
           }
           if (this.currentId === sid) {
             this.model = newM;
             this.effort = nextEffort;
+            this.fastModeEnabled = this._isFastServiceTier(nextServiceTier, newM);
           }
           this.savePrefs();
           const label = this.modelLabel(newM);
@@ -4624,6 +4683,9 @@ function portal() {
           }
           if (targetState._effortExpected === modelEffortExpected) {
             targetState._effortExpected = null;
+          }
+          if (targetState._serviceTierExpected === modelServiceTierExpected) {
+            targetState._serviceTierExpected = null;
           }
           if (this.currentId === sid) this.model = oldM;
           this.toast(this.t("slash.failed"), "error");
@@ -4651,6 +4713,7 @@ function portal() {
             model: newM,
             model_provider: this._modelProvider(newM),
             effort: nextEffort,
+            service_tier: nextServiceTier,
           }),
         });
         if (!r.ok) {
@@ -4667,18 +4730,17 @@ function portal() {
         if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
         // A slow fork must not yank the user back after they deliberately
         // switched tabs while it was being created.  Keep the result open and
-        // mark it ready; activate/replace the grid cell only when the source is
-        // still focused.
+        // mark it ready; activate it only when the source is still focused.
         const stillOnSource = this.currentId === sourceId;
-        if (stillOnSource && this.chatGridIsActive()
-            && this.splitPaneIds.includes(sourceId)) {
-          this.splitPaneIds = this.splitPaneIds.map(id => id === sourceId ? meta.id : id);
-          this.chatGridFocusId = meta.id;
-        }
         if (stillOnSource) {
           this.currentId = meta.id;
           this.model = newM;
           this.effort = nextEffort;
+          this.fastModeEnabled = this._isFastServiceTier(nextServiceTier, newM);
+          this.workspaceLastSession = {
+            ...this.workspaceLastSession,
+            [meta.cwd || this.currentWorkspacePath()]: meta.id,
+          };
           await this.switchSession();
         } else {
           newSt.unread = true;
@@ -4738,6 +4800,41 @@ function portal() {
     _supportsEffort(model) {
       const meta = this._modelMeta(model);
       return !!(meta && meta.supports_effort === true);
+    },
+    _fastServiceTier(model) {
+      const meta = this._modelMeta(model);
+      if (!meta) return "";
+      if (typeof meta.fast_service_tier === "string"
+          && meta.fast_service_tier) {
+        return meta.fast_service_tier;
+      }
+      const tiers = Array.isArray(meta.service_tiers) ? meta.service_tiers : [];
+      const tier = tiers.find(item => item && typeof item.id === "string" && (
+        item.id === "fast"
+        || String(item.name || "").trim().toLowerCase() === "fast"
+      ));
+      if (tier) return tier.id;
+      // Compatibility with older muselab backends that exposed only the
+      // boolean and implicitly used the legacy native id `fast`.
+      return meta.supports_fast === true ? "fast" : "";
+    },
+    _supportsFast(model) {
+      return !!this._fastServiceTier(model);
+    },
+    _canonicalServiceTier(serviceTier, model) {
+      if (!serviceTier) return "";
+      const fastTier = this._fastServiceTier(model);
+      if (!fastTier) return "";
+      // `fast` is retained as a compatibility alias for sessions written by
+      // the first implementation; new writes always use the catalog id.
+      return serviceTier === fastTier || serviceTier === "fast" ? fastTier : "";
+    },
+    _isFastServiceTier(serviceTier, model) {
+      return !!this._canonicalServiceTier(serviceTier, model);
+    },
+    _serviceTierAllowed(serviceTier, model) {
+      if (!serviceTier) return true;
+      return !!this._canonicalServiceTier(serviceTier, model);
     },
     _supportsThinking(model) {
       // Thinking toggle shows for any provider whose endpoint honors the
@@ -4842,6 +4939,66 @@ function portal() {
         if (actual) actual.effort = fallback;
         if (this.currentId === sid) this.effort = fallback;
         this.toast(this.lang === "zh" ? "切换失败" : "Switch failed", "error");
+        return false;
+      }
+    },
+    async onFastModeChange() {
+      if (!this.currentId) return false;
+      const sid = this.currentId;
+      const st = this._ensureTabState(sid);
+      const seq = ++st._serviceTierPatchSeq;
+      let next = this.fastModeEnabled ? this._fastServiceTier(this.model) : "";
+      if (this.fastModeEnabled && !next) {
+        this.fastModeEnabled = false;
+        return false;
+      }
+      const session = this.sessions.find(s => s.id === sid);
+      const previous = (session && session.service_tier) || "";
+      const priorExpected = st._serviceTierExpected;
+      const expected = {
+        seq,
+        value: next,
+        fallback: priorExpected ? priorExpected.fallback : previous,
+      };
+      st._serviceTierExpected = expected;
+      try {
+        const r = await this._serializeTabSettingPatch(
+          st, "_serviceTierPatchTail", async () => {
+            if (this.tabState[sid] !== st || st._serviceTierPatchSeq !== seq) return null;
+            return fetch("/api/chat/sessions/" + encodeURIComponent(sid), {
+              method: "PATCH",
+              headers: { ...this.hdr(), "Content-Type": "application/json" },
+              body: JSON.stringify({ service_tier: next }),
+            });
+          },
+        );
+        if (!r) return false;
+        if (!r.ok) throw new Error(await r.text());
+        if (this.tabState[sid] !== st) return false;
+        const cur = this.sessions.find(s => s.id === sid);
+        if (cur) cur.service_tier = next;
+        if (st._serviceTierExpected) {
+          st._serviceTierExpected.fallback = next;
+          if (st._serviceTierExpected.seq === seq && st._serviceTierExpected.echoed) {
+            st._serviceTierExpected = null;
+          }
+        }
+        if (st._serviceTierPatchSeq !== seq) return false;
+        if (this.currentId === sid) this.fastModeEnabled = !!next;
+        this.toast(this.t(next ? "fast.on" : "fast.off"), "info", 1800);
+        return true;
+      } catch (_err) {
+        if (this.tabState[sid] !== st || st._serviceTierPatchSeq !== seq) return false;
+        const fallback = expected.fallback;
+        if (st._serviceTierExpected === expected) {
+          st._serviceTierExpected = null;
+        }
+        const actual = this.sessions.find(s => s.id === sid);
+        if (actual) actual.service_tier = fallback;
+        if (this.currentId === sid) {
+          this.fastModeEnabled = this._isFastServiceTier(fallback, this.model);
+        }
+        this.toast(this.t("fast.failed"), "error");
         return false;
       }
     },
@@ -4997,6 +5154,13 @@ function portal() {
         streamElapsed: 0,
         _streamTimer: null,
         _streamStartedAt: 0,
+        _lastSseActivity: 0,
+        _stallWatch: null,
+        // Set only after /active or a real (non-ping) turn event proves the
+        // server owns this turn. Lets liveness recovery distinguish a finished
+        // turn from the short ticket→EventSource hand-off before turn/start.
+        _serverActiveObserved: false,
+        _streamHealthProbe: null,
         _reconnectTimer: null,
         _renderStreamingHtml: null,
         _pendingHtmlRender: null,
@@ -5004,6 +5168,7 @@ function portal() {
         // fields are only mirrors of the focused tab, so late responses must
         // be routed back to their owner and stale queue reads must be dropped.
         _effortPatchSeq: 0,
+        _serviceTierPatchSeq: 0,
         _thinkingPatchSeq: 0,
         _permissionPatchSeq: 0,
         _modelChanging: false,
@@ -5014,17 +5179,19 @@ function portal() {
         // poll can make effort jump back to auto (and likewise rewind the
         // permission / reasoning controls).
         _effortExpected: null,
+        _serviceTierExpected: null,
         _thinkingExpected: null,
         _permissionExpected: null,
         _modelExpected: null,
         _effortPatchTail: null,
+        _serviceTierPatchTail: null,
         _thinkingPatchTail: null,
         _permissionPatchTail: null,
         _ctxMeterSeq: 0,
         _queueSyncSeq: 0,
         _loaded: false,   // set true after first loadSession populates messages
-        // Every visible grid pane owns its own follow/scroll intent. Root
-        // `atBottom` is only a mirror of the currently selected pane.
+        // Every session owns its own follow/scroll intent. Root `atBottom` is
+        // only a mirror of the currently selected session.
         atBottom: true,
         // Last user-visible scroll offset. Single-view tabs share the outer
         // `.chat-body` scroller, so the browser cannot preserve this for us
@@ -5034,7 +5201,7 @@ function portal() {
         _autoScrolling: false,
         _settleToken: 0,
         // updated_at represented by the transcript currently rendered in this
-        // pane. Kept per session so all visible grid panes can reconcile.
+        // transcript. Kept per session so background updates can reconcile.
         _seenUpdated: undefined,
         // Highest list revision observed while a stream/load owns this pane.
         // Unlike _seenUpdated, this does NOT claim the transcript was rendered;
@@ -5134,8 +5301,8 @@ function portal() {
       if (!sid) return false;
       const st = this.tabState[sid];
       if (st && (st.streaming || st.compacting)) return true;
-      // A turn can be running without a local EventSource: restored grids,
-      // another browser, and background panes learn that state from the
+      // A turn can be running without a local EventSource: another browser or
+      // a background tab can expose that state through the
       // server-authoritative session.active flag. Treat it as busy too so a
       // composer send is queued instead of incorrectly attempting a second
       // concurrent turn on the same thread.
@@ -5155,6 +5322,40 @@ function portal() {
       if (window.innerWidth <= 900) return true;
       return !!(window.matchMedia
                  && window.matchMedia("(pointer: coarse) and (max-height: 500px)").matches);
+    },
+    setMobileTab(next) {
+      if (!["files", "preview", "chat"].includes(next) || next === this.mobileTab) return;
+      const previous = this.mobileTab;
+      const ownerPath = this.selected;
+      const ownerLoadSeq = this._previewLoadSeq;
+      // Mobile CSS hides inactive panes with display:none. Chromium and WebKit
+      // both expose the hidden shared preview scroller as scrollTop=0, so the
+      // normal savePrefs/openFile capture would overwrite the real position.
+      // Snapshot while the preview is still laid out, before changing the tab.
+      if (previous === "preview" && next !== "preview") {
+        this._capturePreviewViewState(ownerPath);
+        this._cancelPreviewViewRestore();
+      }
+      // Ask an already-loaded sandboxed report to jump while its iframe is
+      // still hidden. The post-show retry remains as a browser fallback, but
+      // successful hidden restoration means the first visible frame is already
+      // at the saved position instead of briefly painting the document top.
+      if (next === "preview" && previous !== "preview" && ownerPath
+          && this.previewMode === "html") {
+        this._restorePreviewViewState(ownerPath, ownerLoadSeq);
+      }
+      this.mobileTab = next;
+      // The same display:none transition clamps the live DOM to zero. Showing
+      // Preview again is not a file navigation, so openFile will not run; restore
+      // the selected tab explicitly after CSS has made the pane measurable.
+      if (next === "preview" && previous !== "preview" && ownerPath) {
+        this.$nextTick(() => requestAnimationFrame(() => {
+          if (this.mobileTab === "preview" && this.selected === ownerPath
+              && this._previewLoadSeq === ownerLoadSeq) {
+            this._schedulePreviewViewRestore(ownerPath, ownerLoadSeq);
+          }
+        }));
+      }
     },
     // The queue is authoritative server-side now (sessions/{sid}.queue.json,
     // drained autonomously by the backend — Option B). The browser keeps a
@@ -5208,6 +5409,7 @@ function portal() {
           model: it.model || "",
           modelProvider: it.model_provider || "",
           effort: it.effort || "",
+          serviceTier: typeof it.service_tier === "string" ? it.service_tier : null,
           hasAttach: !!((it.image_ids || "").trim()),
           images,
           docs,
@@ -5249,6 +5451,7 @@ function portal() {
                                  model_provider: item.modelProvider
                                    || this._modelProvider(itemModel),
                                  effort: item.effort || "",
+                                 service_tier: item.serviceTier,
                                  drain_if_idle: true,
                                  source_device_kind: this._pushDeviceKind() }),
         });
@@ -5290,7 +5493,7 @@ function portal() {
     // don't change.
     _drainPendingQueue(sid, finishedTurnId = "") {
       if (!sid) return;
-      if (!this.visibleChatPaneIds().includes(sid)) {
+      if (sid !== this.currentId) {
         // Hidden tab — just refresh its mirror; activation will re-attach.
         this._syncQueueFromServer(sid);
         return;
@@ -5304,7 +5507,7 @@ function portal() {
     // out of tries, or the queue turns out empty/paused.
     async _attachToServerTurn(sid, tries, finishedTurnId = "") {
       const st0 = this.tabState[sid];
-      if (!this.visibleChatPaneIds().includes(sid) || (st0 && st0.streaming)) {
+      if (sid !== this.currentId || (st0 && st0.streaming)) {
         if (st0) st0._draining = false;
         this._syncQueueFromServer(sid);
         return;
@@ -5338,8 +5541,7 @@ function portal() {
       // elapsed time disappear. Wait only while queued work is still pending;
       // a genuinely drained next turn has a different id and attaches below.
       if (active && finishedTurnId && activeTurnId === finishedTurnId) {
-        if (expect && tries > 1 && st && !st.streaming
-            && this.visibleChatPaneIds().includes(sid)) {
+        if (expect && tries > 1 && st && !st.streaming && sid === this.currentId) {
           setTimeout(
             () => this._attachToServerTurn(sid, tries - 1, finishedTurnId),
             350,
@@ -5349,8 +5551,8 @@ function portal() {
         }
         return;
       }
-      if (active && st && !st.streaming
-          && this.visibleChatPaneIds().includes(sid)) {
+      if (active && st && !st.streaming && sid === this.currentId) {
+        st._serverActiveObserved = true;
         if (st) st._draining = false;
         // FIX (queue live-render): when the SERVER drained a queued item and
         // started its turn headlessly, the browser never pushed a user bubble
@@ -5395,8 +5597,7 @@ function portal() {
         this.$nextTick(() => this._syncQueueFromServer(sid));
         return;
       }
-      if (expect && tries > 1 && st && !st.streaming
-          && this.visibleChatPaneIds().includes(sid)) {
+      if (expect && tries > 1 && st && !st.streaming && sid === this.currentId) {
         setTimeout(
           () => this._attachToServerTurn(sid, tries - 1, finishedTurnId),
           350,
@@ -5475,6 +5676,7 @@ function portal() {
           model: item.model,
           modelProvider: item.modelProvider,
           effort: item.effort,
+          serviceTier: item.serviceTier,
         });
         if (restored) {
           this.toast(this.lang === "zh"
@@ -5601,8 +5803,8 @@ function portal() {
       this._fetchTabUsage(id);
     },
 
-    // P1 (chat-perf-redesign): per-tab DOM persistence. The chat message
-    // list is rendered once PER OPEN TAB (outer x-for over openTabIds), each
+    // P1 (chat-perf-redesign): bounded per-tab DOM persistence. The chat
+    // message list is rendered once per LRU-resident tab, each
     // pane bound to ITS OWN message array via this method. Switching tabs
     // then only toggles x-show on the panes instead of swapping the array
     // backing a single x-for — which used to force Alpine to teardown +
@@ -5640,23 +5842,25 @@ function portal() {
       }
       return list;
     },
-    // Keyed message panes that stay mounted. Visible grid panes are always
-    // present; the remaining slots are the most-recent single-view tabs. This
-    // makes the common A ↔ B switch an x-show flip instead of rebuilding every
-    // Alpine directive in the transcript, while the LRU keeps retained DOM
-    // bounded. `visibleChatPaneIds()` is overlaid defensively because a grid
-    // state change can paint one tick before its async promotion completes.
+    // Keyed message panes that stay mounted. The current session is always
+    // present; the remaining slots are the most-recent tabs. This makes the
+    // common A ↔ B switch an x-show flip instead of rebuilding every Alpine
+    // directive in the transcript, while the LRU keeps retained DOM bounded.
     mountedChatPaneIds() {
+      // Keep residency independent from the active workspace. Workspace
+      // filtering belongs to the pane's visibility condition: coupling it to
+      // this keyed list unmounted/remounted warm panes during a directory
+      // change and could lose their saved reading position.
       const valid = new Set(this.openTabIds || []);
       const ids = [
-        ...this.visibleChatPaneIds(),
+        this.currentId,
         ...this.residentPaneIds(),
       ].filter(id => id && valid.has(id));
       return [...new Set(ids)];
     },
     // [resident-panes] LRU bookkeeping. Promote `tid` to most-recently-used, then
-    // evict panes past _MAX_RESIDENT_PANES from the LRU end — but NEVER evict the
-    // current visible set. Background streams keep writing to tabState even
+    // evict panes past _MAX_RESIDENT_PANES from the LRU end — but never evict the
+    // current session. Background streams keep writing to tabState even
     // when their DOM is evicted, so protecting every streaming tab would let a
     // busy workspace grow retained DOM without bound. An evicted tab's
     // _highlighted flag is reset so its future rebuilt DOM is highlighted.
@@ -5664,7 +5868,7 @@ function portal() {
       if (!tid) return;
       const list = (this._residentTabIds || []).filter(x => x !== tid);
       list.unshift(tid);   // MRU at the front
-      const visible = new Set(this.visibleChatPaneIds());
+      const visible = new Set(this.currentId ? [this.currentId] : []);
       while (list.length > this._MAX_RESIDENT_PANES) {
         let evicted = false;
         // Scan from the LRU end for the first evictable (unprotected) pane.
@@ -5706,29 +5910,25 @@ function portal() {
         this.connState = "reconnecting";
         return false;
       }
-      if (!this.sessions.length) {
-        const s = await this.newSession();
+      const cwd = this.currentWorkspacePath();
+      const current = this.sessions.find(x => x.id === this.currentId);
+      if (!current || !this.workspaceSessions(cwd).some(s => s.id === current.id)) {
+        const remembered = this.workspaceLastSession[cwd];
+        const landing = this.sessions.find(s => s.id === remembered &&
+          this.workspaceSessions(cwd).some(x => x.id === s.id))
+          || this.workspaceSessions(cwd)[0];
+        this.currentId = landing ? landing.id : "";
+      }
+      if (!this.currentId) {
+        const s = await this.newSession({ cwd });
         if (s) this.currentId = s.id;
-      } else if (!this.sessions.find(x => x.id === this.currentId)) {
-        // localStorage had no saved session (new device / cleared storage).
-        // Tab state is device-local now, so just land on the most recent
-        // session rather than restoring a cross-device last-active pointer.
-        this.currentId = this.sessions[0].id;
       }
       // Reconcile openTabIds (restored from prefs) with what still exists on
       // the server: drop tabs whose session was deleted, then ensure currentId
-      // is in the list. Ordinary background tabs stay lazy, but restored grid
-      // panes are already visible and therefore get loaded below.
+      // is in the list. Ordinary background tabs stay lazy; only the selected
+      // session is loaded below.
       const validIds = new Set(this.sessions.map(s => s.id));
       this.openTabIds = (this.openTabIds || []).filter(id => validIds.has(id));
-      this.splitPaneIds = (this.splitPaneIds || []).filter(id => validIds.has(id));
-      if (this.splitPaneIds.length < 2) {
-        this.chatViewMode = "single";
-      } else if (this.chatViewMode === "grid" && !this._isMobileLayout()) {
-        this.currentId = this.splitPaneIds.includes(this.chatGridFocusId)
-          ? this.chatGridFocusId : this.splitPaneIds[0];
-        this.chatGridFocusId = this.currentId;
-      }
       if (!this.openTabIds.includes(this.currentId)) {
         this.openTabIds.push(this.currentId);
       }
@@ -5738,25 +5938,10 @@ function portal() {
       this._residentTabIds = [this.currentId];
       this._activateTabState(this.currentId);
       await this._ensureSessionLoaded(this.currentId);
-      // A restored split pane used to mount with an empty tabState and the
-      // inactive veil on top, producing what looked like a solid black mask
-      // until idle preloading eventually ran (or the pane was clicked). Grid
-      // panes are visible UI, so hydrate them eagerly during session restore.
-      // loadSession is explicitly background-safe: off-current loads write
-      // only to tabState[id], never the shared composer/messages state.
-      const restoredPaneIds = this.chatGridIsActive()
-        ? [...new Set(this.splitPaneIds || [])]
-          .filter(id => id !== this.currentId && validIds.has(id))
-        : [];
-      await Promise.all(restoredPaneIds.map(async id => {
-        this._promoteResident(id);
-        try {
-          await this._ensureSessionLoaded(id);
-          await this._checkActiveTurn(id);
-        } catch (_) {
-          // Keep it retryable: clicking the pane will run the normal load path.
-        }
-      }));
+      this.workspaceLastSession = {
+        ...this.workspaceLastSession,
+        [cwd]: this.currentId,
+      };
       this._sessionsInitialized = true;
       this.savePrefs();
       return true;
@@ -5844,6 +6029,7 @@ function portal() {
     async refreshSessions() {
       const ok = await this._pullSessionList(false);
       if (!ok) return false;
+      await this._recoverStalledStream(this.currentId);
       // The legacy currentId <select> no longer exists.  Flipping currentId
       // to an empty string and back here corrupts Alpine's keyed tab DOM on
       // refresh (`reading 'after'`) and serves no current UI binding.
@@ -5869,6 +6055,8 @@ function portal() {
         ["_modelExpected", "_modelChanging", "model",
           value => value || ""],
         ["_effortExpected", "_effortPatchTail", "effort",
+          value => value || ""],
+        ["_serviceTierExpected", "_serviceTierPatchTail", "service_tier",
           value => value || ""],
         ["_permissionExpected", "_permissionPatchTail", "permission",
           value => value || "default"],
@@ -5961,6 +6149,10 @@ function portal() {
         if (!fst._effortPatchTail && !fst._effortExpected) {
           this.effort = focused.effort || "";
         }
+        if (!fst._serviceTierPatchTail && !fst._serviceTierExpected) {
+          this.fastModeEnabled = this._isFastServiceTier(
+            focused.service_tier, focused.model || this.model);
+        }
         if (!fst._permissionPatchTail && !fst._permissionExpected) {
           this.permission = focused.permission || "default";
         }
@@ -5980,8 +6172,99 @@ function portal() {
     // Driven off the session list we already poll every 10s + on visibility /
     // reconnect — no new backend endpoint, no extra request on the common
     // "nothing changed" tick. Each visible pane keeps its own `_seenUpdated`
-    // cursor, so a masked grid pane receives the same cross-device completion
-    // and active-turn recovery as the composer pane.
+    // cursor, so the selected session receives cross-device completion and
+    // active-turn recovery without a manual refresh.
+    async _recoverStalledStream(sid = this.currentId) {
+      const st = sid && this.tabState && this.tabState[sid];
+      if (!st || (!st.streaming && !st.es) || st._reconnectTimer) return false;
+      if (st._streamHealthProbe) return st._streamHealthProbe;
+
+      // Healthy streams receive a named ping every 15s. Stay entirely
+      // network-free inside that window; a normal long-running tool call can
+      // legitimately emit no model deltas between pings.
+      const ownerEs = st.es;
+      const observedActivity = Number(st._lastSseActivity)
+        || Number(st._streamStartedAt) || Date.now();
+      const transportClosed = !!(ownerEs && Number(ownerEs.readyState) === 2);
+      if (!transportClosed && Date.now() - observedActivity < 18_000) return false;
+
+      const task = (async () => {
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          Math.max(100, Number(this._sessionListTimeoutMs) || 8000),
+        );
+        try {
+          const r = await fetch(`/api/chat/sessions/${sid}/active`, {
+            headers: this.hdr(), signal: controller.signal,
+          });
+          if (!r.ok) return false;
+          const d = await r.json();
+          // A tab close/reopen or a newer reconnect owns a different state /
+          // EventSource generation. Never let this old probe tear it down.
+          if (this.tabState[sid] !== st || st.es !== ownerEs) return false;
+
+          if (d.active) {
+            st._serverActiveObserved = true;
+            const silenceMs = Date.now() - (Number(st._lastSseActivity)
+              || Number(st._streamStartedAt) || Date.now());
+            const serverHasReplay = Math.max(0, Number(d.events_so_far) || 0) > 0;
+            const closedNow = !!(st.es && Number(st.es.readyState) === 2);
+            // If the server already holds replayable events, a healthy SSE
+            // would have delivered at least one (or a ping) inside 18s. Close
+            // the zombie and attach again; TurnStream replays from event zero.
+            if (!st.es || (!closedNow && (!serverHasReplay || silenceMs < 18_000))) {
+              return false;
+            }
+            try { st.es.close(); } catch (_) {}
+            if (st._stallWatch) clearInterval(st._stallWatch);
+            st._stallWatch = null;
+            st.es = null;
+            st.streaming = false;
+            st._reconnectAttempts = 0;
+            if (sid === this.currentId) {
+              this.es = null;
+              this.streaming = false;
+            }
+            await this.send({
+              reconnect: true,
+              sessionId: sid,
+              startedAt: d.started_at,
+              elapsedSeconds: d.elapsed_seconds,
+            });
+            return true;
+          }
+
+          // Never retire during the ticket→GET hand-off: /active is still
+          // false then. Once server activity (or a later persisted revision)
+          // was observed, however, inactive is authoritative completion. Pull
+          // the canonical transcript immediately instead of leaving the UI in
+          // "generating" until the user reloads the page.
+          if (!st._serverActiveObserved && !st._pendingExternalUpdate) return false;
+          this._retireStaleSessionStream(sid, st);
+          st._pendingExternalUpdate = true;
+          const loaded = await this.loadSession(sid, { quiet: true });
+          if (loaded) {
+            st._loaded = true;
+            st._pendingExternalUpdate = false;
+            this._syncQueueFromServer(sid);
+          }
+          return !!loaded;
+        } catch (_) {
+          return false;
+        } finally {
+          clearTimeout(timeout);
+        }
+      })();
+      st._streamHealthProbe = task;
+      try {
+        return await task;
+      } finally {
+        if (this.tabState[sid] === st && st._streamHealthProbe === task) {
+          st._streamHealthProbe = null;
+        }
+      }
+    },
     _retireStaleSessionStream(sid, st) {
       // Server metadata has authoritatively moved active → idle (or its
       // revision advanced well after our local stream began), but this page
@@ -5999,6 +6282,7 @@ function portal() {
       st.streaming = false;
       st._draining = false;
       st._reconnectAttempts = 0;
+      st._serverActiveObserved = false;
       st.streamElapsed = 0;
       st._streamStartedAt = 0;
       if (sid === this.currentId) {
@@ -6015,7 +6299,7 @@ function portal() {
       if (typeof document !== "undefined"
           && document.visibilityState !== "visible") return;
       const metas = next || [];
-      for (const sid of this.visibleChatPaneIds()) {
+      for (const sid of (this.currentId ? [this.currentId] : [])) {
         const cur = metas.find(s => s && s.id === sid);
         if (!cur) continue;
         const st = this._ensureTabState(sid);
@@ -6037,7 +6321,10 @@ function portal() {
         // avoids racing a just-submitted turn before /active flips true).
         const streamAgeMs = st._streamStartedAt
           ? Math.max(0, Date.now() - st._streamStartedAt) : Infinity;
+        if (cur.active) st._serverActiveObserved = true;
         const serverSettled = !cur.active && (
+          st._serverActiveObserved
+          ||
           !!(previous && previous.active)
           || (newer && streamAgeMs >= 5000)
         );
@@ -6134,7 +6421,9 @@ function portal() {
         if (!!x.active !== !!y.active) return false;
         if ((x.updated_at || 0) !== (y.updated_at || 0)) return false;
         if ((x.message_count || 0) !== (y.message_count || 0)) return false;
+        if ((x.cwd || "") !== (y.cwd || "")) return false;
         if ((x.effort || "") !== (y.effort || "")) return false;
+        if ((x.service_tier || "") !== (y.service_tier || "")) return false;
         if ((x.permission || "default") !== (y.permission || "default")) return false;
         if ((x.thinking !== false) !== (y.thinking !== false)) return false;
       }
@@ -6190,9 +6479,13 @@ function portal() {
              `${h[8]}${h[9]}-${h[10]}${h[11]}${h[12]}${h[13]}${h[14]}${h[15]}`;
     },
     currentWorkspacePath() {
+      if (this.activeWorkspace) return this.activeWorkspace;
       const session = this.sessions.find(s => s.id === this.currentId);
       return (session && session.cwd) ||
         (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+    },
+    _workspaceIsCurrent(path) {
+      return String(path || "") === String(this.currentWorkspacePath() || "");
     },
     workspaceLabel(path = "") {
       const entry = this.sessionWorkspaces.find(w => w.path === (path || this.currentWorkspacePath()));
@@ -6201,73 +6494,406 @@ function portal() {
     async fetchSessionWorkspaces() {
       try {
         const response = await fetch("/api/chat/workspaces", { headers: this.hdr() });
-        if (!response.ok) return;
+        if (!response.ok) return false;
         const payload = await response.json();
         this.sessionWorkspaces = Array.isArray(payload.workspaces) ? payload.workspaces : [];
-      } catch (_) { /* session creation still falls back to the primary cwd */ }
-    },
-    async chooseSessionWorkspace(value) {
-      if (this.workspaceSwitching) return;
-      let cwd = value;
-      if (value === "__custom__") {
-        cwd = await this.prompt({
-          title: this.lang === "zh" ? "添加会话工作目录" : "Add session workspace",
-          body: this.lang === "zh"
-            ? "请输入服务端已存在目录的绝对路径。登记后会在该目录新建会话；文件区仍使用主工作目录。"
-            : "Enter an existing absolute path on the server. A new session will be created there; Files stays on the primary workspace.",
-          placeholder: "/path/to/project",
-          okText: this.lang === "zh" ? "添加并新建" : "Add and create",
-        }) || "";
-        if (!cwd.trim()) return;
-        this.workspaceSwitching = true;
-        try {
-          const response = await fetch("/api/chat/workspaces", {
-            method: "POST",
-            headers: { ...this.hdr(), "Content-Type": "application/json" },
-            body: JSON.stringify({ path: cwd.trim() }),
-          });
-          if (!response.ok) {
-            const detail = await response.text();
-            throw new Error(detail || `workspace ${response.status}`);
+        const valid = new Set(this.sessionWorkspaces.map(w => w.path));
+        const session = this.sessions.find(s => s.id === this.currentId);
+        const fallback = (session && valid.has(session.cwd) && session.cwd)
+          || ((this.sessionWorkspaces.find(w => w.primary) || {}).path || "");
+        const requested = this.activeWorkspace;
+        if (!valid.has(requested)) {
+          this.activeWorkspace = fallback;
+          // A persisted workspace may have been removed outside this browser.
+          // In that case restore the fallback workspace's own file surface,
+          // rather than showing the removed project's relative tabs under the
+          // primary tree. An empty requested path is the legacy single-root
+          // format, whose top-level prefs already belong to primary.
+          if (requested && fallback) {
+            const surface = this.workspaceSurfaces[fallback] || {};
+            this.tabs = this._workspacePreviewTabs(surface);
+            this._pendingPreviewSelected = typeof surface.previewSelected === "string"
+              ? surface.previewSelected : "";
+            this.showHidden = typeof surface.showHidden === "boolean"
+              ? surface.showHidden : false;
+            this.openFilesCollapsed = !!surface.openFilesCollapsed;
+            this.openFilesHeight = typeof surface.openFilesHeight === "number"
+              ? surface.openFilesHeight : null;
+            this.expanded = new Set(Array.isArray(surface.expanded) ? surface.expanded : []);
+            this._pendingExpanded = Array.from(this.expanded);
           }
-          const entry = await response.json();
-          cwd = entry.path;
-          await this.fetchSessionWorkspaces();
-        } catch (_) {
-          this.toast(this.lang === "zh" ? "目录无效或无法登记" : "Could not register that directory", "error");
-          return;
-        } finally {
-          this.workspaceSwitching = false;
+        }
+        return true;
+      } catch (_) {
+        // Session creation still falls back to the primary cwd.
+        return false;
+      }
+    },
+    async _refreshSessionsAfterWorkspaceRegistryChange() {
+      // A quiet 10-second poll may already be using the registry snapshot from
+      // before add/remove. Let that request finish, yield once so its
+      // single-flight owner clears, then force a non-conditional pull against
+      // the new registry. Without this, existing threads in a just-added
+      // workspace appeared only on the next poll (and switchWorkspace could
+      // create an unnecessary empty thread in the meantime); a late pre-remove
+      // response could likewise reinsert sessions from a removed workspace.
+      const pending = this._sessionListPullPromise;
+      if (pending) {
+        try { await pending; } catch (_) { /* the fresh pull below retries */ }
+        await new Promise(resolve => setTimeout(resolve, 0));
+      }
+      this._sessionsEtag = "";
+      return await this.refreshSessions();
+    },
+    workspaceOpenTabIds(path = "") {
+      const cwd = path || this.currentWorkspacePath();
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const byId = new Map(this.sessions.map(s => [s.id, s]));
+      return (this.openTabIds || []).filter(id => {
+        const session = byId.get(id);
+        return session && (session.cwd || primary) === cwd;
+      });
+    },
+    sessionInCurrentWorkspace(id) {
+      if (!id) return false;
+      const session = this.sessions.find(s => s.id === id);
+      if (!session) return false;
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      return (session.cwd || primary) === this.currentWorkspacePath();
+    },
+    workspaceSessions(path = "") {
+      const cwd = path || this.currentWorkspacePath();
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      return (this.sessions || []).filter(s => s && (s.cwd || primary) === cwd);
+    },
+    _sanitizePreviewViewState(view = {}) {
+      const nonNegative = value => {
+        const n = Number(value);
+        return Number.isFinite(n) ? Math.max(0, n) : 0;
+      };
+      const modes = new Set(["md", "text", "html", "img", "pdf", "xlsx", "csv"]);
+      return {
+        mode: modes.has(view.mode) ? view.mode : "",
+        scrollTop: nonNegative(view.scrollTop),
+        scrollLeft: nonNegative(view.scrollLeft),
+        innerScrollTop: nonNegative(view.innerScrollTop),
+        innerScrollLeft: nonNegative(view.innerScrollLeft),
+        frameScrollTop: nonNegative(view.frameScrollTop),
+        frameScrollLeft: nonNegative(view.frameScrollLeft),
+        xlsxActive: typeof view.xlsxActive === "string" ? view.xlsxActive : "",
+        csvOffset: Math.floor(nonNegative(view.csvOffset)),
+      };
+    },
+    _previewTabSnapshot(tab = {}) {
+      const path = typeof tab.path === "string" ? tab.path : "";
+      return {
+        path,
+        name: typeof tab.name === "string" && tab.name
+          ? tab.name : path.split("/").pop(),
+        preview: !!tab.preview,
+        view: this._sanitizePreviewViewState(tab.view),
+      };
+    },
+    _workspacePreviewTabs(surface = {}) {
+      const seen = new Set();
+      return (Array.isArray(surface.previewTabs) ? surface.previewTabs : [])
+        .filter(tab => {
+          const path = tab && typeof tab.path === "string" ? tab.path : "";
+          if (!path || seen.has(path)) return false;
+          seen.add(path);
+          return true;
+        })
+        .map(tab => this._previewTabSnapshot(tab));
+    },
+    _captureWorkspaceSurface(path = "") {
+      const cwd = path || this.currentWorkspacePath();
+      if (!cwd) return;
+      // Capture the live DOM before serializing tabs. Scroll does not mutate
+      // Alpine state on every wheel/touch frame; ownership transfers here or
+      // at openFile(), keeping scrolling cheap while still surviving reloads
+      // and workspace switches.
+      this._capturePreviewViewState(this.selected);
+      this.workspaceSurfaces = {
+        ...this.workspaceSurfaces,
+        [cwd]: {
+          previewTabs: (this.tabs || []).map(t => this._previewTabSnapshot(t)),
+          previewSelected: this.selected || "",
+          expanded: Array.from(this.expanded || []),
+          showHidden: !!this.showHidden,
+          openFilesCollapsed: !!this.openFilesCollapsed,
+          openFilesHeight: this.openFilesHeight,
+        },
+      };
+    },
+    async _changeWorkspaceSurface(path) {
+      if (!path || path === this.activeWorkspace) return true;
+      const previous = this.activeWorkspace;
+      if (previous) this._captureWorkspaceSurface(previous);
+
+      // Invalidate every owner-scoped file operation before changing the
+      // request header. Relative paths commonly repeat across projects
+      // (README.md, src/app.js), so an old response must never land in the
+      // new workspace merely because its path string happens to match.
+      ++this._treeLoadSeq;
+      this._childFetches = new Map();
+      if (this._fileSearchAbort) this._fileSearchAbort.abort();
+      this._fileSearchAbort = null;
+      ++this._fileSearchSeq;
+      if (this._previewAbort) this._previewAbort.abort();
+      if (this._csvAbort) this._csvAbort.abort();
+      this._previewAbort = null;
+      this._csvAbort = null;
+      ++this._previewLoadSeq;
+      ++this._csvLoadSeq;
+      this._cancelMentionLookup();
+      ++this._paletteFileSeq;
+      this.palette.fileResults = [];
+      this.palette.fileQuery = "";
+      this.palette.fileLoading = false;
+
+      const surface = this.workspaceSurfaces[path] || {};
+      const keepMobileTab = this.mobileTab;
+      this.activeWorkspace = path;
+      this.clearSearch();
+      this.visible = [];
+      this.childCache = {};
+      this.treeError = "";
+      this.treeFocusPath = "";
+      this.selectedPaths = new Set();
+      this._selAnchor = "";
+      this.fileClipboard = { path: "", name: "" };
+      if (this._previewCache) this._previewCache.clear();
+      this._previewCacheBytes = 0;
+      this._clearPreviewState();
+      this.tabs = this._workspacePreviewTabs(surface);
+      this.showHidden = typeof surface.showHidden === "boolean"
+        ? surface.showHidden : false;
+      this.openFilesCollapsed = !!surface.openFilesCollapsed;
+      this.openFilesHeight = typeof surface.openFilesHeight === "number"
+        ? surface.openFilesHeight : null;
+      this.expanded = new Set(Array.isArray(surface.expanded) ? surface.expanded : []);
+      this._pendingExpanded = Array.from(this.expanded);
+
+      const selected = typeof surface.previewSelected === "string"
+        ? surface.previewSelected : "";
+      await Promise.all([this.loadRoot(), this.loadTrash()]);
+      if (selected && this.tabs.some(t => t.path === selected)) {
+        const tab = this.tabs.find(t => t.path === selected);
+        await this.openFile(
+          { path: selected, name: tab.name || selected.split("/").pop() },
+          { preview: !!tab.preview },
+        );
+      }
+      this.setMobileTab(keepMobileTab);
+      this.savePrefs();
+      return true;
+    },
+    async switchWorkspace(path) {
+      this.workspaceMenuOpen = false;
+      if (!path || path === this.activeWorkspace
+          || this.workspaceSwitching || this._creatingSession) return;
+      if (!this.sessionWorkspaces.some(w => w.path === path)) {
+        this.toast(this.lang === "zh" ? "工作目录未登记" : "Workspace is not registered", "error");
+        return;
+      }
+      if (!this._confirmLoseEdits()) return;
+      this.workspaceSwitching = true;
+      try {
+        await this._changeWorkspaceSurface(path);
+        const remembered = this.workspaceLastSession[path];
+        const target = this.sessions.find(s => s.id === remembered && s.cwd === path)
+          || this.workspaceOpenTabIds(path).map(id => this.sessions.find(s => s.id === id)).find(Boolean)
+          || this.workspaceSessions(path)[0];
+        if (target) await this.openTab(target.id);
+        else await this.newSession({ cwd: path });
+        this.toast((this.lang === "zh" ? "已切换到 " : "Switched to ")
+          + this.workspaceLabel(path), "success", 1600);
+      } finally {
+        this.workspaceSwitching = false;
+      }
+    },
+    closeWorkspaceBrowser() {
+      if (!this.workspaceBrowser.show || this.workspaceSwitching) return;
+      this.workspaceBrowser.show = false;
+      this.workspaceBrowser.requestSeq++;
+      this.workspaceBrowser.loading = false;
+      this.workspaceBrowser.error = "";
+      this.workspaceBrowser.selected = "";
+    },
+    async browseWorkspaceDirectory(path = "") {
+      const browser = this.workspaceBrowser;
+      const requestSeq = ++browser.requestSeq;
+      browser.loading = true;
+      browser.error = "";
+      browser.selected = "";
+      try {
+        const query = path ? "?path=" + encodeURIComponent(path) : "";
+        const response = await fetch(
+          "/api/chat/workspaces/browse" + query,
+          { headers: this.hdr() },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        const payload = await response.json();
+        if (!browser.show || requestSeq !== browser.requestSeq) return false;
+        browser.path = typeof payload.path === "string" ? payload.path : "";
+        browser.name = typeof payload.name === "string" ? payload.name : "";
+        browser.parent = typeof payload.parent === "string" ? payload.parent : "";
+        browser.directories = Array.isArray(payload.directories)
+          ? payload.directories : [];
+        browser.registered = !!payload.registered;
+        browser.selectable = !!payload.selectable;
+        browser.truncated = !!payload.truncated;
+        return true;
+      } catch (_) {
+        if (!browser.show || requestSeq !== browser.requestSeq) return false;
+        browser.error = this.lang === "zh"
+          ? "无法读取该目录，请返回上级后重试。"
+          : "Could not read this directory. Go up and try again.";
+        browser.directories = [];
+        return false;
+      } finally {
+        if (requestSeq === browser.requestSeq) browser.loading = false;
+      }
+    },
+    selectWorkspaceDirectory(directory) {
+      if (!directory || directory.registered || !directory.selectable) return;
+      this.workspaceBrowser.selected = directory.path;
+    },
+    workspaceBrowserTarget() {
+      const browser = this.workspaceBrowser;
+      if (browser.selected) {
+        const selected = browser.directories.find(
+          directory => directory.path === browser.selected);
+        if (selected && selected.selectable && !selected.registered) {
+          return selected.path;
         }
       }
-      if (cwd && cwd !== this.currentWorkspacePath()) {
-        this.workspaceSwitching = true;
-        try { await this.newSession({ cwd }); }
-        finally { this.workspaceSwitching = false; }
+      return browser.selectable && !browser.registered ? browser.path : "";
+    },
+    workspaceBrowserTargetLabel() {
+      const target = this.workspaceBrowserTarget();
+      if (!target) return this.lang === "zh" ? "请选择一个文件夹" : "Select a folder";
+      const name = target.split("/").filter(Boolean).pop() || target;
+      return (this.lang === "zh" ? "将添加：" : "Add: ") + name;
+    },
+    async _registerWorkspacePath(path) {
+      if (!path || this.workspaceSwitching) return;
+      this.workspaceSwitching = true;
+      let entry = null;
+      try {
+        const response = await fetch("/api/chat/workspaces", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path }),
+        });
+        if (!response.ok) throw new Error(await response.text());
+        entry = await response.json();
+        await this.fetchSessionWorkspaces();
+        await this._refreshSessionsAfterWorkspaceRegistryChange();
+      } catch (_) {
+        this.workspaceBrowser.error = this.lang === "zh"
+          ? "目录无效、不可读取或已经无法访问。"
+          : "The directory is invalid, unreadable, or no longer available.";
+        this.toast(this.lang === "zh" ? "目录无法登记" : "Could not register that directory", "error");
+      } finally {
+        this.workspaceSwitching = false;
+      }
+      return entry;
+    },
+    async confirmWorkspaceBrowser() {
+      const entry = await this._registerWorkspacePath(this.workspaceBrowserTarget());
+      if (!entry || !entry.path) return;
+      this.closeWorkspaceBrowser();
+      await this.switchWorkspace(entry.path);
+    },
+    async addWorkspacePathManually() {
+      if (this.workspaceSwitching) return;
+      const value = await this.prompt({
+        title: this.lang === "zh" ? "输入工作目录路径" : "Enter workspace path",
+        body: this.lang === "zh"
+          ? "用于选择器范围外的服务器目录；请输入已存在目录的绝对路径。"
+          : "For server folders outside the browser roots, enter an existing absolute path.",
+        placeholder: "/path/to/project",
+        okText: this.lang === "zh" ? "添加" : "Add",
+      });
+      const path = String(value || "").trim();
+      if (!path) return;
+      const entry = await this._registerWorkspacePath(path);
+      if (!entry || !entry.path) return;
+      this.closeWorkspaceBrowser();
+      await this.switchWorkspace(entry.path);
+    },
+    async addWorkspace() {
+      this.workspaceMenuOpen = false;
+      if (this.workspaceSwitching) return;
+      const browser = this.workspaceBrowser;
+      browser.show = true;
+      browser.error = "";
+      browser.selected = "";
+      browser.directories = [];
+      await this.browseWorkspaceDirectory(this.currentWorkspacePath());
+    },
+    async removeWorkspace(path) {
+      const entry = this.sessionWorkspaces.find(w => w.path === path);
+      if (!entry || entry.primary || this.workspaceSwitching) return;
+      const ok = await this.confirm({
+        title: this.lang === "zh" ? "移除工作目录" : "Remove workspace",
+        body: this.lang === "zh"
+          ? `确定移除「${entry.name}」吗？磁盘文件和已有 Codex 会话不会被删除。`
+          : `Remove “${entry.name}”? Files on disk and existing Codex threads will not be deleted.`,
+        danger: true,
+        okText: this.lang === "zh" ? "移除" : "Remove",
+      });
+      if (!ok) return;
+      this.workspaceSwitching = true;
+      try {
+        if (this.activeWorkspace === path) {
+          const primary = this.sessionWorkspaces.find(w => w.primary);
+          if (primary) await this._changeWorkspaceSurface(primary.path);
+        }
+        const response = await fetch(
+          "/api/chat/workspaces?path=" + encodeURIComponent(path),
+          { method: "DELETE", headers: this.hdr() },
+        );
+        if (!response.ok) throw new Error(await response.text());
+        const removedIds = new Set(this.sessions.filter(s => s.cwd === path).map(s => s.id));
+        for (const id of removedIds) this._disposeTabRuntime(id);
+        this.openTabIds = this.openTabIds.filter(id => !removedIds.has(id));
+        this.sessions = this.sessions.filter(s => !removedIds.has(s.id));
+        const surfaces = { ...this.workspaceSurfaces };
+        delete surfaces[path];
+        this.workspaceSurfaces = surfaces;
+        const lastSessions = { ...this.workspaceLastSession };
+        delete lastSessions[path];
+        this.workspaceLastSession = lastSessions;
+        await this.fetchSessionWorkspaces();
+        await this._refreshSessionsAfterWorkspaceRegistryChange();
+        if (!this.sessions.find(s => s.id === this.currentId)) {
+          const target = this.workspaceSessions()[0];
+          if (target) await this.openTab(target.id);
+          else await this.newSession({ cwd: this.currentWorkspacePath() });
+        }
+        this.savePrefs();
+      } catch (_) {
+        this.toast(this.lang === "zh" ? "移除工作目录失败" : "Could not remove workspace", "error");
+      } finally {
+        this.workspaceSwitching = false;
       }
     },
     async _newServerSession() {
       const options = arguments[0] || {};
       if (this._creatingSession) return null;
-      const gridBefore = this._activeGridSnapshot();
       this._creatingSession = true;
-      // In multi-view, a new conversation replaces the selected pane just
-      // like clicking an existing outside tab. Leaving the grid here made the
-      // whole workspace disappear on every + click. Mobile/single-view keeps
-      // the ordinary one-page flow.
-      if (!gridBefore) this._enterSingleChat();
-      const activate = this._newSessionShouldActivate();
       const seedModel = this.defaultModel || this.model || "";
       const seedPermission = this.defaultPermission || "default";
       const seedCwd = options.cwd || this.currentWorkspacePath();
-      if (activate) {
-        this.model = seedModel;
-        this.permission = seedPermission;
-        // A fresh conversation must not inherit the previous tab's composer
-        // mirrors. There are no global defaults for these two controls.
-        this.effort = "";
-        this.thinkingEnabled = true;
-      }
+      this.model = seedModel;
+      this.permission = seedPermission;
+      // A fresh conversation must not inherit the previous tab's composer
+      // mirrors. There are no global defaults for these two controls.
+      this.effort = "";
+      this.fastModeEnabled = false;
+      this.thinkingEnabled = true;
       const draftId = "draft-" + this._uuid();
       const now = Date.now() / 1000;
       const draft = {
@@ -6277,6 +6903,7 @@ function portal() {
         model_provider: this._modelProvider(seedModel),
         permission: seedPermission,
         effort: "",
+        service_tier: "",
         thinking: true,
         created_at: now,
         updated_at: now,
@@ -6295,11 +6922,9 @@ function portal() {
       st.messages.length = 0;
       st._loaded = true;
       if (!this.openTabIds.includes(draftId)) this.openTabIds.push(draftId);
-      if (activate) {
-        if (gridBefore) this._applyGridReplacement(gridBefore, draftId);
-        else this.currentId = draftId;
-        this._activateTabState(draftId);
-      }
+      this.currentId = draftId;
+      this.workspaceLastSession = { ...this.workspaceLastSession, [seedCwd]: draftId };
+      this._activateTabState(draftId);
 
       const createPromise = (async () => {
         const response = await fetch("/api/chat/sessions", {
@@ -6312,6 +6937,7 @@ function portal() {
             model: seedModel,
             model_provider: this._modelProvider(seedModel),
             permission: seedPermission,
+            service_tier: "",
             cwd: seedCwd,
           }),
         });
@@ -6332,15 +6958,11 @@ function portal() {
           s => s.id !== draftId && s.id !== meta.id);
         nextSessions.splice(Math.max(0, draftIndex), 0, meta);
         this.sessions = nextSessions;
-        const draftStillOpen = (this.openTabIds || []).includes(draftId)
-          || (this.splitPaneIds || []).includes(draftId);
+        const draftStillOpen = (this.openTabIds || []).includes(draftId);
         if (draftStillOpen) {
           this.tabState[meta.id] = this.tabState[draftId] || st;
         }
         this.openTabIds = this.openTabIds.map(id => id === draftId ? meta.id : id);
-        this.splitPaneIds = (this.splitPaneIds || []).map(
-          id => id === draftId ? meta.id : id);
-        if (this.chatGridFocusId === draftId) this.chatGridFocusId = meta.id;
         this._residentTabIds = (this._residentTabIds || []).map(
           id => id === draftId ? meta.id : id);
         const wasCurrent = draftStillOpen && this.currentId === draftId;
@@ -6352,7 +6974,13 @@ function portal() {
           this.model = meta.model || seedModel;
           this.permission = meta.permission || seedPermission;
           this.effort = meta.effort || "";
+          this.fastModeEnabled = this._isFastServiceTier(
+            meta.service_tier, meta.model || seedModel);
           this.thinkingEnabled = meta.thinking !== false;
+          this.workspaceLastSession = {
+            ...this.workspaceLastSession,
+            [meta.cwd || seedCwd]: meta.id,
+          };
         }
         delete this.tabState[draftId];
         delete this._optimisticMetas[draftId];
@@ -6365,36 +6993,18 @@ function portal() {
       try {
         return await createPromise;
       } catch (_error) {
-        // Capture the user's latest navigation intent before removing the
-        // failed draft. They may have focused another grid pane while
-        // thread/start was in flight; rollback must repair only the draft's
-        // cell, not yank focus back to the original selection.
-        const rollbackFocus = this.currentId;
-        const draftStillInActiveGrid = !!(gridBefore
-          && this.chatViewMode === "grid"
-          && (this.splitPaneIds || []).includes(draftId));
         delete this._sessionCreatePromises[draftId];
         delete this._optimisticMetas[draftId];
         this.sessions = this.sessions.filter(s => s.id !== draftId);
         this.openTabIds = this.openTabIds.filter(id => id !== draftId);
-        this.splitPaneIds = (this.splitPaneIds || []).filter(id => id !== draftId);
         this._residentTabIds = (this._residentTabIds || []).filter(
           id => id !== draftId);
         delete this.tabState[draftId];
-        if (draftStillInActiveGrid) {
-          this._restoreGridSnapshot(gridBefore);
-          if (rollbackFocus && rollbackFocus !== draftId
-              && (this.splitPaneIds || []).includes(rollbackFocus)) {
-            this.currentId = rollbackFocus;
-            this.chatGridFocusId = rollbackFocus;
-            this._activateTabState(rollbackFocus);
-          }
-          await this.switchSession();
-        } else if (this.currentId === draftId) {
-          this.currentId = this.openTabIds[this.openTabIds.length - 1] || "";
+        if (this.currentId === draftId) {
+          const workspaceTabs = this.workspaceOpenTabIds(seedCwd);
+          this.currentId = workspaceTabs[workspaceTabs.length - 1] || "";
           if (this.currentId) this._activateTabState(this.currentId);
         }
-        this._normalizeChatGridState(this.currentId);
         this.toast(this.lang === "zh"
           ? "创建会话失败，请检查 Codex 运行状态"
           : "Could not create the session — check the Codex runtime",
@@ -6408,7 +7018,7 @@ function portal() {
       const options = arguments[0] || {};
       // Codex owns thread identifiers. Keep one creation path so every caller
       // gets the same optimistic draft, native-id adoption, settings reset,
-      // error rollback, and grid replacement semantics.
+      // and error rollback semantics.
       return this._newServerSession(options);
     },
 
@@ -6430,7 +7040,6 @@ function portal() {
         okText: zh ? "开始" : "Start",
       });
       if (!ok) return;
-      const gridBefore = this._activeGridSnapshot();
       let r;
       try {
         r = await fetch("/api/chat/sessions/organize", {
@@ -6456,11 +7065,7 @@ function portal() {
       }
       const meta = await r.json();
       await this.refreshSessions();
-      if (gridBefore) this._applyGridReplacement(gridBefore, meta.id);
-      else {
-        this._enterSingleChat();
-        this.currentId = meta.id;
-      }
+      this.currentId = meta.id;
       const st = this._ensureTabState(meta.id);
       st.messages.length = 0;
       st._loaded = true;
@@ -6468,8 +7073,14 @@ function portal() {
       this.model = meta.model || this.model;
       this.permission = meta.permission || "default";
       this.effort = meta.effort || "";
+      this.fastModeEnabled = this._isFastServiceTier(
+        meta.service_tier, meta.model || this.model);
       this.thinkingEnabled = meta.thinking !== false;
       if (!this.openTabIds.includes(meta.id)) this.openTabIds.push(meta.id);
+      this.workspaceLastSession = {
+        ...this.workspaceLastSession,
+        [meta.cwd || this.currentWorkspacePath()]: meta.id,
+      };
       this._fetchTabUsage(meta.id);
       this.savePrefs();
       // Auto-send the curator's initial prompt — the system prompt tells
@@ -6498,9 +7109,7 @@ function portal() {
       }
       if (this._hoverPrefetchedSid === id) this._hoverPrefetchedSid = null;
       if (makeCurrent && id !== this.currentId) {
-        this._enterSingleChat();
-        this.currentId = id;
-        await this.switchSession();
+        await this.activateTab(id);
       }
       this.savePrefs();
     },
@@ -6561,12 +7170,14 @@ function portal() {
       if (ev && ev.stopPropagation) ev.stopPropagation();
       const idx = this.openTabIds.indexOf(id);
       if (idx < 0) return;
+      const workspaceTabsBefore = this.workspaceOpenTabIds();
+      const workspaceIdx = workspaceTabsBefore.indexOf(id);
       // Closing the only optimistic draft while thread/start is unresolved
       // used to call newSession() under the global creation lock, yielding no
       // replacement and an empty tab strip. Let this one id materialize, then
       // close its native replacement normally.
       const pendingCreate = this._sessionCreatePromises[id];
-      if (this.openTabIds.length === 1 && pendingCreate) {
+      if (workspaceTabsBefore.length === 1 && pendingCreate) {
         try {
           const meta = await pendingCreate;
           if (meta && meta.id && meta.id !== id) {
@@ -6576,33 +7187,24 @@ function portal() {
         return;
       }
       const wasActive = this.currentId === id;
-      const gridBefore = this.chatGridWorkspaceIds();
-      const gridIdx = gridBefore.indexOf(id);
-      const wasActiveGrid = this.chatGridIsActive() && gridIdx >= 0;
       // Stop every session-owned timer/request generation before changing the
       // tab topology.  A pending prefetch or reconcile must not recreate this
       // tabState after the user explicitly closed it.
       this._disposeTabRuntime(id);
       this.openTabIds.splice(idx, 1);
-      this.splitPaneIds = (this.splitPaneIds || []).filter(x => x !== id);
       // [resident-panes] Drop the closed tab's pane from the resident set (its
       // DOM is unmounting). If it was active, switchSession below re-promotes
       // the neighbor we land on.
       this._residentTabIds = (this._residentTabIds || []).filter(x => x !== id);
       if (wasActive) {
-        if (this.openTabIds.length) {
-          const gridNext = wasActiveGrid
-            ? this.splitPaneIds[Math.min(Math.max(0, gridIdx), this.splitPaneIds.length - 1)]
-            : "";
-          const nextIdx = Math.min(idx, this.openTabIds.length - 1);
-          this.currentId = gridNext || this.openTabIds[nextIdx];
-          this._normalizeChatGridState(this.currentId);
+        const workspaceTabs = this.workspaceOpenTabIds();
+        if (workspaceTabs.length) {
+          const nextIdx = Math.min(Math.max(0, workspaceIdx), workspaceTabs.length - 1);
+          this.currentId = workspaceTabs[nextIdx];
           await this.switchSession();
         } else {
-          await this.newSession();
+          await this.newSession({ cwd: this.currentWorkspacePath() });
         }
-      } else {
-        this._normalizeChatGridState(this.currentId);
       }
       this.savePrefs();
       // Closing a tab is a cheap, reversible action (session is still in
@@ -6693,299 +7295,6 @@ function portal() {
       const session = this.sessions.find(x => x.id === tid);
       if (!session) return "";
       return session.cwd ? `${session.name || ""}\n${session.cwd}` : (session.name || "");
-    },
-    _newSessionShouldActivate() {
-      return true;
-    },
-    chatGridWorkspaceIds() {
-      const valid = new Set(this.openTabIds || []);
-      return [...new Set((this.splitPaneIds || []).filter(id => valid.has(id)))]
-        .slice(0, 4);
-    },
-    _activeGridSnapshot() {
-      if (!this.chatGridIsActive()) return null;
-      const ids = this.chatGridWorkspaceIds();
-      if (ids.length < 2) return null;
-      const selectedId = ids.includes(this.currentId)
-        ? this.currentId
-        : (ids.includes(this.chatGridFocusId) ? this.chatGridFocusId : ids[0]);
-      return { ids, selectedId };
-    },
-    _applyGridReplacement(snapshot, nextId) {
-      if (!snapshot || !nextId) return false;
-      const ids = [...snapshot.ids];
-      const selected = ids.indexOf(snapshot.selectedId);
-      ids[selected >= 0 ? selected : 0] = nextId;
-      this.splitPaneIds = [...new Set(ids)].slice(0, 4);
-      this.chatViewMode = "grid";
-      this.currentId = nextId;
-      this.chatGridFocusId = nextId;
-      return true;
-    },
-    _restoreGridSnapshot(snapshot) {
-      if (!snapshot) return false;
-      const valid = new Set(this.openTabIds || []);
-      const ids = snapshot.ids.filter(id => valid.has(id));
-      if (ids.length < 2) return false;
-      const selectedId = ids.includes(snapshot.selectedId)
-        ? snapshot.selectedId : ids[0];
-      this.splitPaneIds = ids;
-      this.chatViewMode = "grid";
-      this.currentId = selectedId;
-      this.chatGridFocusId = selectedId;
-      this._activateTabState(selectedId);
-      return true;
-    },
-    _normalizeChatGridState(preferredId = "") {
-      const valid = new Set(this.openTabIds || []);
-      const ids = [...new Set((this.splitPaneIds || [])
-        .filter(id => id && valid.has(id)))].slice(0, 4);
-      this.splitPaneIds = ids;
-      if (ids.length < 2 && this.chatViewMode === "grid") {
-        this.chatViewMode = "single";
-      }
-      if (!this._isMobileLayout() && this.chatViewMode === "grid" && ids.length > 1) {
-        const focus = [preferredId, this.currentId, this.chatGridFocusId]
-          .find(id => ids.includes(id)) || ids[0];
-        this.currentId = focus;
-        this.chatGridFocusId = focus;
-      }
-      return ids;
-    },
-    hasChatGridWorkspace() {
-      return this.chatGridWorkspaceIds().length > 1;
-    },
-    chatGridIsActive() {
-      return !this._isMobileLayout() && this.chatViewMode === "grid" &&
-        this.hasChatGridWorkspace();
-    },
-    visibleChatPaneIds() {
-      if (!this.chatGridIsActive()) {
-        return this.currentId ? [this.currentId] : [];
-      }
-      const ids = this.chatGridWorkspaceIds();
-      return ids.length ? ids.slice(0, 4) : (this.currentId ? [this.currentId] : []);
-    },
-    chatGridClass() {
-      const count = this.visibleChatPaneIds().length;
-      const active = Math.max(1, Math.min(4, count));
-      // Alpine reliably removes stale keys from an object class binding.
-      // Returning one changing class string could leave panes-4 behind after
-      // the grid shrank to three panes, creating a visible empty fourth cell.
-      return {
-        "panes-1": active === 1,
-        "panes-2": active === 2,
-        "panes-3": active === 3,
-        "panes-4": active === 4,
-        "panes-2-rows": active === 2 && this.chatGridLayout === "rows",
-        "panes-3-secondary": active === 3 && this.chatGridLayout === "secondary",
-      };
-    },
-    chatGridPaneClass(tid) {
-      const ids = this.visibleChatPaneIds();
-      const idx = ids.indexOf(tid);
-      return {
-        active: tid === this.currentId,
-        masked: tid !== this.currentId,
-        "drag-over": this.splitDragOverId === tid,
-        "grid-first": idx === 0,
-        "grid-last": idx >= 0 && idx === ids.length - 1,
-      };
-    },
-    async toggleChatGrid() {
-      if (this._isMobileLayout()) return;
-      if (this.chatGridIsActive()) {
-        this.chatGridMenuOpen = !this.chatGridMenuOpen;
-        return;
-      }
-      if (this.hasChatGridWorkspace()) return await this.openChatGridWorkspace();
-      this.chatGridMenuOpen = true;
-    },
-    async openChatGridWorkspace() {
-      if (this._isMobileLayout()) return;
-      const saved = this.chatGridWorkspaceIds();
-      if (saved.length < 2) {
-        this.chatGridMenuOpen = true;
-        return;
-      }
-      this.chatGridMenuOpen = false;
-      this.chatViewMode = "grid";
-      const focus = saved.includes(this.chatGridFocusId)
-        ? this.chatGridFocusId : saved[0];
-      this.currentId = focus;
-      this.chatGridFocusId = focus;
-      await this.switchSession();
-      await Promise.all(saved.map(async id => {
-        await this._ensureSessionLoaded(id);
-        this._checkActiveTurn(id);
-      }));
-      this.savePrefs();
-    },
-    _rememberGridFocus() {
-      if (this.chatGridIsActive() &&
-          (this.splitPaneIds || []).includes(this.currentId)) {
-        this.chatGridFocusId = this.currentId;
-      }
-    },
-    _enterSingleChat() {
-      this._rememberGridFocus();
-      this.chatViewMode = "single";
-      this.chatGridMenuOpen = false;
-    },
-    async createDefaultChatGrid() {
-      const ids = [this.currentId, ...(this.openTabIds || []).filter(
-        id => id !== this.currentId)].filter(Boolean).slice(0, 4);
-      if (ids.length < 2) {
-        this.toast(this.lang === "zh" ? "请先打开至少两个会话" : "Open at least two sessions first", "info", 2400);
-        return;
-      }
-      this.splitPaneIds = ids;
-      this.chatViewMode = "grid";
-      this.chatGridFocusId = this.currentId;
-      await Promise.all(ids.map(async id => {
-        this._promoteResident(id);
-        await this._ensureSessionLoaded(id);
-        this._checkActiveTurn(id);
-      }));
-      this.savePrefs();
-    },
-    async setChatGridView(count, layout = "auto") {
-      const wanted = Math.max(1, Math.min(4, Number(count) || 1));
-      this.chatGridMenuOpen = false;
-      if (wanted === 1) {
-        this._enterSingleChat();
-        this.savePrefs();
-        return;
-      }
-      // Layout changes operate on the curated workspace in place. Rebuilding
-      // from the tab strip used to silently replace panes whenever the user
-      // changed columns/rows.
-      let ids = this.chatGridWorkspaceIds();
-      if (!ids.length) ids = [this.currentId].filter(Boolean);
-      for (const id of (this.openTabIds || [])) {
-        if (ids.length >= wanted) break;
-        if (id && !ids.includes(id)) ids.push(id);
-      }
-      if (ids.length < wanted) {
-        this.toast(this.lang === "zh"
-          ? `需要先打开 ${wanted} 个会话`
-          : `Open ${wanted} sessions first`, "info", 2400);
-        return;
-      }
-      if (ids.length > wanted && ids.includes(this.currentId)
-          && ids.indexOf(this.currentId) >= wanted) {
-        ids = [this.currentId, ...ids.filter(id => id !== this.currentId)];
-      }
-      this.splitPaneIds = ids.slice(0, wanted);
-      this.chatGridLayout = layout;
-      this.chatViewMode = "grid";
-      const focus = this.splitPaneIds.includes(this.currentId)
-        ? this.currentId
-        : (this.splitPaneIds.includes(this.chatGridFocusId)
-          ? this.chatGridFocusId : this.splitPaneIds[0]);
-      const changedFocus = focus !== this.currentId;
-      this.currentId = focus;
-      this.chatGridFocusId = focus;
-      if (changedFocus) await this.switchSession();
-      await Promise.all(this.splitPaneIds.map(async id => {
-        this._promoteResident(id);
-        await this._ensureSessionLoaded(id);
-        this._checkActiveTurn(id);
-      }));
-      this.savePrefs();
-    },
-    async addSessionToGrid(id) {
-      if (!id) return;
-      const origin = this.currentId;
-      if (!(this.openTabIds || []).includes(id)) await this.openTab(id, false);
-      // Dragging into an ordinary single page creates/replaces the one grid
-      // workspace from that page plus the dragged session. While already in
-      // the grid, preserve its existing curated pane set and append normally.
-      const seed = this.chatGridIsActive()
-        ? (this.splitPaneIds || []) : [origin];
-      const ids = [...new Set(seed.filter(Boolean))];
-      if (!ids.includes(id)) {
-        if (ids.length >= 4) {
-          this.toast(this.lang === "zh" ? "四宫格已满" : "The four-pane grid is full", "warn", 2200);
-          return;
-        }
-        ids.push(id);
-      }
-      this.splitPaneIds = ids;
-      if (ids.length > 1 && !this._isMobileLayout()) {
-        this.chatViewMode = "grid";
-        this.currentId = id;
-        this.chatGridFocusId = id;
-      }
-      this._promoteResident(id);
-      if (this.currentId === id && origin !== id) await this.switchSession();
-      else await this._ensureSessionLoaded(id);
-      this._checkActiveTurn(id);
-      this.savePrefs();
-    },
-    async removeSessionFromGrid(id) {
-      const before = this.chatGridWorkspaceIds();
-      const idx = before.indexOf(id);
-      this.splitPaneIds = before.filter(x => x !== id);
-      const removedCurrent = this.currentId === id;
-      if (removedCurrent) {
-        const next = this.splitPaneIds[Math.min(Math.max(0, idx), this.splitPaneIds.length - 1)]
-          || this.openTabIds.find(x => x !== id);
-        if (next) {
-          this.currentId = next;
-          this.chatGridFocusId = next;
-        }
-      }
-      this._normalizeChatGridState(this.currentId);
-      if (removedCurrent && this.currentId) await this.switchSession();
-      this.savePrefs();
-    },
-    async activateGridPane(id) {
-      if (!id || id === this.currentId) return;
-      this.currentId = id;
-      this.chatGridFocusId = id;
-      // Selecting a pane means its completed reply has been seen. Clear the
-      // underlying flag as well as hiding the indicator; otherwise it comes
-      // back as soon as the user activates another pane.
-      const st = this.tabState && this.tabState[id];
-      if (st && st.unread) st.unread = false;
-      await this.switchSession();
-    },
-    scrollGridPane(id, ev) {
-      if (!id || !ev) return;
-      this._userScrollIntent(id);
-      const pane = document.querySelector(
-        `.chat-grid-pane[data-pane-id="${CSS.escape(id)}"] .msg-pane`);
-      if (!pane) return;
-      pane.scrollTop += ev.deltaY || 0;
-    },
-    async openGridFromTab(id) {
-      this.closeTabMenu();
-      await this.addSessionToGrid(id);
-    },
-    onChatGridDragOver(ev, id) {
-      if (!this._draggingTabId) return;
-      if (ev && ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
-      this.splitDragOverId = id || "grid";
-    },
-    async onChatGridDrop(ev, targetId) {
-      const src = this._draggingTabId || (() => {
-        try { return ev.dataTransfer.getData("text/plain"); } catch (_) { return ""; }
-      })();
-      this._draggingTabId = "";
-      this.splitDragOverId = "";
-      if (!src) return;
-      const ids = [...new Set(this.splitPaneIds || [])];
-      const from = ids.indexOf(src);
-      const to = targetId ? ids.indexOf(targetId) : -1;
-      if (from >= 0 && to >= 0 && from !== to) {
-        ids.splice(from, 1);
-        ids.splice(to, 0, src);
-        this.splitPaneIds = ids;
-        this.savePrefs();
-        return;
-      }
-      await this.addSessionToGrid(src);
     },
     // <title> driver — wired via x-effect on the root #app element. Re-runs
     // whenever any read reactive (currentId / sessions / streaming) changes.
@@ -7496,7 +7805,7 @@ function portal() {
     _taskSubjectMapForMessages(tid = "") {
       const sid = tid || this.currentId || "_default";
       const msgs = tid ? this.paneMessages(tid) : (this.messages || []);
-      // Cache per pane: visible grids otherwise evict one shared cache entry
+      // Cache per pane: resident tabs otherwise evict one shared cache entry
       // on every Alpine effect. Tail identity also catches a same-length
       // transcript replacement that a count-only key misses.
       this._cachedTaskSubjectMaps = this._cachedTaskSubjectMaps || {};
@@ -8004,31 +8313,34 @@ function portal() {
 
     async activateTab(tid) {
       if (!tid) return;
-      const gridActive = this.chatGridIsActive();
       if (tid === this.currentId) return;
-      if (gridActive) {
-        // A tab click while the grid is open should navigate WITHIN that
-        // workspace, not silently destroy it. Existing members are simply
-        // focused; an outside tab replaces the currently selected pane while
-        // preserving the pane count and layout. Single-view remains an
-        // explicit choice in the layout menu (and new-session flow).
-        const ids = this.chatGridWorkspaceIds();
-        if (!ids.includes(tid)) {
-          const selected = ids.indexOf(this.currentId);
-          ids[selected >= 0 ? selected : 0] = tid;
-          this.splitPaneIds = ids;
+      const session = this.sessions.find(s => s.id === tid);
+      if (!session) return;
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const targetWorkspace = session.cwd || primary;
+      if (targetWorkspace && targetWorkspace !== this.currentWorkspacePath()) {
+        if (!this.sessionWorkspaces.some(w => w.path === targetWorkspace)) {
+          this.toast(this.lang === "zh" ? "该会话的工作目录尚未登记" : "That session workspace is not registered", "warn");
+          return;
         }
-        this.chatGridFocusId = tid;
-      } else {
-        this._enterSingleChat();
+        if (!this._confirmLoseEdits()) return;
+        this.workspaceSwitching = true;
+        try {
+          await this._changeWorkspaceSurface(targetWorkspace);
+        } finally {
+          this.workspaceSwitching = false;
+        }
       }
       this.currentId = tid;
+      this.workspaceLastSession = {
+        ...this.workspaceLastSession,
+        [targetWorkspace || this.currentWorkspacePath()]: tid,
+      };
       // Clear the green "task done while you were elsewhere" dot now that
       // the user is actually looking at this tab.
       const st = this.tabState && this.tabState[tid];
       if (st && st.unread) st.unread = false;
       await this.switchSession();
-      if (gridActive) this._checkActiveTurn(tid);
       // Scroll the newly-active tab into view — when the strip overflows
       // horizontally (many sessions open), keyboard shortcuts / programmatic
       // activation would otherwise leave the active tab hidden off-screen.
@@ -8043,7 +8355,7 @@ function portal() {
       if (!strip) return;
       const tab = strip.querySelector(`.chat-tab[data-tid="${tid}"]`)
                   || Array.from(strip.querySelectorAll(".chat-tab"))[
-                       this.openTabIds.indexOf(tid)];
+                       this.workspaceOpenTabIds().indexOf(tid)];
       if (!tab) return;
       // `inline: nearest` preserves vertical scroll, only scrolls horizontally
       // if the tab isn't already visible. `block: nearest` likewise vertical.
@@ -8129,7 +8441,6 @@ function portal() {
     onTabDragEnd() {
       this._draggingTabId = "";
       this.tabDragOverId = "";
-      this.splitDragOverId = "";
     },
 
     // ===== drag-to-reorder preview tabs (mirrors chat-tab drag, but operates
@@ -8168,6 +8479,8 @@ function portal() {
             await this.switchTab(path);
             if (this.selected !== path) return;
           }
+          this._dropHtmlPreviewFramesUnder(
+            this.tabs.filter(t => t.path !== path).map(t => t.path));
           this.tabs = this.tabs.filter(t => t.path === path);
           this.savePrefs();
           break;
@@ -8178,7 +8491,10 @@ function portal() {
             await this.switchTab(path);
             if (this.selected !== path) return;
           }
-          if (idx >= 0) this.tabs = this.tabs.slice(0, idx + 1);
+          if (idx >= 0) {
+            this._dropHtmlPreviewFramesUnder(this.tabs.slice(idx + 1).map(t => t.path));
+            this.tabs = this.tabs.slice(0, idx + 1);
+          }
           this.savePrefs();
           break;
         }
@@ -8207,6 +8523,7 @@ function portal() {
       this._dragCounter = 0;
       const files = Array.from((ev.dataTransfer && ev.dataTransfer.files) || []);
       if (!files.length) return;
+      const ownerWorkspace = this.currentWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite("", files);
       if (!uploadContext) return;
       // Always upload to the archive root (MUSELAB_ROOT), regardless of
@@ -8227,10 +8544,13 @@ function portal() {
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet("", f))
       );
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
       await this.reloadTree();
-      await this._syncUploadedFiles(results, uploadContext);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      await this._syncUploadedFiles(results, uploadContext, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (failed && !ok) {
         this.toast(this.lang === "zh"
           ? `${failed} 个文件上传失败`
@@ -8266,7 +8586,6 @@ function portal() {
           return false;
         }
         const data = await r.json().catch(() => ({}));
-        delete this.childCache[dirPath];
         return {
           path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
           replaced_trash_id: data.replaced_trash_id || null,
@@ -8287,7 +8606,12 @@ function portal() {
       context.editorRef = this._cm;
       return context;
     },
-    async _syncUploadedFiles(results, uploadContext = {}) {
+    async _syncUploadedFiles(
+      results,
+      uploadContext = {},
+      ownerWorkspace = this.currentWorkspacePath(),
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const uploaded = (results || [])
         .filter(r => r.status === "fulfilled" && r.value && r.value.path)
         .map(r => r.value);
@@ -8428,15 +8752,19 @@ function portal() {
     _optimisticMetas: {},
     filteredSessions() {
       const q = (this.sessionPickerSearch || "").trim().toLowerCase();
-      if (!q) return this.sessions;
+      const cwd = this.currentWorkspacePath();
+      const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const inWorkspace = list => (list || []).filter(
+        s => s && (s.cwd || primary) === cwd);
+      if (!q) return inWorkspace(this.sessions);
       // Server search has answered for THIS exact query → use the full-archive
       // result set (reaches sessions outside the recent window).
       if (this._sessionSearchQuery === q && Array.isArray(this._sessionSearchResults)) {
-        return this._sessionSearchResults;
+        return inWorkspace(this._sessionSearchResults);
       }
       // Not yet (debounce / network in flight) → instant local feedback over
       // the loaded window; _searchSessions() replaces it with the server set.
-      return this.sessions.filter(s =>
+      return inWorkspace(this.sessions).filter(s =>
         (s.name && s.name.toLowerCase().includes(q))
         || (s.first_prompt && s.first_prompt.toLowerCase().includes(q))
       );
@@ -8649,7 +8977,11 @@ function portal() {
     async purgeOldSessions() {
       const zh = this.lang === "zh";
       const DAYS = 7;
-      const body = { days: DAYS, keep_id: this.currentId || "" };
+      const body = {
+        days: DAYS,
+        keep_id: this.currentId || "",
+        cwd: this.currentWorkspacePath(),
+      };
       // Close the picker popup first — its z-index (1500) sits ABOVE the global
       // confirm modal, so leaving it open would bury the confirm dialog behind
       // the session list. The popup has done its job once the action fires.
@@ -8707,9 +9039,7 @@ function portal() {
         this._disposeTabRuntime(sid);
       }
       this.openTabIds = (this.openTabIds || []).filter(id => !deletedIds.has(id));
-      this.splitPaneIds = (this.splitPaneIds || []).filter(id => !deletedIds.has(id));
       await this.refreshSessions();
-      this._normalizeChatGridState(this.currentId);
       this.savePrefs();
       const cleared = (resp && resp.deleted) || 0;
       this.toast(zh ? `已清理 ${cleared} 个历史会话` : `Cleared ${cleared} session(s)`, "success", 2500);
@@ -8781,6 +9111,7 @@ function portal() {
       // as cancellation of root-level UI work.
       const targetSid = this.currentId;
       if (!targetSid) return;
+      const cur = this.sessions.find(s => s.id === targetSid);
       // Re-baseline the open-session resync cursor on every switch — incl. the
       // instant "already-loaded" path below that skips loadSession (which would
       // otherwise leave the PREVIOUS session's updated_at as the baseline and
@@ -8792,18 +9123,22 @@ function portal() {
       // chat-tabs strip, slash /resume, ctx-menu, programmatic newSession).
       // Earlier we only did this in openTab, which left chat-tabs taps and
       // a few other paths needing a second tap on the bottom Muse icon.
-      if (this._isMobileLayout()) this.mobileTab = "chat";
+      if (this._isMobileLayout()) this.setMobileTab("chat");
       // Switch the visible tab. We do NOT touch other tabs' streams — each
       // tab's ES is in its own tabState[id], and stream callbacks write
       // there directly. Switching is just "show that tab".
-      // Decide warm vs rebuild from the actual DOM. The grid now renders only
-      // visibleChatPaneIds(), so the old resident-LRU bookkeeping could claim a
-      // pane was mounted after single-view Alpine had already removed it. That
-      // skipped the fresh-DOM highlight/artifact pass on return.
+      // Decide warm vs rebuild from the actual DOM. The resident LRU can claim
+      // a pane was retained for one reactive tick after Alpine removed it, so
+      // use the DOM as the source of truth for highlight/artifact work.
       const _wasMounted = typeof document !== "undefined" && !!document.querySelector(
-        `.chat-grid-pane[data-pane-id="${CSS.escape(targetSid)}"] .msg-pane`);
+        `.chat-session-pane[data-pane-id="${CSS.escape(targetSid)}"] .msg-pane`);
       this._promoteResident(targetSid);
       this._activateTabState(targetSid);
+      if (cur) {
+        const primary = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+        const cwd = cur.cwd || primary;
+        if (cwd) this.workspaceLastSession = { ...this.workspaceLastSession, [cwd]: targetSid };
+      }
       this.savePrefs();
       // Sync the model + effort dropdowns to THIS session's persisted
       // values on every tab switch. Without this, the dropdowns are
@@ -8814,13 +9149,14 @@ function portal() {
       // wrongly shows "haiku" even though A.model is still opus. The
       // backend was fine; only the UI label drifted. Same fix applied
       // to effort which has the same shape (per-session metadata).
-      const cur = this.sessions.find(s => s.id === targetSid);
       if (cur) {
         if (cur.model) this.model = cur.model;
         // effort: explicit assignment even when empty — switching from
         // a high-effort tab to one with no override should clear the
         // dropdown, not inherit the old value.
         this.effort = cur.effort || "";
+        this.fastModeEnabled = this._isFastServiceTier(
+          cur.service_tier, cur.model);
         this.permission = cur.permission || "default";
         // thinking: default true when the field is absent (legacy sessions).
         this.thinkingEnabled = cur.thinking !== false;
@@ -8883,7 +9219,7 @@ function portal() {
         // Hiding a long pane for the skeleton clamps the shared scroller to
         // zero, so only use that paint-first trick when we intend to follow the
         // tail anyway. Mid-history readers keep the mounted pane visible.
-        if (histLen > 60 && !this.chatGridIsActive() && shouldFollow) {
+        if (histLen > 60 && shouldFollow) {
           this.messagesReady = false;          // msgs-hidden → bubbles display:none + skeleton
           this._afterPaint(() => {
             if (this.currentId !== target) return;
@@ -8930,16 +9266,8 @@ function portal() {
             if (stCur) stCur._highlighted = true;
           });
         };
-        if (this.chatGridIsActive()) {
-          // Split mode hides the global skeleton; blanking every message would
-          // therefore produce an unexplained empty pane. Let Alpine mount the
-          // new pane directly and do heavy work after it paints.
-          this.messagesReady = true;
-          this._afterPaint(revealFreshPane);
-        } else {
-          this.messagesReady = false;
-          this._afterPaint(revealFreshPane);
-        }
+        this.messagesReady = false;
+        this._afterPaint(revealFreshPane);
       }
     },
     _restoreChatPosition(sid = this.currentId) {
@@ -8997,6 +9325,7 @@ function portal() {
         // Do not recreate a ghost tab or attach its turn to a later reopen.
         if (this.tabState[sid] !== st) return;
         if (d.active && !st.streaming && !st.es) {
+          st._serverActiveObserved = true;
           // Reconnect any time the backend says there's an active turn.
           // get_session_api returns SDK-only messages (no broadcast
           // overlay), so loadSession's view is just the user msg — the
@@ -9305,7 +9634,7 @@ function portal() {
         const startIdx = pickVisibleStart(all);
         const visible = all.slice(startIdx);
         const earlier = all.slice(0, startIdx);
-        const quietPane = quiet && this.visibleChatPaneIds().includes(sid);
+        const quietPane = quiet && sid === this.currentId;
         const quietScrollEl = quietPane ? this._chatScrollEl(sid) : null;
         const quietScrollTop = quietScrollEl ? quietScrollEl.scrollTop : 0;
         // E5: when pickVisibleStart rewound `visible` past the bottom
@@ -9392,6 +9721,8 @@ function portal() {
           // effort defaults to "" (adaptive); always assign so switching from
           // a high-effort tab to a fresh one doesn't leave the old value visible.
           this.effort = s.effort || "";
+          this.fastModeEnabled = this._isFastServiceTier(
+            s.service_tier, s.model || this.model);
           this.permission = s.permission || "default";
           // thinking: default true when absent (legacy sessions had no field).
           this.thinkingEnabled = s.thinking !== false;
@@ -9449,22 +9780,6 @@ function portal() {
                 }
               });
             }
-          });
-        } else if (quietPane) {
-          // A masked grid pane is still visible UI. Re-highlight only that
-          // pane and preserve its independent scroll/follow state after the
-          // authoritative transcript swap.
-          const _wasAtBottom = st.atBottom !== false;
-          this.$nextTick(async () => {
-            if (this.tabState[sid] !== st) return;
-            try {
-              const selector = `.chat-grid-pane[data-pane-id="${CSS.escape(sid)}"]`;
-              await this.highlightCode(selector);
-              st._highlighted = true;
-            } catch (_e) { /* best-effort */ }
-            if (!this.visibleChatPaneIds().includes(sid)) return;
-            if (_wasAtBottom) this.scrollToBottom(true, sid);
-            else if (quietScrollEl) quietScrollEl.scrollTop = quietScrollTop;
           });
         }
         if (this.tabState[sid] !== st) return false;
@@ -9634,7 +9949,7 @@ function portal() {
       });
     },
     _idlePreloadStep() {
-      const ids = this.openTabIds || [];
+      const ids = this.workspaceOpenTabIds();
       const next = ids.find(id => {
         if (!id || id === this.currentId) return false;
         const st = this.tabState && this.tabState[id];
@@ -9642,10 +9957,8 @@ function portal() {
         return !(this._prefetching && this._prefetching[id]);
       });
       if (!next) return;                       // all open tabs warm — done
-      const visibleStream = this.visibleChatPaneIds().some(id => {
-        const st = this.tabState && this.tabState[id];
-        return !!(st && st.streaming);
-      });
+      const currentState = this.currentId && this.tabState && this.tabState[this.currentId];
+      const visibleStream = !!(currentState && currentState.streaming);
       if (visibleStream) {                     // don't fight any visible reply
         // Do not recursively queue idle callbacks on every idle slice while a
         // long turn streams; that loop itself can wake the main thread dozens
@@ -9867,7 +10180,7 @@ function portal() {
       // whole batch the instant they mount, which janks the scroll-to-top load.
       for (const m of batch) m._noAnim = true;
       const isCurrent = sid === this.currentId;
-      const isVisible = this.visibleChatPaneIds().includes(sid);
+      const isVisible = sid === this.currentId;
       // Capture scroll geometry BEFORE the DOM grows so we can restore the
       // user's visible-content offset after Alpine re-renders.
       const scrollEl = isVisible ? this._chatScrollEl(sid) : null;
@@ -10309,7 +10622,10 @@ function portal() {
               this.savePrefs();
             }
             this._ensureValidModel();
-            this._rebindModelSelect();
+            // Loading is not complete until Alpine's select rebind settles.
+            // Leaving this promise detached lets its captured old value land
+            // after a user has already selected another model.
+            await this._rebindModelSelect();
             return true;
           } catch (e) {
             if (attempt < retries) {
@@ -10399,11 +10715,14 @@ function portal() {
         st._streamTimer = null;
         st._stallWatch = null;
         st._reconnectTimer = null;
+        st._streamHealthProbe = null;
+        st._serverActiveObserved = false;
         st._reconcileRetryTimer = null;
         st._reconcilePromise = null;
         st._settleToken = (st._settleToken || 0) + 1;
         // Invalidate every response guard even if a callback is already queued.
         st._effortPatchSeq = (Number(st._effortPatchSeq) || 0) + 1;
+        st._serviceTierPatchSeq = (Number(st._serviceTierPatchSeq) || 0) + 1;
         st._thinkingPatchSeq = (Number(st._thinkingPatchSeq) || 0) + 1;
         st._permissionPatchSeq = (Number(st._permissionPatchSeq) || 0) + 1;
         st._ctxMeterSeq = (Number(st._ctxMeterSeq) || 0) + 1;
@@ -10436,12 +10755,7 @@ function portal() {
         });
         if (!ok) return false;
       }
-      const gridBefore = this.chatGridWorkspaceIds();
-      const gridIdx = gridBefore.indexOf(sid);
-      const preferredGrid = gridIdx >= 0
-        ? gridBefore.filter(id => id !== sid)[Math.min(gridIdx, gridBefore.length - 2)]
-        : "";
-      const openBefore = [...(this.openTabIds || [])];
+      const openBefore = this.workspaceOpenTabIds();
       const openIdx = openBefore.indexOf(sid);
       let response;
       try {
@@ -10461,24 +10775,19 @@ function portal() {
       this._disposeTabRuntime(sid);
       await this.refreshSessions();
       this.openTabIds = (this.openTabIds || []).filter(id => id !== sid);
-      this.splitPaneIds = (this.splitPaneIds || []).filter(id => id !== sid);
       this._residentTabIds = (this._residentTabIds || []).filter(id => id !== sid);
       if (this.currentId === sid) {
-        if (this.sessions.length === 0) {
-          // newSession already pushes to openTabIds + activates tab state.
-          await this.newSession();
+        const workspaceSessions = this.workspaceSessions();
+        if (workspaceSessions.length === 0) {
+          await this.newSession({ cwd: this.currentWorkspacePath() });
         } else {
-          const valid = new Set(this.sessions.map(meta => meta.id));
+          const valid = new Set(workspaceSessions.map(meta => meta.id));
           const openFallbacks = openBefore.filter(id => id !== sid && valid.has(id));
           const neighbor = openFallbacks[Math.min(Math.max(0, openIdx), openFallbacks.length - 1)];
-          this.currentId = (preferredGrid && valid.has(preferredGrid) && preferredGrid)
-            || neighbor || this.sessions[0].id;
+          this.currentId = neighbor || workspaceSessions[0].id;
           if (!this.openTabIds.includes(this.currentId)) this.openTabIds.push(this.currentId);
-          this._normalizeChatGridState(this.currentId);
           await this.switchSession();
         }
-      } else {
-        this._normalizeChatGridState(this.currentId);
       }
       this.savePrefs();
       return true;
@@ -10727,7 +11036,11 @@ function portal() {
     // currently expanded (or restored to root and root isn't loaded),
     // we fall back to reloadTree — rare in practice but covers the
     // edge case without bespoke logic.
-    async _refreshParentInTree(restoredPath) {
+    async _refreshParentInTree(
+      restoredPath,
+      ownerWorkspace = this.currentWorkspacePath(),
+    ) {
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
       if (!restoredPath) return this.reloadTree();
       const parent = restoredPath.split("/").slice(0, -1).join("/");
       delete this.childCache[`${parent}:true`];
@@ -10741,9 +11054,6 @@ function portal() {
         // will refetch fresh.
         return;
       }
-      const parentIdx = this.visible.findIndex(n => n.path === parent);
-      if (parentIdx < 0) return this.reloadTree();
-      const parentNode = this.visible[parentIdx];
       // Snapshot inner-expanded subtrees so we can restore them after
       // re-rendering the parent's children.
       const innerExpanded = Array.from(this.expanded)
@@ -10752,13 +11062,23 @@ function portal() {
       // currently-visible subtree and replace it with a misleading blank.
       let children;
       try {
-        children = await this.fetchChildren(parent, { force: true });
+        children = await this.fetchChildren(parent, {
+          force: true, ownerWorkspace,
+        });
       } catch (_e) {
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
         this.toast(this.lang === "zh"
           ? "目录刷新失败，已保留原内容"
           : "Could not refresh folder; kept the previous contents", "error", 3500);
         return false;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+      // The same workspace can still refresh while this targeted request is
+      // in flight. Re-resolve the row after the await so a stale numeric index
+      // never splices children under a different folder.
+      const parentIdx = this.visible.findIndex(n => n.path === parent);
+      if (parentIdx < 0) return this.reloadTree();
+      const parentNode = this.visible[parentIdx];
       // Splice out parent's current rendered subtree.
       let end = parentIdx + 1;
       while (end < this.visible.length
@@ -10779,37 +11099,64 @@ function portal() {
       // order so each expand() can find its parent already rendered.
       for (const p of innerExpanded.sort((a, b) => a.length - b.length)) {
         const node = this.visible.find(n => n.path === p);
-        if (node && node.is_dir) await this.expand(node);
+        if (node && node.is_dir) {
+          await this.expand(node, { ownerWorkspace, quiet: true });
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
+        }
       }
       this.expanded = new Set(this.expanded);
       return true;
     },
     async fetchChildren(path, opts = {}) {
+      const ownerWorkspace = opts.ownerWorkspace || this.currentWorkspacePath();
+      const isOwner = () => this._workspaceIsCurrent(ownerWorkspace)
+        && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq);
+      if (!isOwner()) {
+        const stale = new Error("stale workspace file request");
+        stale.staleWorkspace = true;
+        throw stale;
+      }
       const showHidden = this.showHidden;
       const cacheKey = `${path}:${showHidden}`;
       if (!opts.force && Object.prototype.hasOwnProperty.call(this.childCache, cacheKey)) {
         return this.childCache[cacheKey];
       }
       if (!this._childFetches) this._childFetches = new Map();
-      const pendingKey = `${cacheKey}:${opts.force ? "force" : "normal"}`;
+      const pendingKey = `${ownerWorkspace}\0${cacheKey}:${opts.force ? "force" : "normal"}`;
       if (this._childFetches.has(pendingKey)) return this._childFetches.get(pendingKey);
       const url = "/api/files/list?path=" + encodeURIComponent(path)
         + (showHidden ? "&show_hidden=true" : "");
+      const requestHeaders = this.hdr();
       const promise = (async () => {
         let r;
         try {
-          r = await fetch(url, { headers: this.hdr() });
+          r = await fetch(url, { headers: requestHeaders });
         } catch (e) {
           throw new Error(String((e && e.message) || e || "network error"));
+        }
+        if (!isOwner()) {
+          const stale = new Error("stale workspace file request");
+          stale.staleWorkspace = true;
+          throw stale;
         }
         if (!r.ok) {
           let detail = "";
           try { detail = await r.text(); } catch (_) {}
+          if (!isOwner()) {
+            const stale = new Error("stale workspace file request");
+            stale.staleWorkspace = true;
+            throw stale;
+          }
           throw new Error(detail || `HTTP ${r.status}`);
         }
         const d = await r.json();
+        if (!isOwner()) {
+          const stale = new Error("stale workspace file request");
+          stale.staleWorkspace = true;
+          throw stale;
+        }
         const entries = d.entries || [];
-        const treeOwner = opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq;
+        const treeOwner = isOwner();
         if (opts.cache !== false && treeOwner) {
           this.childCache[cacheKey] = entries;
           // LRU: keep at most 100 directory entries to prevent unbounded growth
@@ -10873,8 +11220,12 @@ function portal() {
         else await this.expand(n);
         this.savePrefs();
       } else {
-        // Single-click ⇒ ephemeral preview tab (VSCode behavior).
-        await this.openFile(n, { preview: true });
+        // Desktop single-click keeps VS Code's reusable preview slot. Phones
+        // have no reliable double-click gesture to pin that slot, so recycling
+        // it made A → B → A discard A's reading position every time. A mobile
+        // file tap therefore opens a normal closable tab; the visible tab strip
+        // and picker provide the bounded cleanup affordance.
+        await this.openFile(n, { preview: !this._isMobileLayout() });
       }
     },
     // ===== multi-select helpers =====
@@ -10956,6 +11307,10 @@ function portal() {
       }
       if (this.csvPath) this.csvPath = remap(this.csvPath);
       this._previewNeedsReload = remap(this._previewNeedsReload);
+      this.htmlPreviewFrames = this.htmlPreviewFrames.map(entry =>
+        this._pathAtOrBelow(entry.path, src)
+          ? { ...entry, path: remap(entry.path) }
+          : entry);
       this._invalidatePreviewCacheUnder(src);
       this._scheduleSavePrefs();
       return activeMoved;
@@ -10978,6 +11333,7 @@ function portal() {
       const oldIndex = oldTabs.findIndex(t => t.path === this.selected);
       const activeRemoved = removed(this.selected);
       this.tabs = oldTabs.filter(t => !removed(t.path));
+      this._dropHtmlPreviewFramesUnder(list);
       for (const root of list) this._invalidatePreviewCacheUnder(root);
       this.selectedPaths = new Set(Array.from(this.selectedPaths).filter(p => !removed(p)));
       if (removed(this.treeFocusPath)) this.treeFocusPath = "";
@@ -11021,16 +11377,22 @@ function portal() {
       // same children, corrupting the flat `visible` array. Re-check after the
       // async fetch so the loser bails out instead of inserting duplicates.
       if (this.expanded.has(n.path)) return;
+      const ownerWorkspace = opts.ownerWorkspace || this.currentWorkspacePath();
       let children;
       try {
-        children = await this.fetchChildren(n.path, { treeSeq: opts.treeSeq });
-      } catch (_e) {
-        if (!opts.quiet && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq)) {
+        children = await this.fetchChildren(n.path, {
+          treeSeq: opts.treeSeq, ownerWorkspace,
+        });
+      } catch (e) {
+        if (!opts.quiet && !e.staleWorkspace
+            && this._workspaceIsCurrent(ownerWorkspace)
+            && (opts.treeSeq == null || opts.treeSeq === this._treeLoadSeq)) {
           this.toast(this.lang === "zh"
             ? `无法展开 /${n.path}` : `Could not open /${n.path}`, "error", 3000);
         }
         return false;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return false;
       if (opts.treeSeq != null && opts.treeSeq !== this._treeLoadSeq) return false;
       if (this.expanded.has(n.path)) return;
       const idx = this.visible.findIndex(x => x.path === n.path);
@@ -11120,12 +11482,14 @@ function portal() {
           break;
         case "upload":
           this._ctxUploadDir = n.path;
+          this._ctxUploadWorkspace = this.currentWorkspacePath();
           this.$refs.ctxUpload.click();
           break;
       }
     },
     async doNewFile(dirNode) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建文件" : "New file",
         // Root has no meaningful path to show ("在 /" reads broken); a
@@ -11135,7 +11499,7 @@ function portal() {
           ? (zh ? "在 " : "Inside ") + `/${dirNode.path}` : "",
         value: "new.md",
       });
-      if (!name) return;
+      if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const path = dirNode.path ? `${dirNode.path}/${name}` : name;
       let r;
       try {
@@ -11144,18 +11508,30 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path, content: "" }),
         });
-      } catch (e) { this.errToast("create", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("create", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (r.ok) {
         delete this.childCache[dirNode.path];
-        this.reloadTree();
+        await this.reloadTree();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.toast(this.t("toast.created_name", { name }), "success");
         // 自动打开编辑
         await this.openFile({ path, name });
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         if (this.selected === path) await this.toggleEdit();
-      } else this.errToast("create", await r.text());
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("create", detail);
+      }
     },
     async doNewDir(dirNode) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const name = await this.prompt({
         title: dirNode.path
           ? (zh ? "新建子目录" : "New subdirectory")
@@ -11165,7 +11541,7 @@ function portal() {
           ? (zh ? "在 " : "Inside ") + `/${dirNode.path}` : "",
         value: "",
       });
-      if (!name) return;
+      if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const path = dirNode.path ? `${dirNode.path}/${name}` : name;
       let r;
       try {
@@ -11174,29 +11550,45 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path }),
         });
-      } catch (e) { this.errToast("create", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("create", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (r.ok) {
         delete this.childCache[dirNode.path];
-        this.reloadTree();
+        await this.reloadTree();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.toast(this.t("toast.created_dir", { name }), "success");
-      } else this.errToast("generic", await r.text());
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("generic", detail);
+      }
     },
     _ctxUploadDir: "",
+    _ctxUploadWorkspace: "",
     async ctxUploadHandler(ev) {
       const file = ev.target.files[0];
-      if (!file) return;
-      await this.uploadFileTo(this._ctxUploadDir, file);
+      const dirPath = this._ctxUploadDir;
+      const ownerWorkspace = this._ctxUploadWorkspace;
       ev.target.value = "";
       this._ctxUploadDir = "";
+      this._ctxUploadWorkspace = "";
+      if (!file || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      await this.uploadFileTo(dirPath, file);
     },
     async doRename(n) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const newName = await this.prompt({
         title: zh ? "重命名" : "Rename",
         body: (zh ? "当前路径:" : "Current path: ") + n.path,
         value: n.name,
       });
-      if (!newName || newName === n.name) return;
+      if (!newName || newName === n.name
+          || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const parent = n.path.split("/").slice(0, -1).join("/");
       const newPath = parent ? `${parent}/${newName}` : newName;
       let r;
@@ -11206,20 +11598,31 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ src: n.path, dst: newPath }),
         });
-      } catch (e) { this.errToast("rename", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("rename", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (r.ok) {
         const activeMoved = this._remapPreviewPaths(n.path, newPath);
         delete this.childCache[parent];
         await this.reloadTree();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         if (activeMoved && this.selected && !this.editing) {
           const active = this.tabs.find(t => t.path === this.selected);
           await this.openFile(
             { path: this.selected, name: this.selected.split("/").pop() },
             { preview: !!(active && active.preview), forceReload: true },
           );
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         }
         this.toast(this.t("toast.renamed"), "success");
-      } else this.errToast("rename", await r.text());
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("rename", detail);
+      }
     },
     // Look up a tree node by path in the current flat-rendered tree.
     // Returns the node object or null. Used by the Ctrl+C keyboard
@@ -11233,6 +11636,7 @@ function portal() {
     // "Copy as .bak" menu (dst_dir omitted → same-dir duplicate) and
     // the Ctrl+V paste path (dst_dir = selected directory).
     async _postCopyBak(srcPath, dstDir) {
+      const ownerWorkspace = this.currentWorkspacePath();
       const body = dstDir ? { src: srcPath, dst_dir: dstDir }
                           : { src: srcPath };
       let r;
@@ -11243,21 +11647,28 @@ function portal() {
           body: JSON.stringify(body),
         });
       } catch (e) {
-        this.toast(this.t("toast.copy_failed") + ": " + String((e && e.message) || e), "error", 4000);
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast(this.t("toast.copy_failed") + ": "
+            + String((e && e.message) || e), "error", 4000);
+        }
         return null;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return null;
       if (!r.ok) {
         const msg = await r.text();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return null;
         this.toast(this.t("toast.copy_failed") + ": " + msg, "error", 4000);
         return null;
       }
       const data = await r.json();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return null;
       // In-place tree update: only re-fetch the destination parent dir
       // (or fall back to full reload if parent isn't visible — root /
       // collapsed parent). Avoids the whole-tree flicker that the prior
       // reloadTree() caused, matching how delete + drag-to-trash
       // already optimise. The newly-created .bak appears in-place.
-      await this._refreshParentInTree(data.path);
+      await this._refreshParentInTree(data.path, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return null;
       this.toast(
         this.t("toast.copied_as_bak").replace("{name}", data.name),
         "success",
@@ -11295,6 +11706,7 @@ function portal() {
     },
     async doDelete(n) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       // Soft-delete now: backend moves the target into <ROOT>/.muselab-dustbin/
       // and returns a trash_id. Confirm copy says "move to trash" rather
       // than "permanently delete"; the prior "(only empty dirs)" caveat
@@ -11316,7 +11728,7 @@ function portal() {
         danger: false,
         okText: zh ? "移到垃圾桶" : "Move to trash",
       });
-      if (!ok) return;
+      if (!ok || !this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!this._canRemovePreviewPaths([n.path])) return;
       let r;
       try {
@@ -11325,23 +11737,33 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path: n.path }),
         });
-      } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("delete", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
         // 404 = already gone (stale tree row, or its parent dir was trashed
         // moments ago). The goal state is reached, so refresh the tree to
         // drop the phantom row rather than surfacing a "not found" error.
         if (r.status === 404) {
           await this._dropPreviewPathsUnder([n.path]);
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           await this.reloadTree();
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           this.toast(zh ? `${n.name} 已不存在，已刷新列表` : `${n.name} no longer exists — refreshed`, "info", 2500);
           return;
         }
-        this.errToast("delete", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("delete", detail);
         return;
       }
       let data = {};
       try { data = await r.json(); } catch (_) {}
       await this._dropPreviewPathsUnder([n.path]);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       // In-place tree removal: no full reload, no flicker. Helper also
       // invalidates the parent's childCache so a future re-expand fetches
       // fresh truth from disk.
@@ -11374,20 +11796,27 @@ function portal() {
       // paths that fire pre-auth (any future ones) just silently no-op
       // until login/_bootApp re-invokes us.
       if (!this.token) return;
+      const loadSeq = ++this._trashLoadSeq;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const isOwner = () => loadSeq === this._trashLoadSeq
+        && ownerWorkspace === this.currentWorkspacePath();
       this.trash.loading = true;
       try {
         const r = await fetch("/api/files/trash/list", { headers: this.hdr() });
+        if (!isOwner()) return;
         if (!r.ok) {
-          this.errToast("trash list", await r.text());
+          const detail = await r.text();
+          if (isOwner()) this.errToast("trash list", detail);
           return;
         }
         const d = await r.json();
+        if (!isOwner()) return;
         this.trash.items = d.items || [];
         this.trash.count = this.trash.items.length;
       } catch (e) {
-        this.toast(String(e.message || e), "error");
+        if (isOwner()) this.toast(String(e.message || e), "error");
       } finally {
-        this.trash.loading = false;
+        if (isOwner()) this.trash.loading = false;
       }
     },
     openTrashModal() {
@@ -11398,6 +11827,7 @@ function portal() {
       this.trash.modalOpen = false;
     },
     async restoreTrash(tid) {
+      const ownerWorkspace = this.currentWorkspacePath();
       let r;
       try {
         r = await fetch("/api/files/trash/restore", {
@@ -11407,18 +11837,24 @@ function portal() {
         });
       } catch (e) {
         const zh = this.lang === "zh";
-        this.toast((zh ? "恢复失败：" : "Restore failed: ") + String((e && e.message) || e), "error", 4500);
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast((zh ? "恢复失败：" : "Restore failed: ")
+            + String((e && e.message) || e), "error", 4500);
+        }
         return;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
         // 409 = original path occupied; surface backend detail verbatim
         let detail = "";
         try { detail = (await r.json()).detail || ""; } catch (_) {}
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         const zh = this.lang === "zh";
         this.toast(detail || (zh ? "恢复失败" : "Restore failed"), "error", 4500);
         return;
       }
       const d = await r.json();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.trash.items = this.trash.items.filter(it => it.trash_id !== tid);
       this.trash.count = Math.max(0, this.trash.count - 1);
       // Targeted refresh: re-fetch ONLY the parent dir's children + splice
@@ -11426,12 +11862,14 @@ function portal() {
       // Falls back to reloadTree internally for the root / unloaded-parent
       // edge cases.
       const restored = d.restored_path || "";
-      await this._refreshParentInTree(restored);
+      await this._refreshParentInTree(restored, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const zh = this.lang === "zh";
       this.toast(zh ? `已恢复：${restored}` : `Restored: ${restored}`, "success", 2500);
     },
     async purgeTrash(tid) {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const ok = await this.confirm({
         title: zh ? "彻底删除" : "Permanently delete",
         body: zh ? "这一项将被永久删除，无法恢复。继续？"
@@ -11439,7 +11877,7 @@ function portal() {
         danger: true,
         okText: zh ? "彻底删除" : "Delete forever",
       });
-      if (!ok) return;
+      if (!ok || !this._workspaceIsCurrent(ownerWorkspace)) return;
       let r;
       try {
         r = await fetch("/api/files/trash/purge", {
@@ -11447,9 +11885,16 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ trash_id: tid }),
         });
-      } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("delete", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
-        this.errToast("trash purge", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("trash purge", detail);
         return;
       }
       this.trash.items = this.trash.items.filter(it => it.trash_id !== tid);
@@ -11459,6 +11904,7 @@ function portal() {
     async emptyTrash() {
       const zh = this.lang === "zh";
       if (!this.trash.items.length) return;
+      const ownerWorkspace = this.currentWorkspacePath();
       const ok = await this.confirm({
         title: zh ? "清空垃圾桶" : "Empty trash",
         body: zh ? `${this.trash.items.length} 项将被永久删除，无法恢复。继续？`
@@ -11466,16 +11912,23 @@ function portal() {
         danger: true,
         okText: zh ? "清空" : "Empty",
       });
-      if (!ok) return;
+      if (!ok || !this._workspaceIsCurrent(ownerWorkspace)) return;
       let r;
       try {
         r = await fetch("/api/files/trash/empty", {
           method: "DELETE",
           headers: { ...this.hdr(), "Content-Type": "application/json" },
         });
-      } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("delete", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
-        this.errToast("trash empty", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("trash empty", detail);
         return;
       }
 
@@ -11525,6 +11978,7 @@ function portal() {
     async _trashManyPaths(paths) {
       if (!this._canRemovePreviewPaths(paths)) return;
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
           method: "DELETE",
@@ -11533,12 +11987,15 @@ function portal() {
           // 404 = already gone — count as done, not a failure.
         }).then(r => (r.ok || r.status === 404 ? p : Promise.reject(new Error(p))))
       ));
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okPaths.length;
       await this._dropPreviewPathsUnder(okPaths);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.trash.count += okPaths.length;
       this.clearTreeSelection();
       await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (failed && !okPaths.length) {
         this.toast(zh ? `${failed} 项删除失败` : `${failed} item(s) failed to delete`, "error", 4000);
       } else if (failed) {
@@ -11552,6 +12009,7 @@ function portal() {
     async _sendToTrash(path) {
       if (!this._canRemovePreviewPaths([path])) return;
       const name = path.split("/").pop() || path;
+      const ownerWorkspace = this.currentWorkspacePath();
       let r;
       try {
         r = await fetch("/api/files/delete", {
@@ -11559,22 +12017,32 @@ function portal() {
           headers: { ...this.hdr(), "Content-Type": "application/json" },
           body: JSON.stringify({ path }),
         });
-      } catch (e) { this.errToast("delete", String((e && e.message) || e)); return; }
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("delete", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
         // 404 = already gone — refresh instead of erroring (see doDelete).
         if (r.status === 404) {
           await this._dropPreviewPathsUnder([path]);
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           await this.reloadTree();
+          if (!this._workspaceIsCurrent(ownerWorkspace)) return;
           const zh = this.lang === "zh";
           this.toast(zh ? `${name} 已不存在，已刷新列表` : `${name} no longer exists — refreshed`, "info", 2500);
           return;
         }
-        this.errToast("delete", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("delete", detail);
         return;
       }
       let data = {};
       try { data = await r.json(); } catch (_) {}
       await this._dropPreviewPathsUnder([path]);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       // In-place removal — see _removeNodeFromTree for rationale.
       this._removeNodeFromTree(path);
       this.trash.count += 1;
@@ -11605,6 +12073,248 @@ function portal() {
       if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KB";
       return (n / 1024 / 1024).toFixed(1) + " MB";
     },
+    // ===== Preview-tab reading position =====
+    // Preview content is rendered through one shared pane, so changing `selected`
+    // replaces its DOM. Browser-native scroll restoration cannot help here: the
+    // old scroller never navigates, its children are simply swapped. Capture the
+    // live viewport into the outgoing file tab and restore the incoming tab only
+    // after its content has mounted. Table previews own an additional nested
+    // scroller; CSV page and XLSX sheet are part of the same reading position.
+    _previewTabViewState(path = this.selected) {
+      const tab = (this.tabs || []).find(t => t.path === path);
+      return this._sanitizePreviewViewState(tab && tab.view);
+    },
+    _previewScrollBody() {
+      return (this.$refs && this.$refs.previewBody)
+        || document.querySelector(".pane.preview .preview-body");
+    },
+    _previewInnerScrollEl(mode = this.previewMode, body = this._previewScrollBody()) {
+      if (!body) return null;
+      if (mode === "xlsx") {
+        return body.querySelector(".xlsx-preview:not(.csv-preview) .xlsx-scroll");
+      }
+      if (mode === "csv") return body.querySelector(".csv-preview .xlsx-scroll");
+      return null;
+    },
+    _htmlPreviewFrameEls(body = this._previewScrollBody()) {
+      return body ? Array.from(body.querySelectorAll("iframe[data-preview-html-path]")) : [];
+    },
+    _htmlPreviewFrameForPath(path, body = this._previewScrollBody()) {
+      if (!path) return null;
+      return this._htmlPreviewFrameEls(body).find(
+        frame => frame.dataset.previewHtmlPath === path) || null;
+    },
+    _htmlPreviewMessageOwner(source) {
+      if (!source) return "";
+      const frame = this._htmlPreviewFrameEls().find(item => item.contentWindow === source);
+      return (frame && frame.dataset.previewHtmlPath) || "";
+    },
+    // Add/bump a live HTML browsing context. Returning true tells openFile the
+    // frame was already resident, so its native DOM/scroll state should be
+    // shown as-is instead of replaying a saved-position restoration over it.
+    _touchHtmlPreviewFrame(path) {
+      if (!path) return false;
+      const lastUsed = ++this._htmlPreviewFrameClock;
+      const existing = this.htmlPreviewFrames.find(entry => entry.path === path);
+      if (existing) {
+        existing.lastUsed = lastUsed;
+        return true;
+      }
+      let next = this.htmlPreviewFrames.slice();
+      if (next.length >= this.HTML_PREVIEW_CACHE_MAX) {
+        const oldest = next.reduce((a, b) => a.lastUsed <= b.lastUsed ? a : b);
+        next = next.filter(entry => entry.path !== oldest.path);
+      }
+      this.htmlPreviewFrames = [...next, { path, lastUsed }];
+      return false;
+    },
+    _dropHtmlPreviewFramesUnder(roots) {
+      const list = (roots || []).filter(Boolean);
+      if (!list.length || !this.htmlPreviewFrames.length) return;
+      this.htmlPreviewFrames = this.htmlPreviewFrames.filter(entry =>
+        !list.some(root => this._pathAtOrBelow(entry.path, root)));
+    },
+    _previewFrameEl(mode = this.previewMode, body = this._previewScrollBody()) {
+      if (mode === "html") return this._htmlPreviewFrameForPath(this.selected, body);
+      if (mode === "pdf") return (this.$refs && this.$refs.pdfFrame)
+        || (body && body.querySelector('iframe[x-ref="pdfFrame"]'));
+      return null;
+    },
+    _capturePreviewViewState(path = this.selected) {
+      if (!path || path !== this.selected || this.editing
+          || !this.previewMode || this.previewMode === "loading") return null;
+      // In the mobile single-pane layout an inactive preview pane is
+      // display:none, which makes its scrollTop read as zero. The real value is
+      // captured synchronously by setMobileTab() before hiding; never replace it
+      // with hidden-layout geometry from savePrefs or an incoming file open.
+      if (this._isMobileLayout() && this.mobileTab !== "preview") return null;
+      // Content replacement momentarily clamps the shared scroller to zero.
+      // savePrefs() and delayed scroll events may run during that window; they
+      // must not overwrite the incoming tab's saved position before restore.
+      if (this._previewRestoringPath === path
+          && this._previewRestoringLoadSeq === this._previewLoadSeq) return null;
+      const tab = (this.tabs || []).find(t => t.path === path);
+      const body = this._previewScrollBody();
+      if (!tab || !body) return null;
+      const view = {
+        ...this._previewTabViewState(path),
+        mode: this.previewMode,
+        scrollTop: Math.max(0, Number(body.scrollTop) || 0),
+        scrollLeft: Math.max(0, Number(body.scrollLeft) || 0),
+      };
+      const inner = this._previewInnerScrollEl(this.previewMode, body);
+      if (inner) {
+        view.innerScrollTop = Math.max(0, Number(inner.scrollTop) || 0);
+        view.innerScrollLeft = Math.max(0, Number(inner.scrollLeft) || 0);
+      }
+      if (this.previewMode === "xlsx") view.xlsxActive = this.xlsxActive || "";
+      if (this.previewMode === "csv") view.csvOffset = Math.max(0, this.csvOffset || 0);
+
+      // Sandboxed HTML reports their internal viewport through postMessage.
+      // Keep the latest event outside Alpine's reactive tab array while the
+      // user is actively scrolling, then fold it into the outgoing snapshot.
+      const bridged = this._htmlPreviewFramePosition;
+      if (this.previewMode === "html" && bridged && bridged.path === path
+          && bridged.loadSeq === this._previewLoadSeq) {
+        view.frameScrollTop = bridged.top;
+        view.frameScrollLeft = bridged.left;
+      }
+
+      // Best effort for same-origin frames. Sandboxed HTML and the built-in PDF
+      // viewer commonly deny access; keep the last readable value in that case.
+      const frame = this._previewFrameEl(this.previewMode, body);
+      if (frame) {
+        try {
+          const win = frame.contentWindow;
+          const docEl = frame.contentDocument && frame.contentDocument.scrollingElement;
+          view.frameScrollTop = Math.max(0,
+            Number((win && win.scrollY) || (docEl && docEl.scrollTop)) || 0);
+          view.frameScrollLeft = Math.max(0,
+            Number((win && win.scrollX) || (docEl && docEl.scrollLeft)) || 0);
+        } catch (_) { /* sandboxed / browser-owned viewer */ }
+      }
+      const saved = this._sanitizePreviewViewState(view);
+      this.tabs = this.tabs.map(t => t.path === path ? { ...t, view: saved } : t);
+      return saved;
+    },
+    onPreviewViewportScroll() {
+      // Scroll can fire every frame on touch devices. Keep it DOM-native while
+      // moving, then snapshot once after the gesture settles so a reload also
+      // restores the active tab without churning Alpine or localStorage.
+      clearTimeout(this._previewViewSaveTimer);
+      const ownerPath = this.selected;
+      const ownerLoadSeq = this._previewLoadSeq;
+      this._previewViewSaveTimer = setTimeout(() => {
+        this._previewViewSaveTimer = null;
+        if (this.selected !== ownerPath || this._previewLoadSeq !== ownerLoadSeq) return;
+        if (!this._capturePreviewViewState(ownerPath)) return;
+        this._scheduleSavePrefs();
+      }, 160);
+    },
+    onHtmlPreviewScrollMessage(data = {}, ownerPath = this.selected) {
+      if (!ownerPath || ownerPath !== this.selected || this.previewMode !== "html") return;
+      if (this._isMobileLayout() && this.mobileTab !== "preview") return;
+      const ownerLoadSeq = this._previewLoadSeq;
+      // The iframe emits its initial zero and the programmatic restored value.
+      // Neither should replace the position that is currently being restored.
+      if (this._previewRestoringPath === ownerPath
+          && this._previewRestoringLoadSeq === ownerLoadSeq) return;
+      const top = Math.max(0, Number(data.top) || 0);
+      const left = Math.max(0, Number(data.left) || 0);
+      this._htmlPreviewFramePosition = {
+        path: ownerPath, loadSeq: ownerLoadSeq, top, left,
+      };
+      clearTimeout(this._htmlPreviewScrollSaveTimer);
+      this._htmlPreviewScrollSaveTimer = setTimeout(() => {
+        this._htmlPreviewScrollSaveTimer = null;
+        if (this.selected !== ownerPath || this._previewLoadSeq !== ownerLoadSeq) return;
+        if (!this._capturePreviewViewState(ownerPath)) return;
+        this._scheduleSavePrefs();
+      }, 160);
+    },
+    _applyPreviewModeViewState(path, savedView = null) {
+      const view = this._sanitizePreviewViewState(
+        savedView || this._previewTabViewState(path));
+      if (this.previewMode === "xlsx" && view.xlsxActive
+          && this.xlsxSheets.some(sheet => sheet.name === view.xlsxActive)) {
+        this.xlsxActive = view.xlsxActive;
+      }
+      return view;
+    },
+    _restorePreviewViewState(path, loadSeq = this._previewLoadSeq, savedView = null) {
+      if (!path || path !== this.selected || loadSeq !== this._previewLoadSeq
+          || this.editing || this.previewMode === "loading") return false;
+      const body = this._previewScrollBody();
+      if (!body) return false;
+      const view = this._applyPreviewModeViewState(path, savedView);
+      body.scrollTop = view.scrollTop;
+      body.scrollLeft = view.scrollLeft;
+      const inner = this._previewInnerScrollEl(this.previewMode, body);
+      if (inner) {
+        inner.scrollTop = view.innerScrollTop;
+        inner.scrollLeft = view.innerScrollLeft;
+      }
+      const frame = this._previewFrameEl(this.previewMode, body);
+      if (frame) {
+        const win = frame.contentWindow;
+        // Opaque-origin HTML cannot be scrolled directly, but postMessage is
+        // explicitly allowed by the sandbox and the injected child bridge
+        // validates that this message came from its parent.
+        if (this.previewMode === "html" && win) {
+          try {
+            win.postMessage({
+              __muselab: "preview-scroll-restore",
+              top: view.frameScrollTop,
+              left: view.frameScrollLeft,
+            }, "*");
+          } catch (_) { /* iframe disappeared between selection and restore */ }
+        }
+        try {
+          if (win && typeof win.scrollTo === "function") {
+            win.scrollTo(view.frameScrollLeft, view.frameScrollTop);
+          }
+        } catch (_) { /* sandboxed / browser-owned viewer */ }
+      }
+      return true;
+    },
+    _cancelPreviewViewRestore() {
+      for (const timer of this._previewViewRestoreTimers || []) clearTimeout(timer);
+      this._previewViewRestoreTimers = [];
+      this._previewRestoringPath = "";
+      this._previewRestoringLoadSeq = 0;
+    },
+    _schedulePreviewViewRestore(path, loadSeq = this._previewLoadSeq) {
+      this._cancelPreviewViewRestore();
+      const savedView = this._previewTabViewState(path);
+      this._previewRestoringPath = path;
+      this._previewRestoringLoadSeq = loadSeq;
+      const apply = () => this._restorePreviewViewState(path, loadSeq, savedView);
+      const finish = () => {
+        apply();
+        if (this._previewRestoringPath === path
+            && this._previewRestoringLoadSeq === loadSeq) {
+          this._previewRestoringPath = "";
+          this._previewRestoringLoadSeq = 0;
+        }
+      };
+      // First paint handles cached text; bounded retries cover deferred markdown,
+      // image decode, workbook x-for mount, and iframe load without a long-lived
+      // observer or per-scroll reactive writes.
+      this.$nextTick(() => requestAnimationFrame(apply));
+      this._previewViewRestoreTimers = [
+        setTimeout(apply, 80),
+        setTimeout(finish, 240),
+      ];
+    },
+    onPreviewContentLoad(mode) {
+      if (mode !== this.previewMode || !this.selected) return;
+      this._schedulePreviewViewRestore(this.selected, this._previewLoadSeq);
+    },
+    onPreviewFrameLoad(mode, ownerPath = this.selected) {
+      if (ownerPath !== this.selected) return;
+      this.onPreviewContentLoad(mode);
+    },
+
     // ===== Preview-tab content cache =====
     // Chat-session tabs cache their loaded state (tabState[id]._loaded) so
     // switching back is instant; preview tabs had no equivalent — every
@@ -11612,9 +12322,9 @@ function portal() {
     // a "loading" state even for a file already shown moments ago. This LRU
     // caches the parsed/rendered preview for md / text / xlsx so a tab switch
     // back is synchronous (no fetch, no loading flash). Bounded by entry count
-    // and a total byte budget so it can't hoard memory on huge workbooks. csv is
-    // paginated (stateful) and html/img/pdf are URL-based (already instant), so
-    // neither is cached. Invalidated on edit-save / reload / external write.
+    // and a total byte budget so it can't hoard memory on huge workbooks. CSV
+    // remains paginated; HTML has a separate four-entry live-iframe LRU above;
+    // img/pdf remain URL-based. Invalidated on save/reload/external writes.
     PREVIEW_CACHE_MAX_ENTRIES: 16,
     PREVIEW_CACHE_MAX_CHARS: 512 * 1024,   // skip caching bodies larger than this
     PREVIEW_CACHE_MAX_BYTES: 8 * 1024 * 1024,
@@ -11924,6 +12634,12 @@ function portal() {
       if (this.editing && !opts.editsConfirmed && !this._confirmLoseEdits()) {
         return false;
       }
+      // The preview DOM is shared by every file tab. Snapshot the outgoing
+      // owner's live viewport before changing `selected` or clearing content;
+      // otherwise the browser clamps the shared scroller to 0 and that reading
+      // position is irretrievable when the user comes back.
+      this._capturePreviewViewState(this.selected);
+      this._cancelPreviewViewRestore();
       // A preview has one owner: the latest open request. Abort the old
       // transport as well as invalidating its sequence so a slow A response
       // cannot land under B's header (and so mobile radios stop doing wasted
@@ -11983,6 +12699,7 @@ function portal() {
           this.tabs = [...this.tabs, { path: n.path, name, preview: false }];
         }
       }
+      const targetView = this._previewTabViewState(n.path);
       // Tear down CodeMirror while it still belongs to the old path. Updating
       // selected first makes the selected watcher briefly mount a fresh editor
       // for the new file, only for the editing watcher to tear it down again.
@@ -11993,7 +12710,7 @@ function portal() {
       this._scheduleSavePrefs();
       // Mobile: opening a file should jump to the preview pane (otherwise
       // the user is still on `files` tab and sees nothing change).
-      if (this._isMobileLayout()) this.mobileTab = "preview";
+      if (this._isMobileLayout()) this.setMobileTab("preview");
       // When many files are open, the active row/tab can end up off-screen
       // in both the Open files list (vertical scroll) and the preview tab
       // bar (horizontal scroll). Scroll the active item into view so users
@@ -12013,6 +12730,8 @@ function portal() {
         requestAnimationFrame(() => {
           if (this.selected === cachedPath && loadSeq === this._previewLoadSeq) {
             this._applyPreviewCache(cachedPrev);
+            this._applyPreviewModeViewState(cachedPath);
+            this._schedulePreviewViewRestore(cachedPath, loadSeq);
           }
         });
         return true;
@@ -12041,6 +12760,7 @@ function portal() {
       this._previewAbort = controller;
       const ext = name.split(".").pop().toLowerCase();
       let loadOk = true;
+      let reusedHtmlFrame = false;
       try {
       if (["md", "markdown"].includes(ext)) {
         // Stay in "loading" until content actually arrives — renderMd() flips
@@ -12071,6 +12791,7 @@ function portal() {
             if (body.length <= this.LARGE_MD_DEFER_CHARS) {
               this.$nextTick(() => this.highlightCode(".markdown"));
             }
+            this._schedulePreviewViewRestore(targetPath, loadSeq);
           };
           if (body.length > this.LARGE_MD_DEFER_CHARS) {
             this.previewMode = "loading";
@@ -12086,6 +12807,9 @@ function portal() {
         }
       } else if (["html", "htm"].includes(ext)) {
         // Render via sandboxed iframe (backend sends strict CSP + sandbox token).
+        // A resident frame keeps its full browsing context: DOM, script state,
+        // form controls, and scroll position all survive a tab switch.
+        reusedHtmlFrame = this._touchHtmlPreviewFrame(n.path);
         this.previewMode = "html";
       }
       else if (["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "bmp"].includes(ext)) this.previewMode = "img";
@@ -12102,7 +12826,10 @@ function portal() {
           if (_stale()) return false;
           this.previewMode = "xlsx";
           this.xlsxSheets = data.sheets || [];
-          this.xlsxActive = (this.xlsxSheets[0] && this.xlsxSheets[0].name) || "";
+          this.xlsxActive = targetView.xlsxActive
+            && this.xlsxSheets.some(sheet => sheet.name === targetView.xlsxActive)
+            ? targetView.xlsxActive
+            : ((this.xlsxSheets[0] && this.xlsxSheets[0].name) || "");
           this.xlsxLimits = data.limits || null;
           this.xlsxSheetsTruncated = !!data.sheets_truncated;
           this._previewCacheSet(n.path, {
@@ -12119,7 +12846,7 @@ function portal() {
         // file doesn't blow the browser. First page only here; "next page"
         // button is wired through csvLoadPage().
         this.csvPath = n.path;
-        const csvOk = await this.csvLoadPage(0);
+        const csvOk = await this.csvLoadPage(targetView.csvOffset);
         if (_stale()) return false;
         if (csvOk && this.csvData) {
           this.previewMode = "csv";
@@ -12176,6 +12903,10 @@ function portal() {
       if (loadOk && this.selected === targetPath && loadSeq === this._previewLoadSeq
           && this._previewNeedsReload === targetPath) {
         this._previewNeedsReload = "";
+      }
+      if (this.selected === targetPath && loadSeq === this._previewLoadSeq
+          && !(this.previewMode === "html" && reusedHtmlFrame)) {
+        this._schedulePreviewViewRestore(targetPath, loadSeq);
       }
       return loadOk;
     },
@@ -12320,7 +13051,7 @@ function portal() {
       const interactive = opts.mode !== "background";
       if (interactive) {
         if (this.searchMode) this.clearSearch();
-        if (this._isMobileLayout()) this.mobileTab = "files";
+        if (this._isMobileLayout()) this.setMobileTab("files");
       }
       const parts = path.split("/");
       parts.pop();   // drop the filename, keep only directory chain
@@ -12356,6 +13087,7 @@ function portal() {
       // Closing the tab being edited would discard unsaved changes — confirm.
       if (this.editing && path === this.selected && !this._confirmLoseEdits()) return;
       this.tabs = this.tabs.filter(t => t.path !== path);
+      this._dropHtmlPreviewFramesUnder([path]);
       if (this.selected === path) {
         // 关掉的是当前 tab，切到旁边
         if (this.tabs.length === 0) {
@@ -12378,6 +13110,14 @@ function portal() {
     _clearPreviewState() {
       if (this._previewAbort) this._previewAbort.abort();
       if (this._csvAbort) this._csvAbort.abort();
+      clearTimeout(this._previewViewSaveTimer);
+      this._previewViewSaveTimer = null;
+      clearTimeout(this._htmlPreviewScrollSaveTimer);
+      this._htmlPreviewScrollSaveTimer = null;
+      this._htmlPreviewFramePosition = null;
+      this.htmlPreviewFrames = [];
+      this._htmlPreviewFrameClock = 0;
+      this._cancelPreviewViewRestore();
       this._previewAbort = null;
       this._csvAbort = null;
       ++this._previewLoadSeq;
@@ -12424,14 +13164,20 @@ function portal() {
     // switched files, so only apply if `path` is still the selected one. A
     // failed/404 stat clears the strip rather than showing stale numbers.
     async loadSelectedMeta(path) {
+      const loadSeq = ++this._selectedMetaSeq;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const isOwner = () => loadSeq === this._selectedMetaSeq
+        && ownerWorkspace === this.currentWorkspacePath()
+        && this.selected === path;
       if (!path) { this.selectedMeta = null; return; }
       try {
         const r = await fetch("/api/files/stat?path=" + encodeURIComponent(path),
                               { headers: this.hdr() });
-        if (!r.ok) { if (this.selected === path) this.selectedMeta = null; return; }
+        if (!isOwner()) return;
+        if (!r.ok) { this.selectedMeta = null; return; }
         const d = await r.json();
-        if (this.selected === path) this.selectedMeta = d;
-      } catch { if (this.selected === path) this.selectedMeta = null; }
+        if (isOwner()) this.selectedMeta = d;
+      } catch { if (isOwner()) this.selectedMeta = null; }
     },
     // Format a unix-seconds mtime as "YYYY-MM-DD HH:mm" in local time for the
     // preview-header strip. Returns "" for a falsy timestamp.
@@ -12453,12 +13199,14 @@ function portal() {
 
     rawUrl(p, opts = {}) {
       const v = this.previewVersion ? `&_v=${this.previewVersion}` : "";
-      // preview=1 asks the backend to inject the click-to-zoom bridge into
-      // HTML (see files.py). Only the html preview iframe passes it; images /
-      // pdf / downloads stream untouched.
+      const workspace = this.currentWorkspacePath();
+      const ws = workspace ? "&workspace=" + encodeURIComponent(workspace) : "";
+      // preview=1 asks the backend to inject the image + scroll bridge into
+      // HTML (see files.py). Only the html preview iframe passes it; images,
+      // PDFs, and downloads stream untouched.
       const pv = opts.preview ? "&preview=1" : "";
       return "/api/files/raw?path=" + encodeURIComponent(p)
-              + "&token=" + encodeURIComponent(this.token) + v + pv;
+              + "&token=" + encodeURIComponent(this.token) + ws + v + pv;
     },
     async reloadPreview() {
       // Manual "🗘 reload" button in preview header. Bumps previewVersion
@@ -12513,7 +13261,7 @@ function portal() {
     resetPreviewZoom() { this.setPreviewZoom(1); },
     previewZoomPct() { return Math.round(this.previewZoom * 100) + "%"; },
 
-    async _maybeReloadPreview(toolFilePath) {
+    async _maybeReloadPreview(toolFilePath, ownerWorkspace = "") {
       // Called from the tool_use SSE handler when a write-style tool fires.
       // Refresh the preview pane if the tool's target path matches what's
       // currently being previewed. Path matching is by basename + suffix
@@ -12521,6 +13269,7 @@ function portal() {
       // false-positives across same-named files in different dirs are
       // acceptable (we'd over-refresh, which is harmless) vs missing a real
       // hit by being too strict on path normalization.
+      if (ownerWorkspace && ownerWorkspace !== this.currentWorkspacePath()) return;
       if (!this.selected || !toolFilePath) return;
       const path = this.selected;
       const selBase = path.split("/").pop();
@@ -12549,7 +13298,12 @@ function portal() {
       // A tool just wrote this file → its mtime moved; refresh the strip.
       this.loadSelectedMeta(path);
     },
-    downloadUrl(p) { return "/api/files/download?path=" + encodeURIComponent(p) + "&token=" + encodeURIComponent(this.token); },
+    downloadUrl(p) {
+      const workspace = this.currentWorkspacePath();
+      const ws = workspace ? "&workspace=" + encodeURIComponent(workspace) : "";
+      return "/api/files/download?path=" + encodeURIComponent(p)
+        + "&token=" + encodeURIComponent(this.token) + ws;
+    },
 
     iconRef(n) {
       if (n.is_dir) return "#i-folder";
@@ -13499,6 +14253,7 @@ function portal() {
       // the upload button silently uploaded just the first one.
       const files = Array.from(ev.target.files || []);
       if (!files.length) return;
+      const ownerWorkspace = this.currentWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite("", files);
       if (!uploadContext) {
         ev.target.value = "";
@@ -13507,10 +14262,22 @@ function portal() {
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet("", f))
       );
+      if (!this._workspaceIsCurrent(ownerWorkspace)) {
+        ev.target.value = "";
+        return;
+      }
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
       await this.reloadTree();
-      await this._syncUploadedFiles(results, uploadContext);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) {
+        ev.target.value = "";
+        return;
+      }
+      await this._syncUploadedFiles(results, uploadContext, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) {
+        ev.target.value = "";
+        return;
+      }
       if (failed && !ok) {
         this.toast(this.lang === "zh"
           ? `${failed} 个文件上传失败`
@@ -13531,6 +14298,7 @@ function portal() {
       ev.target.value = "";
     },
     async uploadFileTo(dirPath, file) {
+      const ownerWorkspace = this.currentWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite(dirPath, [file]);
       if (!uploadContext) return;
       const fd = new FormData();
@@ -13540,21 +14308,29 @@ function portal() {
       try {
         r = await fetch("/api/files/upload", { method: "POST", headers: this.hdr(), body: fd });
       } catch (e) {
-        this.errToast("upload", String((e && e.message) || e));
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("upload", String((e && e.message) || e));
+        }
         return;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (r.ok) {
         delete this.childCache[dirPath];
         const data = await r.json().catch(() => ({}));
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         await this._refreshParentInTree(
-          data.path || (dirPath ? `${dirPath}/${file.name}` : file.name));
+          data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
+          ownerWorkspace,
+        );
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         await this._syncUploadedFiles([{
           status: "fulfilled",
           value: {
             path: data.path || (dirPath ? `${dirPath}/${file.name}` : file.name),
             replaced_trash_id: data.replaced_trash_id || null,
           },
-        }], uploadContext);
+        }], uploadContext, ownerWorkspace);
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         // Backend trashes any same-name file it replaced; tell the user so a
         // silent overwrite isn't mistaken for a clean upload.
         if (data.replaced_trash_id) {
@@ -13563,7 +14339,8 @@ function portal() {
           this.toast(this.t("toast.uploaded_to", { name: file.name, dir: dirPath || "" }), "success");
         }
       } else {
-        this.errToast("upload", await r.text());
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("upload", detail);
       }
     },
     // Custom MIME so tree-internal drags don't collide with OS file drops.
@@ -13722,17 +14499,23 @@ function portal() {
     // multi-file drop doesn't serialize.
     async _uploadFilesToDir(targetDir, files) {
       if (!files.length) return;
+      const ownerWorkspace = this.currentWorkspacePath();
       const uploadContext = this._prepareUploadOverwrite(targetDir, files);
       if (!uploadContext) return;
       const results = await Promise.allSettled(
         files.map(f => this._uploadFileQuiet(targetDir, f))
       );
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const ok = results.filter(r => r.status === "fulfilled" && r.value).length;
       const failed = results.length - ok;
       const firstUploaded = results.find(r =>
         r.status === "fulfilled" && r.value && r.value.path);
-      if (firstUploaded) await this._refreshParentInTree(firstUploaded.value.path);
-      await this._syncUploadedFiles(results, uploadContext);
+      if (firstUploaded) {
+        await this._refreshParentInTree(firstUploaded.value.path, ownerWorkspace);
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      }
+      await this._syncUploadedFiles(results, uploadContext, ownerWorkspace);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const intoLabel = targetDir ? `/${targetDir}` : "/";
       if (failed && !ok) {
         this.toast(this.lang === "zh"
@@ -13785,6 +14568,7 @@ function portal() {
     },
     async moveTreeItem(srcPath, targetDir) {
       if (!srcPath) return;
+      const ownerWorkspace = this.currentWorkspacePath();
       const srcName = srcPath.split("/").pop();
       const srcParent = srcPath.split("/").slice(0, -1).join("/");
       // Same-parent drop = no-op (user dragged a file inside its own
@@ -13809,12 +14593,16 @@ function portal() {
           body: JSON.stringify({ src: srcPath, dst: newPath }),
         });
       } catch (e) {
-        this.toast((this.lang === "zh" ? "移动失败：" : "Move failed: ")
-          + String((e && e.message) || e), "error", 4000);
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.toast((this.lang === "zh" ? "移动失败：" : "Move failed: ")
+            + String((e && e.message) || e), "error", 4000);
+        }
         return;
       }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) {
         const err = await r.text();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.toast((this.lang === "zh" ? "移动失败：" : "Move failed: ") + err,
           "error", 4000);
         return;
@@ -13824,12 +14612,14 @@ function portal() {
         : `Moved to /${targetDir || "(root)"}`, "success", 2000);
       const activeMoved = this._remapPreviewPaths(srcPath, newPath);
       await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (activeMoved && this.selected && !this.editing) {
         const active = this.tabs.find(t => t.path === this.selected);
         await this.openFile(
           { path: this.selected, name: this.selected.split("/").pop() },
           { preview: !!(active && active.preview), forceReload: true },
         );
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       }
     },
     // Batch move: drag a multi-selection onto a folder (or the root bar).
@@ -13839,10 +14629,12 @@ function portal() {
     // open tabs ONCE. No backend batch endpoint — same parallel-then-refresh
     // pattern as _uploadFilesToDir.
     async moveTreeItems(srcPaths, targetDir) {
+      const ownerWorkspace = this.currentWorkspacePath();
       const list = this._pruneDescendants((srcPaths || []).filter(Boolean));
       if (!list.length) return;
       if (list.length === 1) {
         await this.moveTreeItem(list[0], targetDir);
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
         this.clearTreeSelection();
         return;
       }
@@ -13862,6 +14654,7 @@ function portal() {
           body: JSON.stringify({ src: p.src, dst: p.dst }),
         }).then(r => (r.ok ? p : Promise.reject(new Error(p.src))))
       ));
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const okItems = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okItems.length;
       // Reroute the active focus + every descendant open tab for moved dirs.
@@ -13871,12 +14664,14 @@ function portal() {
       }
       this.clearTreeSelection();
       await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (activeMoved && this.selected && !this.editing) {
         const active = this.tabs.find(t => t.path === this.selected);
         await this.openFile(
           { path: this.selected, name: this.selected.split("/").pop() },
           { preview: !!(active && active.preview), forceReload: true },
         );
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       }
       const zh = this.lang === "zh";
       const into = targetDir ? `/${targetDir}` : (zh ? "/(根)" : "/(root)");
@@ -13896,6 +14691,7 @@ function portal() {
     // sync tabs. No per-item Undo for batches — items are still recoverable
     // from the trash modal.
     async deleteSelected() {
+      const ownerWorkspace = this.currentWorkspacePath();
       const paths = this._pruneDescendants(Array.from(this.selectedPaths));
       if (paths.length <= 1) {
         const p = paths[0] || this.treeFocusPath || this.selected;
@@ -13910,7 +14706,7 @@ function portal() {
                  : `Move ${paths.length} selected items to trash? Recoverable from the trash.`,
         okText: zh ? "移到垃圾桶" : "Move to trash",
       });
-      if (!ok) return;
+      if (!ok || !this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!this._canRemovePreviewPaths(paths)) return;
       const results = await Promise.allSettled(paths.map(p =>
         fetch("/api/files/delete", {
@@ -13921,12 +14717,15 @@ function portal() {
           // in the same batch) — count it as done, not a failure.
         }).then(r => (r.ok || r.status === 404 ? p : Promise.reject(new Error(p))))
       ));
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       const okPaths = results.filter(r => r.status === "fulfilled").map(r => r.value);
       const failed = results.length - okPaths.length;
       await this._dropPreviewPathsUnder(okPaths);
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.trash.count += okPaths.length;
       this.clearTreeSelection();
       await this.reloadTree();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (failed && !okPaths.length) {
         this.toast(zh ? `${failed} 项删除失败` : `${failed} item(s) failed to delete`, "error", 4000);
       } else if (failed) {
@@ -14041,20 +14840,36 @@ function portal() {
     },
     async mkdirPrompt() {
       const zh = this.lang === "zh";
+      const ownerWorkspace = this.currentWorkspacePath();
       const name = await this.prompt({
         title: zh ? "新建目录" : "New directory",
         body: zh ? "输入相对根的路径，例如 archives/2026"
                  : "Path relative to root, e.g. archives/2026",
         placeholder: "archives/2026",
       });
-      if (!name) return;
-      const r = await fetch("/api/files/mkdir", {
-        method: "POST",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ path: name }),
-      });
-      if (r.ok) { this.reloadTree(); this.toast(this.t("toast.created"), "success"); }
-      else this.errToast("generic", await r.text());
+      if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
+      let r;
+      try {
+        r = await fetch("/api/files/mkdir", {
+          method: "POST",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: name }),
+        });
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("create", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      if (r.ok) {
+        await this.reloadTree();
+        if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+        this.toast(this.t("toast.created"), "success");
+      } else {
+        const detail = await r.text();
+        if (this._workspaceIsCurrent(ownerWorkspace)) this.errToast("generic", detail);
+      }
     },
 
     // ===== edit =====
@@ -14386,6 +15201,7 @@ function portal() {
       }
       if (!this.selected) return;
       const targetPath = this.selected;
+      const ownerWorkspace = this.currentWorkspacePath();
       const targetMode = this.previewMode;
       // Entering the editor takes ownership of the file body. Cancel any
       // preview/CSV transport and invalidate deferred markdown rendering so it
@@ -14407,23 +15223,30 @@ function portal() {
           r = await fetch("/api/files/read?path=" + encodeURIComponent(targetPath),
                           { headers: this.hdr() });
         } catch (e) {
-          if (this.selected === targetPath) this.errToast("read", String((e && e.message) || e));
+          if (this._workspaceIsCurrent(ownerWorkspace)
+              && this.selected === targetPath) {
+            this.errToast("read", String((e && e.message) || e));
+          }
           return;
         }
-        if (this.selected !== targetPath) return;
+        if (!this._workspaceIsCurrent(ownerWorkspace)
+            || this.selected !== targetPath) return;
         if (!r.ok) {
           const detail = await r.text();
-          if (this.selected !== targetPath) return;
+          if (!this._workspaceIsCurrent(ownerWorkspace)
+              || this.selected !== targetPath) return;
           this.errToast("read", this.lang === "zh"
                                   ? "可能是二进制或太大 — " + detail
                                   : "binary or too large — " + detail);
           return;
         }
         const body = await r.text();
-        if (this.selected !== targetPath) return;
+        if (!this._workspaceIsCurrent(ownerWorkspace)
+            || this.selected !== targetPath) return;
         this.rawText = body;
       }
-      if (this.selected !== targetPath) return;
+      if (!this._workspaceIsCurrent(ownerWorkspace)
+          || this.selected !== targetPath) return;
       this.editText = this.rawText;
       // Live-preview setup: markdown files get the split pane; others edit
       // full-width (editorView forced to "edit" so the template hides the
@@ -14463,6 +15286,7 @@ function portal() {
         // rawText sync) reads this.editText, so refresh it first.
         if (!this.selected) return;
         const savePath = this.selected;
+        const ownerWorkspace = this.currentWorkspacePath();
         const saveMode = this.previewMode;
         const saveLang = this.previewLang;
         const saveText = this._cm ? this._cm.getValue() : this.editText;
@@ -14476,25 +15300,25 @@ function portal() {
           });
         } catch (e) {
           // Keep editing=true so the unsaved buffer is preserved for retry.
-          this.errToast("save", String((e && e.message) || e));
+          if (this._workspaceIsCurrent(ownerWorkspace)
+              && this.selected === savePath) {
+            this.errToast("save", String((e && e.message) || e));
+          }
           return;
         }
         if (r.ok) {
-          this._previewCacheDel(savePath);
-          if (this._previewNeedsReload === savePath) this._previewNeedsReload = "";
           // The user can keep typing while the request is in flight. Compare
           // the live buffer with the exact payload that reached disk before
           // deciding whether it is safe to close the editor.
-          const sameOwner = this.selected === savePath;
+          const sameOwner = this._workspaceIsCurrent(ownerWorkspace)
+            && this.selected === savePath;
           const liveText = sameOwner && this.editing
             ? (this._cm ? this._cm.getValue() : this.editText)
             : saveText;
           const hasNewerEdits = sameOwner && liveText !== saveText;
-          if (!sameOwner) {
-            this.previewVersion = Date.now();
-            this.toast(this.t("toast.saved"), "success");
-            return;
-          }
+          if (!sameOwner) return;
+          this._previewCacheDel(savePath);
+          if (this._previewNeedsReload === savePath) this._previewNeedsReload = "";
           this.rawText = saveText;
           // Keep the preview cache in step with the just-saved body. For md/text
           // we can refresh in place; other modes (xlsx/html/img/pdf) just drop
@@ -14532,7 +15356,11 @@ function portal() {
             ? (this.lang === "zh" ? "已保存；之后输入的改动仍待保存"
                                   : "Saved; newer edits are still unsaved")
             : this.t("toast.saved"), "success", hasNewerEdits ? 3000 : 2000);
-        } else this.errToast("save", await r.text());
+        } else {
+          const detail = await r.text();
+          if (this._workspaceIsCurrent(ownerWorkspace)
+              && this.selected === savePath) this.errToast("save", detail);
+        }
       } finally {
         this._saveEditInFlight = false;
       }
@@ -14545,7 +15373,7 @@ function portal() {
       if (this.$refs.chatInput) this.$refs.chatInput.focus();
       this.toast(this.t("toast.mention_added", { path }), "success", 1500);
       // Mobile: @ mention is a chat-side action, jump to the chat pane
-      if (this._isMobileLayout()) this.mobileTab = "chat";
+      if (this._isMobileLayout()) this.setMobileTab("chat");
     },
     autoGrow(ta) {
       // Grow to fit content up to max. The hard problem: iOS Safari
@@ -14728,7 +15556,7 @@ function portal() {
         }
         case "resume": {
           if (!arg) {
-            const list = (this.sessions || []).slice(0, 10)
+            const list = this.workspaceSessions().slice(0, 10)
               .map(s => {
                 const turns = s.turn_count ?? Math.floor((s.message_count || 0) / 2);
                 return `- **${s.name}** (${turns}t, ${s.id.slice(0, 8)})`;
@@ -14737,10 +15565,9 @@ function portal() {
             return;
           }
           const q = arg.toLowerCase();
-          const hit = (this.sessions || []).find(s =>
+          const hit = this.workspaceSessions().find(s =>
             s.id.startsWith(arg) || s.name.toLowerCase().includes(q));
           if (!hit) { this.toast(this.t("slash.resume_no_match"), "warn", 2000); return; }
-          this._enterSingleChat();
           await this.openTab(hit.id);
           this.toast(this.t("slash.resumed", { name: hit.name }), "success", 1500);
           return;
@@ -15007,24 +15834,39 @@ function portal() {
     },
 
     async quickNewNote() {
+      const ownerWorkspace = this.currentWorkspacePath();
       const name = await this.prompt({
         title: this.t("preview.new_note_title"),
         body: this.t("preview.new_note_body"),
         value: "untitled.md",
       });
-      if (!name) return;
+      if (!name || !this._workspaceIsCurrent(ownerWorkspace)) return;
       const trimmed = name.trim();
       if (!trimmed) return;
-      // Create empty file at archive root
-      const r = await fetch("/api/files/write", {
-        method: "PUT",
-        headers: { ...this.hdr(), "Content-Type": "application/json" },
-        body: JSON.stringify({ path: trimmed, content: "# " + trimmed.replace(/\.md$/, "") + "\n\n" }),
-      });
+      // Create empty file at archive root.
+      let r;
+      try {
+        r = await fetch("/api/files/write", {
+          method: "PUT",
+          headers: { ...this.hdr(), "Content-Type": "application/json" },
+          body: JSON.stringify({ path: trimmed, content: "# " + trimmed.replace(/\.md$/, "") + "\n\n" }),
+        });
+      } catch (e) {
+        if (this._workspaceIsCurrent(ownerWorkspace)) {
+          this.errToast("create", String((e && e.message) || e));
+        }
+        return;
+      }
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       if (!r.ok) { this.toast(this.t("slash.failed"), "error"); return; }
       await this.loadRoot();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       await this.openFile({ path: trimmed, name: trimmed });
-      this.editing = true;
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
+      // Seed editText / CodeMirror from the newly-read body. Flipping the flag
+      // directly reused the previous file's editor buffer on some paths.
+      if (this.selected === trimmed) await this.toggleEdit();
+      if (!this._workspaceIsCurrent(ownerWorkspace)) return;
       this.toast(this.t("toast.saved"), "success", 1200);
     },
 
@@ -15408,17 +16250,10 @@ function portal() {
     },
     _chatPaneScope(sid = this.currentId) {
       return sid
-        ? `.chat-grid-pane[data-pane-id="${CSS.escape(sid)}"]`
+        ? `.chat-session-pane[data-pane-id="${CSS.escape(sid)}"]`
         : ".chat-body";
     },
     _chatScrollEl(sid = this.currentId) {
-      const visible = this.visibleChatPaneIds();
-      if (visible.length > 1 && sid) {
-        if (!visible.includes(sid)) return null;
-        const pane = document.querySelector(
-          `.chat-grid-pane[data-pane-id="${CSS.escape(sid)}"] .msg-pane`);
-        return pane || null;
-      }
       if (sid && sid !== this.currentId) return null;
       return this.$refs.chatBody || null;
     },
@@ -15553,10 +16388,9 @@ function portal() {
       let stable = 0;
       const step = () => {
         if (owner._settleToken !== myToken) return; // superseded; newer settle owns the flag
-        // In single view all sessions share `.chat-body`. Stop a previous
-        // tab's settle loop as soon as that session is no longer visible;
-        // visible split panes keep their independent scrollers and continue.
-        if (!this.visibleChatPaneIds().includes(sid)) {
+        // All sessions share `.chat-body`. Stop a previous tab's settle loop as
+        // soon as that session is no longer visible.
+        if (sid !== this.currentId) {
           owner._autoScrolling = false;
           return;
         }
@@ -15660,6 +16494,13 @@ function portal() {
     },
 
     async send(opts = {}) {
+      // While the application-level workspace is changing, currentId still
+      // names the previous directory for a brief load window. The composer is
+      // disabled in the template, and this entry guard also covers keyboard
+      // handlers/programmatic user sends so nothing can be ambiguously routed
+      // to that hidden session. Internal reconnects and an already-owned queue
+      // drain remain session-pinned and may continue safely in the background.
+      if (this.workspaceSwitching && !opts.reconnect && !opts.resumedItem) return;
       const requestedSid = opts.sessionId || this.currentId;
       const pendingCreate = this._sessionCreatePromises[requestedSid];
       if (pendingCreate) {
@@ -15712,6 +16553,14 @@ function portal() {
         ? this.permission : ((sendMeta && sendMeta.permission) || "default");
       const sendEffort = sendSid === this.currentId
         ? (this.effort || "") : ((sendMeta && sendMeta.effort) || "");
+      const requestedServiceTier = sendSid === this.currentId
+        ? (this.fastModeEnabled ? this._fastServiceTier(sendModel) : "")
+        : ((sendMeta && sendMeta.service_tier) || "");
+      // A catalog update or model switch can remove Fast support while a tab
+      // is in the background. Never send an unsupported tier merely because a
+      // stale session mirror still says `fast`.
+      const sendServiceTier = this._canonicalServiceTier(
+        requestedServiceTier, sendModel);
       // Reconnect mode: skip user-input validation + user-msg push.
       // Used by _reconnectActiveTurn() when loadSession discovers an
       // in-flight background turn on the current session — we just want
@@ -15843,6 +16692,7 @@ function portal() {
           modelProvider: this._modelProvider(sendModel),
           permission: sendPermission,
           effort: sendEffort,
+          serviceTier: sendServiceTier,
         });
         if (!ok) return;
         clearSubmittedComposer();
@@ -15956,7 +16806,11 @@ function portal() {
       // from `this.currentId` here. That was the bug.
       const streamSid = sendSid;
       const streamState = sendState;
+      const streamSession = this.sessions.find(s => s.id === streamSid);
+      const primaryWorkspace = (this.sessionWorkspaces.find(w => w.primary) || {}).path || "";
+      const streamWorkspace = (streamSession && streamSession.cwd) || primaryWorkspace;
 
+      if (!isReconnect) streamState._serverActiveObserved = false;
       streamState.streaming = true;
       if (streamSid === this.currentId) this.streaming = true;
       // A live turn renders DIRECTLY into the visible pane, so it must never be
@@ -15979,11 +16833,9 @@ function portal() {
         this.messagesReady = true;
         this.messagesLoading = false;
       }
-      // [resident-panes] A tab with a live stream must stay mounted even if the
-      // user tabs away — its bubbles are being written by the SSE handlers below.
-      // Promote it now (streamState.streaming is already true, so the LRU's
-      // streaming guard will refuse to evict it). When streamSid === currentId
-      // (the common case) this is a harmless re-promote of the front entry.
+      // Keep the newly-active transcript warm. If it is later evicted from the
+      // resident DOM, SSE handlers still write to its session-owned state and
+      // the keyed pane rebuilds from that data when the user returns.
       this._promoteResident(streamSid);
       streamState.streamingModel = sendModel;
       // 锁定 — pending bubble 用它，不跟着 dropdown。只在 streamSid 仍是当前
@@ -16068,6 +16920,7 @@ function portal() {
             model_provider: this._modelProvider(sendModel),
             permission: sendPermission,
             effort: sendEffort,
+            service_tier: sendServiceTier,
             image_ids: attachIds.length ? attachIds.join(",") : "",
             source_device_kind: this._pushDeviceKind(),
           }),
@@ -16173,14 +17026,20 @@ function portal() {
       // from disk). Reconnect is idempotent (broadcast replay), so a false
       // trigger only costs a reconnect, never data.
       streamState._lastSseActivity = Date.now();
-      const _bumpSse = () => { streamState._lastSseActivity = Date.now(); };
+      const _bumpSse = (ev) => {
+        streamState._lastSseActivity = Date.now();
+        if (ev && ev.type !== "ping" && ev.type !== "error") {
+          streamState._serverActiveObserved = true;
+        }
+      };
       ["text", "thinking", "tool_use", "tool_result", "rate_limit", "ping",
        "done", "error"].forEach(
         t => es.addEventListener(t, _bumpSse));
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
       streamState._stallWatch = setInterval(() => {
         if (!streamState.streaming) return;
-        if (Date.now() - (streamState._lastSseActivity || 0) > 40000) {
+        const silentMs = Date.now() - (streamState._lastSseActivity || 0);
+        if (silentMs > 40000 && !streamState._streamHealthProbe) {
           // 40s of total silence (server pings every 15s → ≥2 missed) means
           // the connection is dead in a way onerror never caught. Tear down
           // the watchdog and drive the existing reconnect logic via a
@@ -16188,6 +17047,8 @@ function portal() {
           clearInterval(streamState._stallWatch);
           streamState._stallWatch = null;
           try { es.dispatchEvent(new Event("error")); } catch (_) {}
+        } else if (silentMs > 18000) {
+          this._recoverStalledStream(streamSid);
         }
       }, 10000);
 
@@ -16199,12 +17060,11 @@ function portal() {
       let curBubble = null;
       let acc = "";
       const modelForBubble = sendModel;
-      // Every visible grid pane follows its own stream independently. Hidden
-      // tabs remain untouched, and a user scroll-up disables follow only for
-      // that pane via streamState.atBottom.
+      // Only the selected session follows its stream. Hidden tabs retain their
+      // state, and a user scroll-up disables follow via streamState.atBottom.
       // SSE can deliver dozens of thinking/tool deltas in one burst. A direct
       // scrollToBottom call per event queues the same scrollHeight layout read
-      // dozens of times and is especially costly in four-pane mode. Coalesce
+      // dozens of times. Coalesce
       // every stream event family behind one ~frame-rate-independent cadence;
       // final flushes still pin immediately.
       const STREAM_SCROLL_INTERVAL = 80;
@@ -16216,7 +17076,7 @@ function portal() {
           pendingScrollTimer = null;
         }
         lastStreamScroll = Date.now();
-        if (!this.visibleChatPaneIds().includes(streamSid)) return;
+        if (streamSid !== this.currentId) return;
         // Mid-stream DOM cap (root-cause fix for the mobile freeze on long
         // turns). _capLiveMessages otherwise only runs at user-send, so a
         // SINGLE long agentic turn — dozens of thinking / tool_use /
@@ -16414,7 +17274,7 @@ function portal() {
         if (["Edit", "Write", "MultiEdit", "NotebookEdit"].includes(d.name)) {
           const fp = (d.input && (d.input.file_path
                                     || d.input.notebook_path)) || "";
-          this._maybeReloadPreview(fp);
+          this._maybeReloadPreview(fp, streamWorkspace);
         }
 
         _scheduleScroll();
@@ -16543,6 +17403,7 @@ function portal() {
       const _markDone = (cancelled = false, timing = {}) => {
         streamState.streaming = false;
         streamState.es = null;
+        streamState._serverActiveObserved = false;
         // If the user is on a different tab when this turn lands, flag
         // unread so the tab strip can show a green dot. Doing it inside
         // _markDone covers every termination path (done / error /
@@ -16713,7 +17574,7 @@ function portal() {
         streamState._seenUpdated = undefined;
         if (streamSid === this.currentId) this._openSeenUpdated = undefined;
         this.refreshSessions();
-        if (this.visibleChatPaneIds().includes(streamSid)) {
+        if (streamSid === this.currentId) {
           // highlightCode resolves AFTER syntax highlight + artifact render
           // (mermaid / HTML preview iframes), which can grow the tail block's
           // height seconds past the last text chunk. The streaming auto-follow
@@ -16722,10 +17583,9 @@ function portal() {
           // the final layout settles. Gated on atBottom so a user who scrolled
           // up to read history isn't yanked back down.
           this.$nextTick(() => {
-            const selector = `.chat-grid-pane[data-pane-id="${CSS.escape(streamSid)}"]`;
+            const selector = `.chat-session-pane[data-pane-id="${CSS.escape(streamSid)}"]`;
             this.highlightCode(selector).then(() => {
-              if (this.visibleChatPaneIds().includes(streamSid)
-                  && streamState.atBottom !== false) {
+              if (streamSid === this.currentId && streamState.atBottom !== false) {
                 this.scrollToBottom(true, streamSid);
               }
             });
@@ -16791,7 +17651,7 @@ function portal() {
         if (serverError === "no active turn") {
           es.close(); _markDone(); _stopTimer();
           this.loadSession(streamSid, {
-            quiet: this.visibleChatPaneIds().includes(streamSid),
+            quiet: streamSid === this.currentId,
           }).then(() => {
             this.$nextTick(() => this._drainPendingQueue(streamSid));
           });
@@ -16861,7 +17721,7 @@ function portal() {
           // _checkActiveTurn(streamSid) re-attaches (or loads the finished
           // reply from disk). Only the timer is stopped — it writes
           // root-level streamElapsed which is now another tab's display.
-          if (!this.visibleChatPaneIds().includes(streamSid)) {
+          if (streamSid !== this.currentId) {
             _stopTimer();
             streamState.streaming = false;
             streamState.es = null;
@@ -16879,7 +17739,7 @@ function portal() {
               // Backend turn already finished while we were disconnected.
               // Refresh session from disk to pick up the completed reply.
               _markDone(); _stopTimer();
-              if (this.visibleChatPaneIds().includes(streamSid)) {
+              if (streamSid === this.currentId) {
                 this.loadSession(streamSid, { quiet: true });
               }
               streamState._reconnectAttempts = 0;
@@ -16916,7 +17776,7 @@ function portal() {
               // Schedule next retry ourselves since no new ES error will fire.
               streamState._reconnectTimer = setTimeout(() => {
                 streamState._reconnectTimer = null;
-                if (!this.visibleChatPaneIds().includes(streamSid)) {
+                if (streamSid !== this.currentId) {
                   _stopTimer();
                   streamState.streaming = false;
                   streamState.es = null;
@@ -17502,28 +18362,39 @@ function portal() {
     async _fetchPaletteFiles() {
       const q = this.palette.query.trim();
       if (q.length < 2) {
+        ++this._paletteFileSeq;
         this.palette.fileResults = [];
         this.palette.fileQuery = "";
+        this.palette.fileLoading = false;
         return;
       }
       if (q === this.palette.fileQuery) return;
+      const requestSeq = ++this._paletteFileSeq;
       this.palette.fileQuery = q;
       this.palette.fileLoading = true;
+      const ownerWorkspace = this.currentWorkspacePath();
+      const isOwner = () => requestSeq === this._paletteFileSeq
+        && this._workspaceIsCurrent(ownerWorkspace)
+        && this.palette.query.trim() === q;
       try {
         const r = await fetch(
           "/api/files/search?q=" + encodeURIComponent(q) + "&limit=30",
           { headers: this.hdr() });
+        if (!isOwner()) return;
         if (!r.ok) { this.palette.fileResults = []; return; }
         const data = await r.json();
         // Race: only commit if the user hasn't typed something else since
         // we kicked off this request.
-        if (this.palette.query.trim() === q) {
+        if (isOwner()) {
           this.palette.fileResults = (data.entries || []).filter(n => !n.is_dir);
         }
       } catch {
-        this.palette.fileResults = [];
+        if (isOwner()) this.palette.fileResults = [];
       } finally {
-        this.palette.fileLoading = false;
+        if (requestSeq === this._paletteFileSeq
+            && this._workspaceIsCurrent(ownerWorkspace)) {
+          this.palette.fileLoading = false;
+        }
       }
     },
     // Build the item list freshly each render — cheap (few hundred entries

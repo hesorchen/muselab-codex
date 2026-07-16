@@ -9,6 +9,8 @@ multi-tab sprint and can ONLY be caught in a real browser:
 
 Skipped by default. Enable with `RUN_E2E=1`. See tests/e2e/README.md."""
 from __future__ import annotations
+from pathlib import Path
+
 import pytest
 
 pytest.importorskip("playwright.sync_api",
@@ -21,17 +23,13 @@ from playwright.sync_api import Page, expect  # noqa: E402
 SEL_LOGIN = ".login"
 SEL_LOGIN_INPUT = '.login input[type="password"]'
 SEL_TABS = ".chat-tabs-list"
-SEL_TAB = ".chat-tab:not(.chat-workspace-tab)"
-SEL_TAB_ACTIVE = ".chat-tab:not(.chat-workspace-tab).active"
+SEL_TAB = ".chat-tab"
+SEL_TAB_ACTIVE = ".chat-tab.active"
 SEL_TAB_NAME = ".chat-tab-name"
 SEL_TAB_RENAME = ".chat-tab-rename-input"
 SEL_TAB_CLOSE = ".chat-tab-close"
 SEL_TAB_NEW = ".chat-tab-new"
-SEL_GRID_PANE = ".chat-grid-pane:visible"
-SEL_GRID_PANE_ACTIVE = ".chat-grid-pane.active:visible"
-SEL_GRID_MASK = ".chat-grid-mask"
-SEL_GRID_TOGGLE = ".chat-grid-toggle"
-SEL_GRID_MENU = ".chat-grid-menu"
+SEL_SESSION_PANE = ".chat-session-pane:visible"
 
 
 def _login(page: Page, base: str, token: str) -> None:
@@ -136,6 +134,166 @@ def test_effort_override_survives_list_poll_and_page_reload(
         timeout=5000,
     )
     expect(page.locator(".chat-toolbar-effort")).to_have_value("medium")
+
+
+def test_fast_mode_survives_list_poll_and_page_reload(
+        page: Page, backend_url, auth_token):
+    """Fast is session metadata and must not regress during list reconciliation."""
+    _login(page, backend_url, auth_token)
+    supports_fast = page.evaluate(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app._supportsFast(app.model);
+        }"""
+    )
+
+    toggle = page.locator(".chat-toolbar-fast input")
+    if not supports_fast:
+        # Accounts/models without a catalog-advertised tier must never receive
+        # a dead control. The persistence branch runs on Fast-enabled fixtures.
+        expect(page.locator(".chat-toolbar-fast")).to_be_hidden()
+        return
+    expect(toggle).to_be_visible()
+    toggle.check()
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const session = app.sessions.find(s => s.id === app.currentId);
+          return app.fastModeEnabled && session?.service_tier === 'priority';
+        }""",
+        timeout=5000,
+    )
+
+    page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          await app.refreshSessions();
+        }"""
+    )
+    expect(toggle).to_be_checked()
+
+    _login(page, backend_url, auth_token)
+    page.wait_for_function(
+        """() => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const session = app.sessions.find(s => s.id === app.currentId);
+          return app.fastModeEnabled && session?.service_tier === 'priority';
+        }""",
+        timeout=5000,
+    )
+    expect(page.locator(".chat-toolbar-fast input")).to_be_checked()
+
+
+def test_mobile_fast_mode_lives_in_settings_popover_without_toolbar_overflow(
+        browser, backend_url, auth_token):
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+        is_mobile=True,
+    )
+    page = context.new_page()
+    try:
+        def advertise_fast(route):
+            response = route.fetch()
+            payload = response.json()
+            for model in payload.get("models", []):
+                model["supports_fast"] = True
+                model["fast_service_tier"] = "priority"
+                model["service_tiers"] = [{
+                    "id": "priority", "name": "Fast", "description": "",
+                }]
+            route.fulfill(response=response, json=payload)
+
+        page.route("**/api/chat/providers", advertise_fast)
+        _login(page, backend_url, auth_token)
+        page.wait_for_function(
+            """() => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              return app._supportsFast(app.model);
+            }"""
+        )
+
+        expect(page.locator(".chat-toolbar-fast")).to_be_hidden()
+        gear = page.locator(".chat-toolbar-more-btn")
+        expect(gear).to_be_visible()
+        toolbar_size = page.locator(".chat-toolbar").evaluate(
+            """el => ({
+              scrollWidth: el.scrollWidth,
+              clientWidth: el.clientWidth,
+              children: [...el.children].map(child => ({
+                className: child.className,
+                display: getComputedStyle(child).display,
+                width: child.getBoundingClientRect().width,
+              })),
+            })"""
+        )
+        assert toolbar_size["scrollWidth"] <= toolbar_size["clientWidth"] + 1, toolbar_size
+        gear.click()
+        expect(page.locator(".chat-toolbar-more-toggle").first).to_be_visible()
+        expect(page.locator(".chat-toolbar-queue")).to_be_visible()
+    finally:
+        context.close()
+
+
+def test_mobile_new_chat_keeps_entire_empty_state_scrollable(
+        browser, backend_url, auth_token):
+    """Tall Muse suggestions must grow downward, never overflow above scrollTop 0."""
+    context = browser.new_context(
+        viewport={"width": 390, "height": 844},
+        has_touch=True,
+        is_mobile=True,
+    )
+    page = context.new_page()
+    try:
+        _login(page, backend_url, auth_token)
+        page.evaluate(
+            """async () => {
+              const app = document.querySelector('#app')._x_dataStack[0];
+              await app.newSession();
+              app.contextInfo = {
+                ...app.contextInfo,
+                _fetched: true,
+                has_any_provider: true,
+              };
+            }"""
+        )
+        empty = page.locator(".chat-empty:visible")
+        expect(empty).to_be_visible()
+        cells = empty.locator(".muse-cell")
+        expect(cells).to_have_count(9)
+        page.locator(".chat-body").evaluate("el => { el.scrollTop = 0; }")
+        geometry = page.evaluate(
+            """() => {
+              const body = document.querySelector('.chat-body');
+              const empty = body.querySelector('.chat-empty:not([style*="display: none"])');
+              const first = empty.querySelector('.muse-cell');
+              const last = empty.querySelector('.muse-cell:last-child');
+              const bodyBox = body.getBoundingClientRect();
+              const firstBox = first.getBoundingClientRect();
+              body.scrollTop = body.scrollHeight;
+              const lastBox = last.getBoundingClientRect();
+              const emptyBox = empty.getBoundingClientRect();
+              return {
+                firstTop: firstBox.top,
+                viewportTop: bodyBox.top,
+                lastBottom: lastBox.bottom,
+                emptyBottom: emptyBox.bottom,
+                viewportBottom: bodyBox.bottom,
+                scrollHeight: body.scrollHeight,
+                clientHeight: body.clientHeight,
+              };
+            }"""
+        )
+        assert geometry["firstTop"] >= geometry["viewportTop"] - 1, geometry
+        assert geometry["lastBottom"] <= geometry["viewportBottom"] + 1, geometry
+        # At scroll-bottom, the empty-state's own bottom should be just above
+        # the chat body's padding edge. A second min-height:100% sibling used
+        # to leave nearly a full viewport of blank space after the Muse cards.
+        trailing_blank = geometry["viewportBottom"] - geometry["emptyBottom"]
+        assert 0 <= trailing_blank <= 32, geometry
+        assert geometry["scrollHeight"] > geometry["clientHeight"], geometry
+    finally:
+        context.close()
 
 
 def test_cancelled_incompatible_model_switch_keeps_source_effort(
@@ -274,8 +432,16 @@ def test_model_switch_is_single_flight_and_locks_session_controls(
     """A native select double-change must not start two model transitions."""
     _login(page, backend_url, auth_token)
     targets = page.evaluate(
-        """() => {
+        """async () => {
           const app = document.querySelector('#app')._x_dataStack[0];
+          // Boot deliberately fetches the model catalog off the first-paint
+          // path, and fetchStats may request it again after 300 ms. Let any
+          // current request settle, then suppress later background refreshes
+          // while this test owns availableModels; otherwise a fast CI runner
+          // can replace the synthetic catalog halfway through the assertion.
+          while (app._modelsFetchPromise) await app._modelsFetchPromise;
+          const realFetchModels = app._fetchModels;
+          app._fetchModels = async () => true;
           const sid = app.currentId;
           const session = app.sessions.find(s => s.id === sid);
           const st = app._ensureTabState(sid);
@@ -304,6 +470,7 @@ def test_model_switch_is_single_flight_and_locks_session_controls(
           window.__restoreModelTest = () => {
             window.fetch = realFetch;
             app.refreshSessions = realRefresh;
+            app._fetchModels = realFetchModels;
           };
           app.model = 'e2e-target-a';
           window.__firstModelChange = app.onModelChange();
@@ -451,6 +618,69 @@ def test_delayed_session_list_cannot_rewind_settings(
     }
 
 
+def test_fast_mode_patch_is_catalog_gated_and_stale_list_safe(
+        page: Page, backend_url, auth_token):
+    _login(page, backend_url, auth_token)
+    result = page.evaluate(
+        """async () => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const sid = app.currentId;
+          const original = app.sessions.find(s => s.id === sid);
+          const base = { ...original, service_tier: '' };
+          app.sessions = [base];
+          app.fastModeEnabled = false;
+          app.availableModels = [{
+            model: app.model, label: app.model || 'Fast fixture', group: 'E2E',
+            supports_fast: true,
+            fast_service_tier: 'priority',
+            service_tiers: [{ id: 'priority', name: 'Fast', description: '' }],
+          }, ...app.availableModels.filter(item => item.model !== app.model)];
+          const realReconcile = app._reconcileOpenSession;
+          app._reconcileOpenSession = () => {};
+          const realFetch = window.fetch;
+          let resolvePatch;
+          window.fetch = (url, init = {}) => {
+            if (String(url).endsWith(`/api/chat/sessions/${sid}`)
+                && init.method === 'PATCH') {
+              return new Promise(resolve => { resolvePatch = resolve; });
+            }
+            return realFetch(url, init);
+          };
+
+          app.fastModeEnabled = true;
+          const done = app.onFastModeChange();
+          while (!resolvePatch) await new Promise(resolve => setTimeout(resolve, 0));
+          app._applySessionList([{ ...base, service_tier: '' }]);
+          const during = {
+            root: app.fastModeEnabled,
+            tier: app.sessions[0].service_tier,
+          };
+          resolvePatch(new Response('{}', { status: 200 }));
+          await done;
+          app._applySessionList([{ ...base, service_tier: '' }]);
+          const afterAck = {
+            root: app.fastModeEnabled,
+            tier: app.sessions[0].service_tier,
+          };
+          app._applySessionList([{
+            ...base, model: '', service_tier: 'priority',
+          }]);
+          const released = app.tabState[sid]._serviceTierExpected === null;
+          const omittedModelKeptFast = app.fastModeEnabled;
+
+          window.fetch = realFetch;
+          app._reconcileOpenSession = realReconcile;
+          return { during, afterAck, released, omittedModelKeptFast };
+        }"""
+    )
+    assert result == {
+        "during": {"root": True, "tier": "priority"},
+        "afterAck": {"root": True, "tier": "priority"},
+        "released": True,
+        "omittedModelKeptFast": True,
+    }
+
+
 def test_queue_drops_stale_reads_and_failed_edit_keeps_message(
         page: Page, backend_url, auth_token):
     _login(page, backend_url, auth_token)
@@ -526,10 +756,8 @@ def test_identical_queued_prompts_render_once_per_turn_id(
           const realFetch = window.fetch;
           const realSync = app._syncQueueFromServer;
           const realSend = app.send;
-          const realVisible = app.visibleChatPaneIds;
           const attached = [];
           app._syncQueueFromServer = async () => {};
-          app.visibleChatPaneIds = () => [sid];
           app.send = opts => { attached.push(opts); };
           window.fetch = (url, init = {}) => {
             if (String(url).endsWith(`/api/chat/sessions/${sid}/active`)) {
@@ -558,7 +786,6 @@ def test_identical_queued_prompts_render_once_per_turn_id(
           window.fetch = realFetch;
           app._syncQueueFromServer = realSync;
           app.send = realSend;
-          app.visibleChatPaneIds = realVisible;
           return answer;
         }"""
     )
@@ -690,655 +917,287 @@ def test_keyboard_shortcut_ctrl_t_opens_tab(page: Page, backend_url, auth_token)
     expect(page.locator(SEL_TAB)).to_have_count(start + 1)
 
 
-def test_chat_grid_shows_multiple_sessions_with_one_active_pane(
-        page: Page, backend_url, auth_token):
-    """Multiple conversations remain visible while currentId is the sole
-    interactive/composer target; clicking a mask activates that pane."""
+def test_workspace_switches_files_previews_and_sessions_together(
+        page: Page, backend_url, auth_token, tmp_path):
+    """An app-level workspace owns all three surfaces and remembers each one."""
     _login(page, backend_url, auth_token)
-    page.locator(SEL_TAB_NEW).click()
-    page.locator(SEL_TAB_NEW).click()
-    page.wait_for_function(
-        """() => document.querySelector('#app')._x_dataStack[0].openTabIds.length >= 3""")
-    page.evaluate(
-        """async () => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          const ids = app.openTabIds.slice(-3);
-          for (const id of ids) await app.addSessionToGrid(id);
-        }""")
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(3)
-    expect(page.locator(SEL_GRID_PANE_ACTIVE)).to_have_count(1)
+    primary = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath()")
+    primary_id = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
+    other = Path(primary) / ("workspace-two-" + tmp_path.name)
+    other.mkdir()
+    (other / "WORKSPACE_ONLY.md").write_text(
+        "# second workspace\n\nworkspace-isolated-preview\n", encoding="utf-8")
 
-    inactive = page.locator(f"{SEL_GRID_PANE}:not(.active)").first
-    target = inactive.get_attribute("data-pane-id")
-    page.evaluate(
-        """([id]) => {
+    page.locator('.filelist li[data-path="README.md"]').click()
+    page.wait_for_function(
+        """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const st = app._ensureTabState(id);
-          st.messages.splice(0, st.messages.length, ...Array.from({length: 80}, (_, i) => ({
-            _k: `grid-scroll-${i}`,
-            role: 'assistant',
-            text: `scroll row ${i}`,
-            html: `<p>scroll row ${i}</p>`,
-          })));
+          return app.selected === 'README.md' && app.rawText.includes('muselab e2e');
+        }""")
+
+    # Add through the actual server-side folder browser, not by typing an
+    # absolute path or mutating Alpine state.
+    page.locator(".workspace-picker-btn").click()
+    expect(page.locator(".workspace-picker-pop")).to_be_visible()
+    page.locator(".workspace-picker-add").click()
+    expect(page.locator(".workspace-browser-modal")).to_be_visible()
+    row = page.locator(
+        f'.workspace-browser-row[data-workspace-path="{other}"]')
+    expect(row).to_be_visible(timeout=5000)
+    row.locator(".workspace-browser-entry").click()
+    expect(page.locator(
+        f'.workspace-browser-row.selected[data-workspace-path="{other}"]'
+    )).to_be_visible()
+    page.locator(".workspace-browser-confirm").click()
+    page.wait_for_function(
+        """([path]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const session = app.sessions.find(s => s.id === app.currentId);
+          return app.activeWorkspace === path && !app.workspaceSwitching
+            && !app._creatingSession && session?.cwd === path;
         }""",
-        arg=[target],
+        arg=[str(other)],
+        timeout=15000,
     )
-    scroller = inactive.locator(".msg-pane")
-    page.wait_for_function(
-        "([id]) => { const el = document.querySelector(`.chat-grid-pane[data-pane-id='${id}'] .msg-pane`); return el && el.scrollHeight > el.clientHeight; }",
-        arg=[target],
-    )
-    mask = inactive.locator(SEL_GRID_MASK)
-    expected_label = page.evaluate(
-        "() => document.querySelector('#app')._x_dataStack[0].lang === 'zh'"
-    )
-    expect(mask).to_have_text(
-        "点击选中会话" if expected_label else "Click to select session")
-    mask_style = mask.evaluate(
-        """el => {
-          const s = getComputedStyle(el);
-          return { background: s.backgroundColor, color: s.color,
-                   fontSize: getComputedStyle(el.firstElementChild).fontSize };
-        }""")
-    assert mask_style["background"] not in {"transparent", "rgba(0, 0, 0, 0)"}
-    assert mask_style["color"] not in {"transparent", "rgba(0, 0, 0, 0)"}
-    assert float(mask_style["fontSize"].removesuffix("px")) >= 18
 
-    mask.dispatch_event("wheel", {"deltaY": 600})
-    page.wait_for_function(
-        "([id]) => document.querySelector(`.chat-grid-pane[data-pane-id='${id}'] .msg-pane`).scrollTop > 0",
-        arg=[target],
-    )
-    assert scroller.evaluate("el => el.scrollTop") > 0
-
-    mask.click()
-    page.wait_for_function(
-        "([id]) => document.querySelector('#app')._x_dataStack[0].currentId === id",
-        arg=[target],
-    )
-    expect(page.locator(SEL_GRID_PANE_ACTIVE)).to_have_attribute("data-pane-id", target)
-
-
-def test_mobile_hides_multi_view_and_renders_only_current_session(
-        page: Page, backend_url, auth_token):
-    """Desktop split preferences may remain stored, but phones expose neither
-    the multi-view control nor background panes."""
-    page.set_viewport_size({"width": 390, "height": 844})
-    _login(page, backend_url, auth_token)
-    page.evaluate(
-        """() => {
+    isolated = page.evaluate(
+        """([path]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          app.splitPaneIds = [app.currentId, 'stored-desktop-pane'];
-        }""")
-
-    expect(page.locator(".chat-grid-menu-wrap")).to_be_hidden()
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(1)
-    visible = page.evaluate(
-        """() => { const app = document.querySelector('#app')._x_dataStack[0];
-        return { visible: app.visibleChatPaneIds(), stored: app.splitPaneIds }; }""")
-    assert visible["visible"] == [page.evaluate(
-        "() => document.querySelector('#app')._x_dataStack[0].currentId")]
-    assert len(visible["stored"]) == 2
-
-
-def test_mobile_single_session_grid_has_no_separator_fill(
-        page: Page, backend_url, auth_token):
-    """The grid's desktop separator color must not paint a tall grey block
-    below a short single-session transcript on phones."""
-    page.set_viewport_size({"width": 390, "height": 844})
-    _login(page, backend_url, auth_token)
-
-    colors = page.evaluate(
-        """() => {
-          const grid = document.querySelector('.chat-grid');
-          const pane = document.querySelector('.chat-grid-pane');
+          const byId = new Map(app.sessions.map(s => [s.id, s]));
           return {
-            grid: getComputedStyle(grid).backgroundColor,
-            pane: getComputedStyle(pane).backgroundColor,
+            visible: app.visible.map(n => n.path),
+            selected: app.selected,
+            currentId: app.currentId,
+            tabCwds: app.workspaceOpenTabIds().map(id => byId.get(id)?.cwd),
+            workspace: app.currentWorkspacePath(),
           };
-        }""")
-    assert colors["grid"] in {"transparent", "rgba(0, 0, 0, 0)"}
-    assert colors["pane"] in {"transparent", "rgba(0, 0, 0, 0)"}
+        }""",
+        arg=[str(other)],
+    )
+    assert "WORKSPACE_ONLY.md" in isolated["visible"]
+    assert "README.md" not in isolated["visible"]
+    assert isolated["selected"] == ""
+    assert isolated["workspace"] == str(other)
+    assert isolated["tabCwds"] and set(isolated["tabCwds"]) == {str(other)}
+    secondary_id = isolated["currentId"]
+    # A new workspace starts with an empty conversation. The onboarding view
+    # owns the viewport until the first message, so resident transcript panes
+    # are intentionally mounted but hidden from layout.
+    expect(page.locator(".chat-empty:visible")).to_have_count(1)
 
-
-def test_new_chat_replaces_selected_grid_pane_without_leaving_multi_view(
-        page: Page, backend_url, auth_token):
-    """The + button follows ordinary grid navigation: the optimistic draft
-    and its adopted native id replace the selected pane in place."""
-    _login(page, backend_url, auth_token)
-    while page.evaluate(
-            "() => document.querySelector('#app')._x_dataStack[0].openTabIds.length") < 3:
-        page.locator(SEL_TAB_NEW).click()
-        page.wait_for_function(
-            "() => !document.querySelector('#app')._x_dataStack[0]._creatingSession")
-
-    before = page.evaluate(
-        """async () => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          await app.setChatGridView(3);
-          return { currentId: app.currentId,
-                   splitPaneIds: [...app.splitPaneIds],
-                   visibleIds: [...app.visibleChatPaneIds()],
-                   layout: app.chatGridLayout,
-                   openTabIds: [...app.openTabIds],
-                   tabCount: app.openTabIds.length };
-        }""")
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(3)
-    expect(page.locator(".chat-workspace-tab.active")).to_have_count(1)
-    page.locator(SEL_TAB_NEW).click()
-    expect(page.locator(SEL_TAB)).to_have_count(before["tabCount"] + 1)
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(3)
-    optimistic = page.evaluate(
-        """() => { const app = document.querySelector('#app')._x_dataStack[0];
-        return { mode: app.chatViewMode, currentId: app.currentId,
-                 splitPaneIds: [...app.splitPaneIds],
-                 visibleIds: [...app.visibleChatPaneIds()] }; }""")
-    selected = before["splitPaneIds"].index(before["currentId"])
-    expected_optimistic = list(before["splitPaneIds"])
-    expected_optimistic[selected] = optimistic["currentId"]
-    assert optimistic["mode"] == "grid"
-    assert optimistic["currentId"] not in before["visibleIds"]
-    assert optimistic["splitPaneIds"] == expected_optimistic
-    assert optimistic["visibleIds"] == expected_optimistic
-    expect(page.locator(".chat-workspace-tab.active")).to_have_count(1)
-    expect(page.locator(SEL_TAB_ACTIVE)).to_have_count(0)
-
+    page.locator('.filelist li[data-path="WORKSPACE_ONLY.md"]').click()
     page.wait_for_function(
-        "() => document.querySelector('#app')?._x_dataStack?.[0]?._creatingSession === false")
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(3)
-    adopted = page.evaluate(
-        """() => { const app = document.querySelector('#app')._x_dataStack[0];
-        return { mode: app.chatViewMode, currentId: app.currentId,
-                 splitPaneIds: [...app.splitPaneIds],
-                 visibleIds: [...app.visibleChatPaneIds()],
-                 focusId: app.chatGridFocusId,
-                 layout: app.chatGridLayout }; }""")
-    expected_adopted = list(before["splitPaneIds"])
-    expected_adopted[selected] = adopted["currentId"]
-    assert adopted["mode"] == "grid"
-    assert not adopted["currentId"].startswith("draft-")
-    assert adopted["splitPaneIds"] == expected_adopted
-    assert adopted["visibleIds"] == expected_adopted
-    assert adopted["focusId"] == adopted["currentId"]
-    assert adopted["layout"] == before["layout"]
-
-
-def test_failed_new_chat_restores_the_original_grid_selection(
-        page: Page, backend_url, auth_token):
-    """A failed native thread/start must not leave the selected grid cell
-    missing after its optimistic draft is removed."""
-    _login(page, backend_url, auth_token)
-    before = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const origin = app.currentId;
-          const peer = 'create-failure-peer';
-          app.sessions.push({ id: peer, name: peer, active: false,
-            updated_at: Date.now() / 1000 });
-          app.openTabIds.push(peer);
-          app._ensureTabState(peer)._loaded = true;
-          app.splitPaneIds = [origin, peer];
-          app.chatViewMode = 'grid';
-          app.chatGridFocusId = origin;
-          return { currentId: origin, split: [...app.splitPaneIds] };
-        }"""
-    )
+          return app.selected === 'WORKSPACE_ONLY.md'
+            && app.rawText.includes('workspace-isolated-preview');
+        }""")
 
-    def fail_create(route, request):
-        if request.method == "POST":
-            route.fulfill(status=503, body="unavailable")
-        else:
-            route.continue_()
-
-    page.route("**/api/chat/sessions", fail_create)
-    page.locator(SEL_TAB_NEW).click()
-    page.wait_for_function(
-        "() => document.querySelector('#app')?._x_dataStack?.[0]?._creatingSession === false"
-    )
-    restored = page.evaluate(
-        """() => {
+    # Hold an old-workspace directory response across the switch. A common
+    # filename/path in both projects must never let that late payload populate
+    # the newly-active tree cache.
+    page.evaluate(
+        """([primaryWorkspace]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          return { mode: app.chatViewMode, currentId: app.currentId,
-                   split: [...app.splitPaneIds],
-                   visible: [...app.visibleChatPaneIds()] };
-        }"""
-    )
-    assert restored == {
-        "mode": "grid",
-        "currentId": before["currentId"],
-        "split": before["split"],
-        "visible": before["split"],
-    }
-
-
-def test_failed_new_chat_preserves_newer_grid_focus(
-        page: Page, backend_url, auth_token):
-    """Creation rollback repairs the draft cell without stealing focus."""
-    _login(page, backend_url, auth_token)
-    result = page.evaluate(
-        """async () => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          const origin = app.currentId;
-          const peer = 'create-failure-focus-peer';
-          app.sessions.push({ id: peer, name: peer, active: false,
-            updated_at: Date.now() / 1000 });
-          app.openTabIds.push(peer);
-          app._ensureTabState(peer)._loaded = true;
-          app.splitPaneIds = [origin, peer];
-          app.chatViewMode = 'grid';
-          app.chatGridFocusId = origin;
-
           const realFetch = window.fetch;
-          let resolveCreate;
+          window.__workspaceRace = {
+            ready: false, done: false, result: '',
+            holdRoot: primaryWorkspace, rootReady: false,
+          };
           window.fetch = (url, init = {}) => {
-            if (String(url).endsWith('/api/chat/sessions')
-                && init.method === 'POST') {
-              return new Promise(resolve => { resolveCreate = resolve; });
+            if (String(url).includes('path=__workspace_race__')) {
+              return new Promise(resolve => {
+                window.__workspaceRace.ready = true;
+                window.__workspaceRace.release = () => resolve(new Response(
+                  JSON.stringify({entries: [{
+                    name: 'README.md', path: '__workspace_race__/README.md',
+                    is_dir: false, size: 1, mtime: 1,
+                  }]}),
+                  {status: 200, headers: {'Content-Type': 'application/json'}},
+                ));
+              });
+            }
+            const headers = init.headers || {};
+            const encodedWorkspace = headers['X-Muselab-Workspace']
+              || headers['x-muselab-workspace'] || '';
+            let requestWorkspace = '';
+            try { requestWorkspace = decodeURIComponent(encodedWorkspace); }
+            catch { requestWorkspace = encodedWorkspace; }
+            const requestUrl = new URL(String(url), location.origin);
+            if (window.__workspaceRace.holdRoot
+                && requestWorkspace === window.__workspaceRace.holdRoot
+                && requestUrl.pathname === '/api/files/list'
+                && requestUrl.searchParams.get('path') === '') {
+              window.__workspaceRace.holdRoot = '';
+              return new Promise(resolve => {
+                window.__workspaceRace.rootReady = true;
+                window.__workspaceRace.releaseRoot = () => {
+                  realFetch(url, init).then(resolve);
+                };
+              });
             }
             return realFetch(url, init);
           };
-          const creating = app.newSession();
-          while (!resolveCreate) await new Promise(r => setTimeout(r, 0));
-          const draft = app.currentId;
-          app.currentId = peer;
-          app.chatGridFocusId = peer;
-          app._activateTabState(peer);
-          resolveCreate(new Response('unavailable', { status: 503 }));
-          await creating;
-          window.fetch = realFetch;
-          return {
-            origin, peer, draft,
-            mode: app.chatViewMode,
-            currentId: app.currentId,
-            focusId: app.chatGridFocusId,
-            split: [...app.splitPaneIds],
-          };
-        }"""
-    )
-    assert result["draft"].startswith("draft-")
-    assert result["mode"] == "grid"
-    assert result["currentId"] == result["peer"]
-    assert result["focusId"] == result["peer"]
-    assert result["split"] == [result["origin"], result["peer"]]
-
-
-def test_session_init_eagerly_restores_all_visible_grid_panes(
-        page: Page, backend_url, auth_token):
-    """A restored grid must hydrate every visible conversation instead of
-    painting an empty dark pane beneath the inactive-session veil."""
-    _login(page, backend_url, auth_token)
-    while page.evaluate(
-            "() => document.querySelector('#app')._x_dataStack[0].openTabIds.length") < 3:
-        page.locator(SEL_TAB_NEW).click()
-        page.wait_for_function(
-            "() => document.querySelector('#app')?._x_dataStack?.[0]?._creatingSession === false")
-
-    pane_ids = page.evaluate(
-        """async () => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          await app.setChatGridView(3);
-          for (const id of app.splitPaneIds) {
-            const st = app._ensureTabState(id);
-            st._loaded = false;
-            st.messages.length = 0;
-          }
-          return [...app.splitPaneIds];
-        }""")
-    assert len(pane_ids) == 3
-    expect(page.locator(".chat-grid-pane-loading:visible")).to_have_count(3)
-    expect(page.locator(f"{SEL_GRID_MASK}:visible")).to_have_count(0)
-
-    restored = page.evaluate(
-        """async () => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          await app._initSessionsOnce({ skipRefresh: true });
-          return { paneIds: [...app.splitPaneIds],
-                   visibleIds: [...app.visibleChatPaneIds()],
-                   loadedIds: app.visibleChatPaneIds().filter(
-                     id => app.tabState[id] && app.tabState[id]._loaded) };
-        }""")
-    assert restored["paneIds"] == pane_ids
-    assert restored["loadedIds"] == restored["visibleIds"]
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(3)
-    expect(page.locator(".chat-grid-pane-loading:visible")).to_have_count(0)
-    expect(page.locator(f"{SEL_GRID_MASK}:visible")).to_have_count(2)
-
-
-def test_two_pane_grid_scrolls_inside_each_pane(page: Page, backend_url, auth_token):
-    """The two-column implicit grid row must be height-constrained; otherwise
-    message content stretches the row below the viewport and gets clipped."""
-    _login(page, backend_url, auth_token)
-    page.locator(SEL_TAB_NEW).click()
-    page.wait_for_function(
-        "() => document.querySelector('#app')._x_dataStack[0].openTabIds.length >= 2")
-    page.wait_for_function(
-        """() => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          return app.openTabIds.slice(-2).every(id => app.tabState[id] && app.tabState[id]._loaded);
-        }""")
-    ids = page.evaluate(
-        """() => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          const ids = app.openTabIds.slice(-2);
-          app.splitPaneIds = ids;
-          app.chatViewMode = 'grid';
-          return ids;
-        }""")
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(2)
-    for sid in ids:
-        pane = page.locator(f"{SEL_GRID_PANE}[data-pane-id='{sid}']")
-        scroller = pane.locator(".msg-pane")
-        scroller.evaluate(
-            """el => { for (let i = 0; i < 100; i++) {
-              const row = document.createElement('div');
-              row.className = 'msg'; row.style.minHeight = '36px';
-              row.textContent = `scroll row ${i}`; el.appendChild(row);
-            }}""")
-        page.wait_for_function(
-            "([id]) => { const el = document.querySelector(`.chat-grid-pane[data-pane-id='${id}'] .msg-pane`); return el && el.scrollHeight > el.clientHeight; }",
-            arg=[sid],
-        )
-        if pane.evaluate("el => el.classList.contains('active')"):
-            scroller.hover()
-            page.mouse.wheel(0, 700)
-        else:
-            pane.locator(SEL_GRID_MASK).dispatch_event("wheel", {"deltaY": 700})
-        page.wait_for_function(
-            "([id]) => document.querySelector(`.chat-grid-pane[data-pane-id='${id}'] .msg-pane`).scrollTop > 0",
-            arg=[sid],
-        )
-
-
-def test_background_grid_history_prepend_preserves_viewport(
-        page: Page, backend_url, auth_token):
-    """Loading older rows in a visible non-focused pane must anchor its scroll."""
-    _login(page, backend_url, auth_token)
-    page.locator(SEL_TAB_NEW).click()
-    page.wait_for_function(
-        "() => document.querySelector('#app')._x_dataStack[0].openTabIds.length >= 2")
-    background_id = page.evaluate(
-        """async () => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          await app.setChatGridView(2);
-          const sid = app.splitPaneIds.find(id => id !== app.currentId);
-          const st = app._ensureTabState(sid);
-          const mk = (prefix, i) => ({
-            role: i % 2 ? 'assistant' : 'user',
-            text: `${prefix} ${i} ${'viewport anchor '.repeat(45)}`,
-            html: i % 2 ? `<p>${prefix} ${i} ${'viewport anchor '.repeat(45)}</p>` : '',
-            uuid: `${prefix}-${i}`, _k: `${sid}-${prefix}-${i}`, _noAnim: true,
+          app.fetchChildren('__workspace_race__').then(
+            () => { window.__workspaceRace.result = 'resolved'; },
+            error => {
+              window.__workspaceRace.result = error?.staleWorkspace
+                ? 'stale' : String(error);
+            },
+          ).finally(() => {
+            window.fetch = realFetch;
+            window.__workspaceRace.done = true;
           });
-          st.messages.splice(0, st.messages.length,
-            ...Array.from({ length: 24 }, (_, i) => mk('visible', i)));
-          st._earlierMessages = Array.from({ length: 6 }, (_, i) => mk('older', i));
-          st._hasMoreHistory = true;
-          st._loaded = true;
-          return sid;
-        }""")
-    pane = page.locator(
-        f".chat-grid-pane[data-pane-id='{background_id}'] .msg-pane")
-    expect(pane.locator(".msg[data-uuid^='visible-']")).to_have_count(24)
-
-    result = page.evaluate(
-        """async sid => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          const el = document.querySelector(
-            `.chat-grid-pane[data-pane-id="${sid}"] .msg-pane`);
-          el.scrollTop = Math.max(100, Math.floor(
-            (el.scrollHeight - el.clientHeight) * 0.45));
-          app._userScrollIntent(sid);
-          app.onChatScroll(sid, { currentTarget: el });
-          const before = { top: el.scrollTop, height: el.scrollHeight };
-          await app.loadEarlierMessages(sid);
-          await new Promise(resolve => requestAnimationFrame(
-            () => requestAnimationFrame(resolve)));
-          return {
-            before,
-            after: { top: el.scrollTop, height: el.scrollHeight },
-            count: el.querySelectorAll(
-              '.msg[data-uuid^="visible-"], .msg[data-uuid^="older-"]').length,
-          };
         }""",
-        background_id,
+        arg=[primary],
     )
-    assert result["count"] == 30
-    height_delta = result["after"]["height"] - result["before"]["height"]
-    top_delta = result["after"]["top"] - result["before"]["top"]
-    assert height_delta > 0
-    assert abs(top_delta - height_delta) <= 6
+    page.wait_for_function("() => window.__workspaceRace?.ready === true")
 
-
-def test_selecting_completed_grid_pane_clears_status_dot(
-        page: Page, backend_url, auth_token):
-    """An idle pane has no status dot; a completed background pane keeps one
-    only until the user selects it, then clears the underlying unread flag."""
-    _login(page, backend_url, auth_token)
-    page.locator(SEL_TAB_NEW).click()
+    # Switching back restores the primary workspace's own preview and session.
+    page.locator(".workspace-picker-btn").click()
+    page.locator(
+        f'.workspace-picker-row[title="{primary}"] .workspace-picker-select').click()
     page.wait_for_function(
-        "() => document.querySelector('#app')._x_dataStack[0].openTabIds.length >= 2")
-    background_id = page.evaluate(
-        """async () => {
+        """([path]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          await app.setChatGridView(2);
-          const id = app.splitPaneIds.find(x => x !== app.currentId);
-          app._ensureTabState(id).unread = true;
-          return id;
-        }""")
-    pane = page.locator(f"{SEL_GRID_PANE}[data-pane-id='{background_id}']")
-    expect(pane.locator(".chat-grid-pane-status:visible")).to_have_count(1)
-
-    pane.locator(SEL_GRID_MASK).click()
-
-    expect(page.locator(".chat-grid-pane-status:visible")).to_have_count(0)
-    assert page.evaluate(
-        "([id]) => document.querySelector('#app')._x_dataStack[0].tabState[id].unread",
-        [background_id],
-    ) is False
-
-
-def test_single_pane_can_reach_latest_message(page: Page, backend_url, auth_token):
-    """Single-pane mode scrolls on .chat-body; its only grid row must remain
-    content-sized instead of clipping messages to one viewport."""
-    _login(page, backend_url, auth_token)
+          return app.workspaceSwitching && app.activeWorkspace === path
+            && window.__workspaceRace?.rootReady === true;
+        }""",
+        arg=[primary],
+    )
+    locked = page.evaluate(
+        """async ([oldSid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const before = app.tabState[oldSid].messages.length;
+          const draft = app.input;
+          app.input = 'must-not-send-during-workspace-switch';
+          await app.send();
+          const result = {
+            textareaDisabled: document.querySelector('.chat-input-textarea').disabled,
+            sendDisabled: document.querySelector('.chat-toolbar-send').disabled,
+            visiblePanes: Array.from(document.querySelectorAll('.chat-session-pane'))
+              .filter(el => getComputedStyle(el).display !== 'none').length,
+            messagesUnchanged: app.tabState[oldSid].messages.length === before,
+          };
+          app.input = draft;
+          return result;
+        }""",
+        arg=[secondary_id],
+    )
+    assert locked == {
+        "textareaDisabled": True,
+        "sendDisabled": True,
+        "visiblePanes": 0,
+        "messagesUnchanged": True,
+    }
+    page.evaluate("() => window.__workspaceRace.releaseRoot()")
     page.wait_for_function(
+        """([path, sid]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          return app.currentWorkspacePath() === path && app.currentId === sid
+            && app.selected === 'README.md' && app.rawText.includes('muselab e2e')
+            && !app.workspaceSwitching;
+        }""",
+        arg=[primary, primary_id],
+    )
+    page.evaluate("() => window.__workspaceRace.release()")
+    page.wait_for_function("() => window.__workspaceRace?.done === true")
+    race = page.evaluate(
         """() => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          return app.tabState[app.currentId] && app.tabState[app.currentId]._loaded;
-        }""")
-    page.evaluate(
-        """() => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          app.splitPaneIds = [];
-          app.chatViewMode = 'single';
-        }""")
-    page.locator(".chat-grid-pane .msg-pane").evaluate(
-        """el => { for (let i = 0; i < 100; i++) {
-          const row = document.createElement('div');
-          row.className = 'msg'; row.style.minHeight = '36px';
-          row.textContent = `single row ${i}`; el.appendChild(row);
-        }}""")
-    body = page.locator(".chat-body")
-    page.wait_for_function(
-        "() => { const el = document.querySelector('.chat-body'); return el && el.scrollHeight > el.clientHeight; }")
-    body.evaluate("el => { el.scrollTop = el.scrollHeight; }")
-    page.wait_for_function(
-        """() => {
-          const body = document.querySelector('.chat-body');
-          const last = document.querySelector('.chat-grid-pane .msg:last-child');
-          if (!body || !last) return false;
-          return last.getBoundingClientRect().bottom <= body.getBoundingClientRect().bottom + 1;
-        }""")
-
-
-def test_grid_view_menu_and_toolbar_alignment(page: Page, backend_url, auth_token):
-    _login(page, backend_url, auth_token)
-    page.evaluate(
-        """() => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          while (app.openTabIds.length < 4) {
-            const id = `layout-test-${app.openTabIds.length}`;
-            app.sessions.push({ id, name: id, active: false,
-              created_at: Date.now() / 1000, updated_at: Date.now() / 1000 });
-            app.openTabIds.push(id);
-            const st = app._ensureTabState(id);
-            st.messages.length = 0;
-            st._loaded = true;
-          }
-        }""")
-    expect(page.locator(SEL_TAB)).to_have_count(4)
-
-    grid_box = page.locator(SEL_GRID_TOGGLE).bounding_box()
-    plus_box = page.locator(SEL_TAB_NEW).bounding_box()
-    assert grid_box and plus_box
-    assert abs(grid_box["y"] - plus_box["y"]) <= 1
-    assert abs(grid_box["height"] - plus_box["height"]) <= 1
-
-    page.locator(SEL_GRID_TOGGLE).click()
-    expect(page.locator(SEL_GRID_MENU)).to_be_visible()
-    choices = page.locator(f"{SEL_GRID_MENU} button")
-    expect(choices).to_have_count(6)
-    choices.nth(5).click()
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(4)
-    expect(page.locator(".chat-grid.panes-4")).to_have_count(1)
-
-    # Shrinking 4 → 3 must remove panes-4. A stale class leaves the fourth
-    # grid cell visibly empty even though only three pane nodes remain.
-    page.locator(SEL_GRID_TOGGLE).click()
-    choices.nth(3).click()
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(3)
-    expect(page.locator(".chat-grid.panes-3")).to_have_count(1)
-    expect(page.locator(".chat-grid.panes-4")).to_have_count(0)
-    pane_boxes = [page.locator(SEL_GRID_PANE).nth(i).bounding_box()
-                  for i in range(3)]
-    assert all(pane_boxes)
-    primary, upper, lower = pane_boxes
-    # 主 pane 跨两行；右侧两块上下堆叠。Geometry catches the real blank-cell
-    # regression that a class-only assertion misses when :first-child fails.
-    assert primary["height"] > upper["height"] * 1.8
-    assert abs(upper["height"] - lower["height"]) <= 2
-    assert abs(upper["x"] - lower["x"]) <= 1
-    assert lower["y"] > upper["y"]
-
-    # 次主三窗：前两个会话在左侧上下排列，最后一个占满右侧。
-    page.locator(SEL_GRID_TOGGLE).click()
-    choices.nth(4).click()
-    secondary_boxes = [page.locator(SEL_GRID_PANE).nth(i).bounding_box()
-                       for i in range(3)]
-    assert all(secondary_boxes)
-    upper, lower, primary = secondary_boxes
-    assert primary["height"] > upper["height"] * 1.8
-    assert abs(upper["x"] - lower["x"]) <= 1
-    assert primary["x"] > upper["x"]
-
-    # 上下双栏：两块等宽、上下堆叠。
-    page.locator(SEL_GRID_TOGGLE).click()
-    choices.nth(2).click()
-    row_boxes = [page.locator(SEL_GRID_PANE).nth(i).bounding_box()
-                 for i in range(2)]
-    assert all(row_boxes)
-    upper, lower = row_boxes
-    assert abs(upper["width"] - lower["width"]) <= 2
-    assert abs(upper["x"] - lower["x"]) <= 1
-    assert lower["y"] > upper["y"]
-
-    page.locator(SEL_GRID_TOGGLE).click()
-    choices.nth(0).click()
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(1)
-
-
-def test_grid_layout_change_preserves_curated_membership_and_close_invariant(
-        page: Page, backend_url, auth_token):
-    """Changing only the geometry must keep the curated ids; closing the
-    selected pane must immediately select another pane that is still visible."""
-    _login(page, backend_url, auth_token)
-    result = page.evaluate(
-        """async () => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          const origin = app.currentId;
-          const extras = ['curated-a', 'curated-b', 'not-curated'];
-          for (const id of extras) {
-            if (!app.sessions.some(s => s.id === id)) {
-              app.sessions.push({ id, name: id, active: false,
-                updated_at: Date.now() / 1000 });
-            }
-            if (!app.openTabIds.includes(id)) app.openTabIds.push(id);
-            app._ensureTabState(id)._loaded = true;
-          }
-          app.splitPaneIds = [origin, 'curated-b', 'curated-a'];
-          app.chatViewMode = 'grid';
-          app.chatGridFocusId = origin;
-          await app.setChatGridView(3, 'secondary');
-          const afterLayout = [...app.splitPaneIds];
-          await app.closeChatTab(app.currentId);
           return {
-            origin,
-            afterLayout,
-            currentId: app.currentId,
-            visible: [...app.visibleChatPaneIds()],
-            mode: app.chatViewMode,
+            result: window.__workspaceRace.result,
+            leaked: Object.keys(app.childCache)
+              .some(key => key.startsWith('__workspace_race__:')),
           };
         }""")
-    assert result["afterLayout"] == [result["origin"], "curated-b", "curated-a"]
-    assert "not-curated" not in result["afterLayout"]
-    assert result["currentId"] in result["visible"]
-    assert len(result["visible"]) == 2
-    assert result["mode"] == "grid"
+    assert race == {"result": "stale", "leaked": False}
 
-
-def test_clicking_a_tab_outside_the_grid_replaces_the_selected_pane(
-        page: Page, backend_url, auth_token):
-    """Ordinary tab navigation must stay inside an active multi-view
-    workspace; an outside conversation replaces the selected pane."""
-    _login(page, backend_url, auth_token)
-    state = page.evaluate(
-        """async () => {
+    # The secondary surface is independently remembered as well.
+    page.locator(".workspace-picker-btn").click()
+    page.locator(
+        f'.workspace-picker-row[title="{other}"] .workspace-picker-select').click()
+    page.wait_for_function(
+        """([path, sid]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const origin = app.currentId;
-          for (const id of ['grid-peer', 'outside-grid']) {
-            app.sessions.push({ id, name: id, active: false,
-              updated_at: Date.now() / 1000 });
-            app.openTabIds.push(id);
-            app._ensureTabState(id)._loaded = true;
-          }
-          app.splitPaneIds = [origin, 'grid-peer'];
-          app.chatViewMode = 'grid';
-          app.chatGridFocusId = origin;
-          await app.activateTab('outside-grid');
-          return {
-            origin,
-            currentId: app.currentId,
-            split: [...app.splitPaneIds],
-            visible: [...app.visibleChatPaneIds()],
-            mode: app.chatViewMode,
-          };
-        }"""
+          return app.currentWorkspacePath() === path && app.currentId === sid
+            && app.selected === 'WORKSPACE_ONLY.md'
+            && app.rawText.includes('workspace-isolated-preview')
+            && !app.workspaceSwitching;
+        }""",
+        arg=[str(other), secondary_id],
     )
-    assert state["mode"] == "grid"
-    assert state["currentId"] == "outside-grid"
-    assert state["split"] == ["outside-grid", "grid-peer"]
-    assert state["visible"] == state["split"]
-    assert state["origin"] not in state["split"]
 
-
-def test_adding_unopened_session_to_grid_keeps_the_origin_pane(
-        page: Page, backend_url, auth_token):
-    """openTab(id) must not steal currentId before addSessionToGrid seeds the
-    two-pane workspace."""
-    _login(page, backend_url, auth_token)
-    state = page.evaluate(
-        """async () => {
+    # Remove it through the UI. Files and native Codex threads remain on disk.
+    page.locator(".workspace-picker-btn").click()
+    page.locator(
+        f'.workspace-picker-row[title="{primary}"] .workspace-picker-select').click()
+    page.wait_for_function(
+        "([path]) => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath() === path",
+        arg=[primary],
+    )
+    page.locator(".workspace-picker-btn").click()
+    page.locator(
+        f'.workspace-picker-row[title="{other}"] .workspace-picker-remove').click()
+    expect(page.locator(".confirm-modal")).to_be_visible()
+    page.locator(".confirm-modal .btn-danger").click()
+    page.wait_for_function(
+        """([path]) => {
           const app = document.querySelector('#app')._x_dataStack[0];
-          const origin = app.currentId;
-          const target = 'history-not-open';
-          app.sessions.push({ id: target, name: 'History', active: false,
-            updated_at: Date.now() / 1000 });
-          app._ensureTabState(target)._loaded = true;
-          await app.addSessionToGrid(target);
-          return { origin, target, currentId: app.currentId,
-                   split: [...app.splitPaneIds] };
-        }""")
-    assert state["split"] == [state["origin"], state["target"]]
-    assert state["currentId"] == state["target"]
+          return !app.workspaceSwitching
+            && !app.sessionWorkspaces.some(w => w.path === path);
+        }""",
+        arg=[str(other)],
+    )
+
+
+def test_workspace_folder_browser_is_fullscreen_and_navigable_on_mobile(
+        page: Page, backend_url, auth_token, tmp_path):
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    primary = page.evaluate(
+        "() => document.querySelector('#app')._x_dataStack[0].currentWorkspacePath()")
+    parent = Path(primary) / ("mobile-picker-" + tmp_path.name)
+    child = parent / "nested-project"
+    child.mkdir(parents=True)
+    (child / "package.json").write_text('{"name":"nested"}\n', encoding="utf-8")
+
+    page.locator(".workspace-picker-btn").click()
+    page.locator(".workspace-picker-add").click()
+    modal = page.locator(".workspace-browser-modal")
+    expect(modal).to_be_visible()
+    page.wait_for_timeout(250)  # let modal-in's scale transform settle
+    box = modal.bounding_box()
+    assert box is not None
+    assert box["x"] == 0
+    assert box["y"] == 0
+    assert box["width"] >= 389
+    assert box["height"] >= 843
+
+    parent_row = page.locator(
+        f'.workspace-browser-row[data-workspace-path="{parent}"]')
+    expect(parent_row).to_be_visible(timeout=5000)
+    parent_row.locator(".workspace-browser-open").click()
+    page.wait_for_function(
+        """([path]) => document.querySelector('#app')._x_dataStack[0]
+          .workspaceBrowser.path === path""",
+        arg=[str(parent)],
+    )
+    child_row = page.locator(
+        f'.workspace-browser-row[data-workspace-path="{child}"]')
+    expect(child_row).to_be_visible()
+    expect(child_row).to_contain_text("Node.js")
+
+    page.locator(".workspace-browser-up").click()
+    page.wait_for_function(
+        """([path]) => document.querySelector('#app')._x_dataStack[0]
+          .workspaceBrowser.path === path""",
+        arg=[primary],
+    )
+    page.locator(".workspace-browser-modal .modal-close").click()
+    expect(modal).to_be_hidden()
 
 
 def test_delayed_queue_acceptance_does_not_erase_a_new_draft(
@@ -1606,21 +1465,16 @@ def test_enqueue_completion_race_attaches_started_turn_immediately(
     assert result["queue"] == 0
 
 
-def test_grid_queues_for_server_active_session_without_duplicate_bubbles(
+def test_current_session_queues_for_server_active_turn_without_duplicate_bubbles(
         page: Page, backend_url, auth_token):
-    """A visible background/server-owned turn is busy even without a local
-    EventSource; sending must enqueue once in that pane instead of starting a
-    second turn or duplicating the queue bubble across every grid pane."""
+    """A server-owned turn is busy even without a local EventSource; sending
+    must enqueue once instead of starting a second turn or duplicating it."""
     _login(page, backend_url, auth_token)
     page.locator(SEL_TAB_NEW).click()
     page.wait_for_function(
         "() => !document.querySelector('#app')._x_dataStack[0]._creatingSession")
     sid = page.evaluate(
-        """async () => {
-          const app = document.querySelector('#app')._x_dataStack[0];
-          await app.setChatGridView(2);
-          return app.currentId;
-        }""")
+        "() => document.querySelector('#app')._x_dataStack[0].currentId")
 
     posts = []
 
@@ -1632,7 +1486,7 @@ def test_grid_queues_for_server_active_session_without_duplicate_bubbles(
         route.fulfill(status=200, json={
             "items": [{
                 "id": "queued-probe",
-                "text": "queued from grid",
+                "text": "queued from current session",
                 "image_ids": "",
                 "enqueued_at": 1,
             }],
@@ -1640,8 +1494,28 @@ def test_grid_queues_for_server_active_session_without_duplicate_bubbles(
         })
 
     page.route(f"**/api/chat/sessions/{sid}/queue", queue_route)
+    # The product intentionally removes the resident transcript stack from
+    # layout while a brand-new session has no messages; otherwise its 100%
+    # minimum height sits below the onboarding empty state and recreates the
+    # large blank band this layout is meant to prevent. Seed one existing
+    # bubble so this test exercises the real "busy transcript queues and
+    # follows the new row" path instead of waiting for a deliberately hidden
+    # empty pane.
+    page.evaluate(
+        """([id]) => {
+          const app = document.querySelector('#app')._x_dataStack[0];
+          const st = app._ensureTabState(id);
+          st.messages.push({
+            role: 'assistant',
+            text: 'existing transcript',
+            _k: 'queue-scroll-seed',
+          });
+          app._activateTabState(id);
+        }""",
+        arg=[sid],
+    )
     scroller = page.locator(
-        f"{SEL_GRID_PANE}[data-pane-id='{sid}'] .msg-pane")
+        f"{SEL_SESSION_PANE}[data-pane-id='{sid}'] .msg-pane")
     scroller.evaluate(
         """el => {
           for (let i = 0; i < 80; i++) {
@@ -1656,7 +1530,7 @@ def test_grid_queues_for_server_active_session_without_duplicate_bubbles(
     page.wait_for_function(
         """([id]) => {
           const el = document.querySelector(
-            `.chat-grid-pane[data-pane-id='${id}'] .msg-pane`);
+            `.chat-session-pane[data-pane-id='${id}'] .msg-pane`);
           return el && el.scrollHeight > el.clientHeight && el.scrollTop === 0;
         }""",
         arg=[sid],
@@ -1668,19 +1542,19 @@ def test_grid_queues_for_server_active_session_without_duplicate_bubbles(
           session.active = true;
           const st = app._ensureTabState(id);
           st.streaming = false;
-          app.input = 'queued from grid';
+          app.input = 'queued from current session';
           await app.send();
         }""",
         arg=[sid],
     )
 
     assert len(posts) == 1
-    assert posts[0]["text"] == "queued from grid"
+    assert posts[0]["text"] == "queued from current session"
     expect(page.locator(".msg.user.queued")).to_have_count(1)
     page.wait_for_function(
         """([id]) => {
           const el = document.querySelector(
-            `.chat-grid-pane[data-pane-id='${id}'] .msg-pane`);
+            `.chat-session-pane[data-pane-id='${id}'] .msg-pane`);
           return el && (el.scrollHeight - el.scrollTop - el.clientHeight) < 2;
         }""",
         arg=[sid],
@@ -1865,26 +1739,6 @@ def test_stop_cancels_pending_sse_reconnect(page: Page, backend_url, auth_token)
         "streams": 1,
         "activeProbes": 0,
     }
-
-
-def test_dragging_chat_tab_into_content_creates_split(page: Page, backend_url, auth_token):
-    _login(page, backend_url, auth_token)
-    page.locator(SEL_TAB_NEW).click()
-    expect(page.locator(SEL_TAB)).to_have_count(2)
-    source = page.locator(SEL_TAB).first
-    target = page.locator(".chat-scroll-wrap")
-    src_box = source.bounding_box()
-    dst_box = target.bounding_box()
-    assert src_box and dst_box
-    page.mouse.move(src_box["x"] + src_box["width"] / 2,
-                    src_box["y"] + src_box["height"] / 2)
-    page.mouse.down()
-    page.mouse.move(dst_box["x"] + dst_box["width"] / 2,
-                    dst_box["y"] + dst_box["height"] / 2,
-                    steps=12)
-    expect(page.locator(".chat-grid-drop-overlay")).to_be_visible()
-    page.mouse.up()
-    expect(page.locator(SEL_GRID_PANE)).to_have_count(2)
 
 
 # Note: drag-and-drop tab reorder and right-click context menu are harder

@@ -36,6 +36,7 @@ async def test_drain_starts_fifo_head_once_when_thread_is_idle():
     queue.enqueue(
         "thread-1", "first", permission="plan",
         model="gpt-test", model_provider="openai", effort="high",
+        service_tier="priority",
         source_device_kind="desktop")
     queue.enqueue("thread-1", "second")
     turns = Turns()
@@ -49,6 +50,7 @@ async def test_drain_starts_fifo_head_once_when_thread_is_idle():
     assert kwargs["model"] == "gpt-test"
     assert kwargs["model_provider"] == "openai"
     assert kwargs["effort"] == "high"
+    assert kwargs["service_tier"] == "priority"
     from backend import turn_notifications
     assert turn_notifications._turn_origins["thread-1"] == "desktop"
     turn_notifications.clear_turn_origin("thread-1")
@@ -86,6 +88,7 @@ def test_queue_survives_service_restart_and_persists_every_mutation(tmp_path):
     queued = first.enqueue(
         "thread-1", "survive restart", image_ids="a" * 32,
         permission="plan", model="gpt-test", effort="high",
+        service_tier="priority",
         source_device_kind="mobile",
     )
     first.pause("thread-1", True)

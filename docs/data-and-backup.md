@@ -5,7 +5,7 @@
 muselab-codex has no application database. Its current native state lives in
 three places:
 
-1. the workspace selected by `MUSELAB_ROOT`;
+1. the default workspace selected by `MUSELAB_ROOT` and any additional registered workspaces;
 2. deployment configuration such as the service `.env`;
 3. Codex CLI state under `$CODEX_HOME` (normally `~/.codex`).
 
@@ -13,7 +13,9 @@ three places:
 
 | Path | Contains | Why it matters |
 |---|---|---|
-| `$MUSELAB_ROOT/` | Your files and muselab-codex workspace state | This is the user-owned workspace |
+| `$MUSELAB_ROOT/` | Your files and muselab-codex workspace state | This is the default user-owned workspace |
+| Every additional registered workspace | That workspace's files and `.muselab-dustbin/` | Required to restore its files and recoverable trash independently |
+| `$MUSELAB_ROOT/.muselab-codex/workspaces.json` | Registered workspace names and paths | Restores the workspace picker; restored paths must still exist |
 | `$MUSELAB_ROOT/.muselab-codex/attachments/threads/` | Files attached to materialized Codex threads | Required for attachment previews and the local paths stored in transcripts |
 | `$MUSELAB_ROOT/.muselab-codex/usage/` | Sanitized per-thread numeric token-usage snapshots | Keeps the context meter populated after a backend restart |
 | `$MUSELAB_ROOT/.muselab-codex/scheduler.json` | Scheduled tasks, run history, and unread state | Restores automation |
@@ -41,10 +43,10 @@ file. Codex remains the source of truth for threads and configuration.
 
 1. Install the same supported Codex CLI and muselab-codex revision.
 2. Stop the service.
-3. Restore `$MUSELAB_ROOT`, the active service `.env`, and `$CODEX_HOME`.
+3. Restore `$MUSELAB_ROOT`, every additional workspace you need, the active service `.env`, and `$CODEX_HOME`.
 4. Check that `MUSELAB_ROOT`, `HOME`, and optional `CODEX_HOME` point to the restored locations.
 5. Confirm `codex login status`, then start muselab-codex.
-6. Open a recent thread and verify both its transcript and one attachment.
+6. Open a recent thread, switch through the restored workspaces, and verify a transcript, one attachment, and one file preview.
 7. Check scheduled tasks and send a test notification to verify VAPID state.
 
 Use the matching service and upgrade instructions when restoring an instance.

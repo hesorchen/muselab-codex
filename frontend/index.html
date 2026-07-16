@@ -373,12 +373,12 @@
       <div class="filelist-wrap" x-show="!searchMode">
         <div class="filelist-sticky-root"
              :class="{ 'drag-over': dragOverRoot }"
-             :title="contextInfo.workspace_root || ''"
+             :title="currentWorkspacePath() || ''"
              @dragover.prevent="onTreeRootDragOver($event)"
              @dragleave="dragOverRoot = false"
              @drop.prevent="onTreeRootDrop($event)">
           <span class="icon"><svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12L12 3l9 9M5 10v10h14V10"/></svg></span>
-          <span class="path" x-text="contextInfo.workspace_root || '—'"></span>
+          <span class="path" x-text="currentWorkspacePath() || '—'"></span>
           <!-- Root-level quick actions. Same doNewFile/doNewDir the per-dir
                "+" and ctx menu use — both already handle path:'' (root), so
                these are pure entry points, no new write paths. @click.stop
@@ -741,8 +741,9 @@
         </svg>
       </button>
 
-      <div class="preview-body"
+      <div class="preview-body" x-ref="previewBody"
            :class="{ 'drag-hover': previewDragHover || osFileDragging }"
+           @scroll.passive="onPreviewViewportScroll()"
            @dragover.prevent="previewDragHover = true"
            @dragenter.prevent="previewDragHover = true"
            @dragleave.prevent="previewDragHover = false"
@@ -865,29 +866,37 @@
           <div class="empty-title" x-text="lang==='zh' ? '空文件' : 'Empty file'"></div>
           <div class="empty-hint" x-text="lang==='zh' ? '该文件没有内容。' : 'This file has no content.'"></div>
         </div>
-        <!-- src 仅在该模式激活时才指向真实 URL，否则空字符串/about:blank，
-             避免隐藏元素请求 raw URL 触发对 md/txt 的下载。 -->
+        <!-- Keep up to four HTML reports mounted. Re-selecting a resident
+             report only toggles display, preserving its live DOM/scripts/forms
+             and avoiding another raw request. The keyed LRU removes the least
+             recently used browsing context when a fifth report is opened. -->
         <!-- Zoom via transform:scale (NOT `zoom`): `zoom` is non-standard and
              Safari scales the iframe box down to the top-left, leaving an empty
              right/bottom gutter, while Chrome reflows it to fill. transform +
              inverse width/height (e.g. 0.5 → 200% box scaled to 100%) gives the
              same "reflow & fill, show more, smaller" result on every engine.
              (2026-06-26 user report: html preview zoom gutters on mobile.) -->
-        <iframe x-show="!editing && previewMode==='html'"
-                x-ref="htmlFrame"
-                :src="previewMode==='html' ? rawUrl(selected, {preview:true}) : 'about:blank'"
-                :style="previewZoom === 1 ? {} : { transform: 'scale(' + previewZoom + ')', transformOrigin: 'top left', width: 'calc(100% / ' + previewZoom + ')', height: 'calc(100% / ' + previewZoom + ')' }"
-                class="frame" sandbox="allow-scripts"></iframe>
+        <template x-for="entry in htmlPreviewFrames" :key="entry.path">
+          <iframe x-show="!editing && previewMode==='html' && selected===entry.path"
+                  :src="rawUrl(entry.path, {preview:true})"
+                  :data-preview-html-path="entry.path"
+                  :style="previewZoom === 1 ? {} : { transform: 'scale(' + previewZoom + ')', transformOrigin: 'top left', width: 'calc(100% / ' + previewZoom + ')', height: 'calc(100% / ' + previewZoom + ')' }"
+                  @load="onPreviewFrameLoad('html', entry.path)"
+                  class="frame" sandbox="allow-scripts"></iframe>
+        </template>
         <!-- Use template x-if (not x-show) so the <img> isn't even in the DOM
              when not active — :src="" would otherwise resolve to the page URL
              and fire a spurious resource-load-failed error in console. -->
         <template x-if="!editing && previewMode==='img' && selected">
           <img :src="rawUrl(selected)" :alt="selected ? selected.split('/').pop() : ''"
                class="preview-img" :style="'zoom:' + previewZoom"
+               @load="onPreviewContentLoad('img')"
                @error="onPreviewImageError()" />
         </template>
         <iframe x-show="!editing && previewMode==='pdf'"
                 :src="previewMode==='pdf' ? rawUrl(selected) : 'about:blank'"
+                x-ref="pdfFrame"
+                @load="onPreviewFrameLoad('pdf')"
                 class="frame"></iframe>
 
         <!-- xlsx preview: per-sheet tabs + scrollable table. Backend caps to
@@ -920,7 +929,8 @@
                 <div class="empty-title" x-text="lang==='zh' ? '空工作表' : 'Empty sheet'"></div>
                 <div class="empty-hint" x-text="lang==='zh' ? '这个工作表没有可显示的单元格。' : 'This sheet has no cells to display.'"></div>
               </div>
-              <div class="xlsx-scroll" x-show="sh.rows && sh.rows.length">
+              <div class="xlsx-scroll" x-show="sh.rows && sh.rows.length"
+                   @scroll.passive="onPreviewViewportScroll()">
                 <table class="xlsx-table" :style="'zoom:' + previewZoom">
                   <tbody>
                     <template x-for="(row, ri) in sh.rows" :key="ri">
@@ -967,6 +977,7 @@
                   x-text="lang==='zh' ? '（列数已截断）' : '(cols truncated)'"></span>
           </div>
           <div class="xlsx-scroll"
+               @scroll.passive="onPreviewViewportScroll()"
                x-show="csvData && csvData.rows && csvData.rows.length">
             <table class="xlsx-table" :style="'zoom:' + previewZoom">
               <thead x-show="csvData && csvData.has_header && csvData.header && csvData.header.length">
@@ -1254,7 +1265,7 @@
         <div class="session-picker chat-tab-history" @click.outside="sessionPickerOpen = false">
           <button class="chat-tab-history-btn" @click="toggleHistoryPicker($event)" type="button"
                   :title="lang==='zh' ? '历史会话' : 'Session history'">
-            <svg><use href="#i-folder"/></svg>
+            <svg><use href="#i-history"/></svg>
           </button>
           <div x-show="sessionPickerOpen" x-transition.opacity.duration.150ms
                class="session-picker-pop"
@@ -1374,21 +1385,50 @@
             </div>
           </div>
         </div>
-        <div class="chat-tabs-list" @wheel="onChatTabsWheel($event)">
-          <button class="chat-tab chat-workspace-tab"
-                  x-show="hasChatGridWorkspace() && !_isMobileLayout()"
-                  :class="{ active: chatGridIsActive() }"
-                  @click="openChatGridWorkspace()"
-                  :title="lang==='zh' ? '返回多视图工作区' : 'Return to multi-view workspace'">
-            <svg viewBox="0 0 20 20" aria-hidden="true">
-              <rect x="1.5" y="1.5" width="9" height="17" rx="1"/>
-              <rect x="12" y="1.5" width="6.5" height="7.5" rx="1"/>
-              <rect x="12" y="10.5" width="6.5" height="8" rx="1"/>
-            </svg>
-            <span x-text="(lang==='zh' ? '多视图' : 'Multi-view') + ' · ' + chatGridWorkspaceIds().length"></span>
+        <div class="workspace-picker" @click.outside="workspaceMenuOpen = false">
+          <button class="workspace-picker-btn" type="button"
+                  @click="workspaceMenuOpen = !workspaceMenuOpen"
+                  :disabled="workspaceSwitching || _creatingSession"
+                  :title="currentWorkspacePath()"
+                  :aria-expanded="workspaceMenuOpen"
+                  :aria-label="lang==='zh' ? '切换工作目录' : 'Switch workspace'">
+            <svg><use href="#i-folder"/></svg>
+            <span class="workspace-picker-name" x-text="workspaceLabel()"></span>
+            <svg class="workspace-picker-caret"><use href="#i-chevron-down"/></svg>
           </button>
-          <template x-for="tid in openTabIds" :key="tid">
-            <div class="chat-tab" :class="{active: !chatGridIsActive() && tid === currentId, 'drag-over': tabDragOverId === tid}"
+          <div class="workspace-picker-pop" x-show="workspaceMenuOpen" x-cloak
+               x-transition.opacity.duration.120ms>
+            <div class="workspace-picker-title"
+                 x-text="lang==='zh' ? '工作目录' : 'Workspaces'"></div>
+            <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
+              <div class="workspace-picker-row"
+                   :class="{ active: workspace.path === currentWorkspacePath() }"
+                   :title="workspace.path">
+                <button class="workspace-picker-select"
+                        @click="switchWorkspace(workspace.path)">
+                  <span class="workspace-picker-check"
+                        x-text="workspace.path === currentWorkspacePath() ? '✓' : ''"></span>
+                  <span class="workspace-picker-meta">
+                    <strong x-text="workspace.name"></strong>
+                    <small x-text="workspace.path"></small>
+                  </span>
+                </button>
+                <button class="workspace-picker-remove" x-show="!workspace.primary"
+                        @click.stop="removeWorkspace(workspace.path)"
+                        :title="lang==='zh' ? '移除目录' : 'Remove workspace'">
+                  <svg><use href="#i-x"/></svg>
+                </button>
+              </div>
+            </template>
+            <button class="workspace-picker-add" @click="addWorkspace()">
+              <svg><use href="#i-folder-plus"/></svg>
+              <span x-text="lang==='zh' ? '添加工作目录…' : 'Add workspace…'"></span>
+            </button>
+          </div>
+        </div>
+        <div class="chat-tabs-list" @wheel="onChatTabsWheel($event)">
+          <template x-for="tid in workspaceOpenTabIds()" :key="tid">
+            <div class="chat-tab" :class="{active: tid === currentId, 'drag-over': tabDragOverId === tid}"
                  :data-tid="tid"
                  :draggable="isPointerDevice"
                  @dragstart="onTabDragStart($event, tid)"
@@ -1439,46 +1479,6 @@
                strip (middle) + new (right)". Removed current-session chip
                (redundant once strip is visible) and outline button (moved
                to chat-pane FAB that aligns with .jump-bottom). -->
-          <div class="chat-grid-menu-wrap" @click.outside="chatGridMenuOpen = false">
-            <button class="chat-grid-toggle" @click="toggleChatGrid()"
-                    :class="{ active: chatGridIsActive() }"
-                    :title="lang==='zh' ? '选择会话视图' : 'Choose chat view'"
-                    :aria-expanded="chatGridMenuOpen"
-                    :aria-label="lang==='zh' ? '会话视图' : 'Chat view'">
-              <svg viewBox="0 0 20 20" aria-hidden="true">
-                <rect x="1.5" y="1.5" width="9" height="17" rx="1"/>
-                <rect x="12" y="1.5" width="6.5" height="7.5" rx="1"/>
-                <rect x="12" y="10.5" width="6.5" height="8" rx="1"/>
-              </svg>
-            </button>
-            <div class="chat-grid-menu" x-show="chatGridMenuOpen" x-transition.opacity.duration.120ms>
-              <div class="chat-grid-menu-title" x-text="lang==='zh' ? '会话视图' : 'Chat view'"></div>
-              <button @click="setChatGridView(1)">
-                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="26" height="18" rx="2"/></svg>
-                <span x-text="lang==='zh' ? '单窗口' : 'Single'"></span>
-              </button>
-              <button @click="setChatGridView(2, 'columns')" :disabled="openTabIds.length < 2">
-                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12.5" height="18" rx="2"/><rect x="14.5" y="1" width="12.5" height="18" rx="2"/></svg>
-                <span x-text="lang==='zh' ? '左右双栏' : 'Two columns'"></span>
-              </button>
-              <button @click="setChatGridView(2, 'rows')" :disabled="openTabIds.length < 2">
-                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="26" height="8.5" rx="2"/><rect x="1" y="10.5" width="26" height="8.5" rx="2"/></svg>
-                <span x-text="lang==='zh' ? '上下双栏' : 'Two rows'"></span>
-              </button>
-              <button @click="setChatGridView(3, 'primary')" :disabled="openTabIds.length < 3">
-                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="13" height="18" rx="2"/><rect x="15" y="1" width="12" height="8.5" rx="2"/><rect x="15" y="10.5" width="12" height="8.5" rx="2"/></svg>
-                <span x-text="lang==='zh' ? '主次三窗' : 'Primary three panes'"></span>
-              </button>
-              <button @click="setChatGridView(3, 'secondary')" :disabled="openTabIds.length < 3">
-                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12" height="8.5" rx="2"/><rect x="1" y="10.5" width="12" height="8.5" rx="2"/><rect x="15" y="1" width="12" height="18" rx="2"/></svg>
-                <span x-text="lang==='zh' ? '次主三窗' : 'Secondary three panes'"></span>
-              </button>
-              <button @click="setChatGridView(4, 'quad')" :disabled="openTabIds.length < 4">
-                <svg viewBox="0 0 28 20"><rect x="1" y="1" width="12.5" height="8.5" rx="2"/><rect x="14.5" y="1" width="12.5" height="8.5" rx="2"/><rect x="1" y="10.5" width="12.5" height="8.5" rx="2"/><rect x="14.5" y="10.5" width="12.5" height="8.5" rx="2"/></svg>
-                <span x-text="lang==='zh' ? '四宫格' : 'Four panes'"></span>
-              </button>
-            </div>
-          </div>
           <button class="chat-tab-new" @click="newSession({ cwd: currentWorkspacePath() })" :disabled="_creatingSession"
                   :aria-busy="_creatingSession"
                   :title="t('btn.new_session')">+</button>
@@ -1494,8 +1494,6 @@
              @keydown.escape.window="closeTabMenu()">
           <button @click="menuRename(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '重命名' : 'Rename'"></button>
-          <button @click="openGridFromTab(tabCtxMenu && tabCtxMenu.id)"
-                  x-text="lang==='zh' ? '加入会话分屏' : 'Add to chat grid'"></button>
           <button @click="menuClose(tabCtxMenu && tabCtxMenu.id)"
                   x-text="lang==='zh' ? '关闭 tab' : 'Close tab'"></button>
           <button @click="menuExportMarkdown(tabCtxMenu && tabCtxMenu.id)"
@@ -1515,22 +1513,7 @@
              anchoring FABs to the outer wrapper placed them *behind* that
              variable-height composer, leaving only the top button visible. -->
         <div class="chat-transcript-wrap">
-        <div class="chat-grid-drop-overlay"
-             x-show="_draggingTabId && !visibleChatPaneIds().includes(_draggingTabId)"
-             @dragenter.prevent.stop
-             @dragover.prevent.stop="$event.dataTransfer.dropEffect = 'move'"
-             @drop.prevent.stop="onChatGridDrop($event, '')">
-          <div class="chat-grid-drop-card">
-            <svg viewBox="0 0 28 20" aria-hidden="true">
-              <rect x="1" y="1" width="13" height="18" rx="2"/>
-              <rect x="15" y="1" width="12" height="8.5" rx="2"/>
-              <rect x="15" y="10.5" width="12" height="8.5" rx="2"/>
-            </svg>
-            <strong x-text="lang==='zh' ? '松开加入分屏' : 'Drop to add a pane'"></strong>
-            <span x-text="lang==='zh' ? '当前会话会继续保留' : 'The current conversation stays open'"></span>
-          </div>
-        </div>
-        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent()" @touchmove.passive="_userScrollIntent()" @pointerdown.passive="_userScrollIntent()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length, 'is-split': visibleChatPaneIds().length > 1 }">
+        <div class="chat-body" x-ref="chatBody" @scroll="onChatScroll()" @wheel.passive="_userScrollIntent()" @touchmove.passive="_userScrollIntent()" @pointerdown.passive="_userScrollIntent()" @click="onChatClick($event)" :class="{ 'msgs-hidden': !messagesReady && messages.length }">
           <!-- Shimmer skeleton while loadSession is in-flight. Without
                this, switching to a long-history session briefly shows the
                brand-empty onboarding cards as if it were a new session. -->
@@ -1657,20 +1640,6 @@
                _backendOutline cache to stay accurate on lazy-loaded
                sessions.) -->
 
-          <!-- Lazy-loaded history controls — sits above the message loop.
-               Only shown when loadSession() deferred older messages because
-               history exceeds INITIAL_LOAD. Clicking pages back in batches
-               (LOAD_MORE_BATCH = 50) while preserving scroll position. -->
-          <div x-show="messagesReady && (hasMoreHistory() || historyTruncated())"
-               class="load-earlier-wrap">
-            <button x-show="hasMoreHistory()"
-                    class="load-earlier-btn"
-                    @click="loadEarlierMessages()"
-                    x-text="t('history.load_earlier', { n: earlierMessageCount() })"></button>
-            <div x-show="historyTruncated() && !hasMoreHistory()"
-                 class="load-earlier-truncated-note"
-                 x-text="t('history.truncated_note')"></div>
-          </div>
           <!-- Per-message rendering — Alpine 3's reactivity worked
                reliably on this flat messages x-for. The "group into
                assistant turns" experiment broke streaming reactivity
@@ -1680,45 +1649,26 @@
                to hide the avatar on all but the FIRST assistant-side
                msg in a run — visually the same "one avatar per turn"
                result without a derived data structure. -->
-          <!-- Keep only the recent keyed panes mounted. Every binding inside
-               the loop is scoped by `tid`, so hidden tabs can retain their DOM
-               and scroll position without reading the active tab's messages.
-               The LRU in mountedChatPaneIds bounds retained transcript DOM. -->
-          <div class="chat-grid" :class="chatGridClass()"
-               @dragover.prevent="onChatGridDragOver($event, '')"
-               @dragleave.self="splitDragOverId = ''"
-               @drop.prevent="onChatGridDrop($event, '')">
+          <!-- Keep only the recent keyed sessions mounted. Hidden sessions
+               retain their DOM and scroll position, while x-show guarantees
+               that exactly one transcript is visible. The resident LRU in
+               mountedChatPaneIds keeps the retained DOM bounded. -->
+          <!-- The empty-state above already owns a full transcript viewport.
+               Keep resident panes mounted, but remove their wrapper from layout
+               until the current session has a message; otherwise both siblings'
+               min-height:100% rules create an extra blank viewport below it. -->
+          <div class="chat-session-stack" x-show="messages.length">
           <template x-for="tid in mountedChatPaneIds()" :key="tid">
-          <section class="chat-grid-pane"
-                   x-show="visibleChatPaneIds().includes(tid)"
-                   :class="chatGridPaneClass(tid)"
-                   :data-pane-id="tid"
-                   @dragover.prevent.stop="onChatGridDragOver($event, tid)"
-                   @drop.prevent.stop="onChatGridDrop($event, tid)">
-            <header class="chat-grid-pane-head" draggable="true"
-                    @dragstart="onTabDragStart($event, tid)" @dragend="onTabDragEnd()">
-              <span class="chat-grid-pane-status"
-                    x-show="isTabStreaming(tid) || isTabUnread(tid)"
-                    :class="{ streaming: isTabStreaming(tid), unread: isTabUnread(tid) }"></span>
-              <span class="chat-grid-pane-title ellipsis" x-text="tabTitle(tid) || '…'"></span>
-              <span class="chat-grid-pane-workspace ellipsis"
-                    x-show="sessionWorkspaces.length > 1"
-                    x-text="workspaceLabel((sessions.find(s => s.id === tid) || {}).cwd)"></span>
-              <button class="chat-grid-pane-close" @click.stop="removeSessionFromGrid(tid)"
-                      :title="lang==='zh' ? '移出分屏' : 'Remove from grid'">×</button>
-            </header>
-            <div class="chat-grid-pane-loading"
-                 x-show="visibleChatPaneIds().length > 1
-                         && (!tabState[tid] || !tabState[tid]._loaded
-                             || (tid === currentId && !messagesReady))">
-              <span x-text="lang==='zh' ? '正在恢复会话…' : 'Restoring session…'"></span>
-            </div>
+          <section class="chat-session-pane"
+                   x-show="tid === currentId && sessionInCurrentWorkspace(tid)"
+                   :class="{ active: tid === currentId }"
+                   :data-pane-id="tid">
             <div class="msg-pane"
                  @scroll="onChatScroll(tid, $event)"
                  @wheel.passive="_userScrollIntent(tid)"
                  @touchmove.passive="_userScrollIntent(tid)"
                  @pointerdown.passive="_userScrollIntent(tid)">
-            <div x-show="visibleChatPaneIds().length > 1 && (hasMoreHistory(tid) || historyTruncated(tid))"
+            <div x-show="messagesReady && (hasMoreHistory(tid) || historyTruncated(tid))"
                  class="load-earlier-wrap">
               <button x-show="hasMoreHistory(tid)"
                       class="load-earlier-btn"
@@ -2462,9 +2412,8 @@
               </div>
             </div>
           </template>
-            <!-- Per-pane pending queue. This must live inside .msg-pane:
-                 split mode intentionally hides chat-body children outside
-                 .chat-grid, which previously made queueing appear unsupported. -->
+            <!-- The pending queue lives inside the owning keyed transcript so
+                 tab switches never leak queued prompts between sessions. -->
             <template x-for="(q, qi) in (tabState[tid] && tabState[tid].pendingQueue || [])"
                       :key="q.id">
               <div class="msg user queued">
@@ -2539,7 +2488,7 @@
             </div>
 
             <div x-show="tabState[tid] && tabState[tid].compacting"
-                 class="msg assistant compact-pending">
+                 class="msg assistant msg-streaming compact-pending">
               <div class="msg-row">
                 <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
                   <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
@@ -2552,14 +2501,12 @@
               </div>
             </div>
 
-            <!-- The first-token placeholder belongs to the transcript pane in
-                 both single and split view. Keeping the single-view variant
-                 outside .chat-grid made the grid's 100% min-height insert a
-                 viewport-sized gap between the prompt and this row. -->
+            <!-- Keep the first-token placeholder in the keyed transcript pane
+                 so it follows the owning session during rapid tab switches. -->
             <div x-show="tabState[tid] && tabState[tid].streaming
                          && (!paneMessages(tid).length
                              || paneMessages(tid)[paneMessages(tid).length-1].role === 'user')"
-                 class="msg assistant first-token-pending">
+                 class="msg assistant msg-streaming first-token-pending">
               <div class="msg-row">
                 <span class="msg-avatar assistant-avatar is-streaming-avatar" :title="mascotLabel()">
                   <svg viewBox="0 0 24 24"><use :href="mascotHref()"/></svg>
@@ -2575,44 +2522,6 @@
               </div>
             </div>
             </div>
-            <button class="jump-bottom"
-                    x-show="visibleChatPaneIds().length > 1 && tid === currentId
-                            && tabState[tid] && tabState[tid].atBottom === false"
-                    @click="scrollToBottom(true, tid)"
-                    :title="lang==='zh' ? '最新' : 'Jump to latest'"
-                    :aria-label="lang==='zh' ? '跳到最新消息' : 'Jump to latest'">
-              <svg><use href="#i-arrow-down"/></svg>
-            </button>
-            <button class="chat-outline-fab"
-                    x-show="visibleChatPaneIds().length > 1 && tid === currentId
-                            && tabState[tid] && tabState[tid].atBottom === false"
-                    @click="msgOutlineOpen = true"
-                    :title="lang==='zh' ? '会话目录' : 'Outline'">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-                   stroke-linecap="round" stroke-linejoin="round">
-                <line x1="8" y1="6" x2="21" y2="6"/>
-                <line x1="8" y1="12" x2="21" y2="12"/>
-                <line x1="8" y1="18" x2="21" y2="18"/>
-                <circle cx="4" cy="6" r="1" fill="currentColor"/>
-                <circle cx="4" cy="12" r="1" fill="currentColor"/>
-                <circle cx="4" cy="18" r="1" fill="currentColor"/>
-              </svg>
-            </button>
-            <button class="chat-prevuser-fab"
-                    x-show="visibleChatPaneIds().length > 1 && tid === currentId
-                            && tabState[tid] && tabState[tid].atBottom === false"
-                    @click="jumpToPrevUser()"
-                    :title="lang==='zh' ? '上一条提问' : 'Previous message'"
-                    :aria-label="lang==='zh' ? '跳到上一条用户消息' : 'Jump to previous user message'">
-              <svg><use href="#i-arrow-up"/></svg>
-            </button>
-            <button x-show="tid !== currentId && tabState[tid] && tabState[tid]._loaded"
-                    class="chat-grid-mask"
-                    @click.stop="activateGridPane(tid)"
-                    @wheel.prevent.stop="scrollGridPane(tid, $event)"
-                    :aria-label="(lang==='zh' ? '选中会话：' : 'Select session: ') + tabTitle(tid)">
-              <span x-text="lang==='zh' ? '点击选中会话' : 'Click to select session'"></span>
-            </button>
           </section>
           </template>
           </div>
@@ -2770,7 +2679,7 @@
           <form autocomplete="off" onsubmit="return false" style="display:contents">
           <textarea x-model="input" x-ref="chatInput"
                     rows="1"
-                    :disabled="!availableModels.length"
+                    :disabled="workspaceSwitching || !availableModels.length"
                     class="chat-input-textarea"
                     name="muselab-chat-message"
                     inputmode="text"
@@ -2797,19 +2706,10 @@
                  the running turn). -->
             <button @click="$refs.attachInput.click()"
                     class="chat-toolbar-btn"
+                    :disabled="workspaceSwitching"
                     :title="t('attach.title')">
               <svg><use href="#i-paperclip"/></svg>
             </button>
-            <select class="chat-toolbar-select chat-toolbar-workspace"
-                    :disabled="workspaceSwitching || _creatingSession"
-                    :value="currentWorkspacePath()"
-                    @change="chooseSessionWorkspace($event.target.value); $event.target.value = currentWorkspacePath()"
-                    :title="lang==='zh' ? '会话工作目录（切换会新建会话）' : 'Session workspace (switching creates a new session)'">
-              <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
-                <option :value="workspace.path" x-text="workspace.name"></option>
-              </template>
-              <option value="__custom__" x-text="lang==='zh' ? '自定义目录…' : 'Custom directory…'"></option>
-            </select>
             <!-- Command-palette opener lives in the chat pane's TOP bar
                  (global "files / sessions / actions" entry), not here.
                  This bottom toolbar is reserved for per-turn controls
@@ -2821,7 +2721,7 @@
                  See the header near the organize / scheduler buttons. -->
             <!-- Model selector -->
             <select x-model="model" @change="onModelChange()"
-                    :disabled="_sessionSettingsBusy(currentId)"
+                    :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"
                     class="chat-toolbar-select"
                     :title="lang==='zh' ? '切换模型' : 'Switch model'">
               <template x-if="model && !availableModels.some(m => m.model === model)">
@@ -2837,7 +2737,7 @@
             </select>
             <!-- Permission mode -->
             <select x-model="permission" @change="onPermissionChange()"
-                    :disabled="_sessionSettingsBusy(currentId)"
+                    :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"
                     class="chat-toolbar-select chat-toolbar-permission"
                     :title="t('set.label.default_permission')">
               <option value="default" x-text="permissionLabel('default')"></option>
@@ -2848,7 +2748,7 @@
                  means the model catalog's native default; explicit values are
                  sent as turn/start.effort and persist for later turns. -->
             <select x-model="effort" @change="onEffortChange()"
-                    :disabled="_sessionSettingsBusy(currentId)"
+                    :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"
                     x-effect="effort + ':' + model + ':' + availableModels.length; $nextTick(() => { $el.value = effort || '' })"
                     x-show="_supportsEffort(model)"
                     class="chat-toolbar-select chat-toolbar-effort"
@@ -2857,8 +2757,19 @@
                 <option :value="opt.value" x-text="t(opt.labelKey)"></option>
               </template>
             </select>
-            <!-- Mobile-only gear: on phones the permission + effort selects
-                 above are hidden (CSS) and collapsed in here, so the composer
+            <!-- Fast is a native Codex service tier, independent of Effort.
+                 The control is catalog-driven so API-key/custom models that
+                 do not advertise a tier named Fast never see a dead toggle. -->
+            <label class="chat-toolbar-fast"
+                   x-show="_supportsFast(model)"
+                   :title="t('fast.title')">
+              <input type="checkbox" x-model="fastModeEnabled" @change="onFastModeChange()"
+                     :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"
+                     :aria-label="t('fast.label')">
+              <span x-text="t('fast.label')"></span>
+            </label>
+            <!-- Mobile-only gear: on phones the permission / effort / Fast /
+                 reasoning-summary controls are collapsed in here, so the composer
                  toolbar stays a single row instead of wrapping to two. Desktop
                  hides this whole group and keeps the selects inline. The selects
                  inside share the SAME x-model as the inline ones, so flipping
@@ -2867,9 +2778,9 @@
               <button type="button"
                       class="chat-toolbar-btn chat-toolbar-more-btn"
                       :class="{ active: composerSettingsOpen }"
-                      :disabled="_sessionSettingsBusy(currentId)"
+                      :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"
                       @click.stop="composerSettingsOpen = !composerSettingsOpen"
-                      :title="lang==='zh' ? '会话设置（权限 / Effort）' : 'Session settings (permission / effort)'">
+                      :title="lang==='zh' ? '会话设置（权限 / Effort / Fast / 思考摘要）' : 'Session settings (permission / effort / Fast / summary)'">
                 <svg><use href="#i-cog"/></svg>
               </button>
               <!-- iOS renders a native select's option sheet outside the
@@ -2885,19 +2796,9 @@
                    @keydown.escape.window="composerSettingsOpen = false">
                 <div class="chat-toolbar-more-title" x-text="t('session.settings')"></div>
                 <label class="chat-toolbar-more-field">
-                  <span x-text="lang==='zh' ? '工作目录' : 'Workspace'"></span>
-                  <select :value="currentWorkspacePath()"
-                          @change="chooseSessionWorkspace($event.target.value); composerSettingsOpen = false">
-                    <template x-for="workspace in sessionWorkspaces" :key="workspace.path">
-                      <option :value="workspace.path" x-text="workspace.name"></option>
-                    </template>
-                    <option value="__custom__" x-text="lang==='zh' ? '自定义目录…' : 'Custom directory…'"></option>
-                  </select>
-                </label>
-                <label class="chat-toolbar-more-field">
                   <span x-text="t('session.permission')"></span>
                   <select x-model="permission" @change="onPermissionChange()"
-                          :disabled="_sessionSettingsBusy(currentId)">
+                          :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)">
                     <option value="default" x-text="permissionLabel('default')"></option>
                     <option value="plan" x-text="permissionLabel('plan')"></option>
                     <option value="bypassPermissions" x-text="permissionLabel('bypassPermissions')"></option>
@@ -2906,12 +2807,28 @@
                 <label class="chat-toolbar-more-field" x-show="_supportsEffort(model)">
                   <span x-text="t('session.intelligence')"></span>
                   <select x-model="effort" @change="onEffortChange()"
-                          :disabled="_sessionSettingsBusy(currentId)"
+                          :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"
                           x-effect="effort + ':' + model + ':' + availableModels.length; $nextTick(() => { $el.value = effort || '' })">
                     <template x-for="opt in effortChoices(model)" :key="opt.value || 'auto'">
                       <option :value="opt.value" x-text="t(opt.labelKey)"></option>
                     </template>
                   </select>
+                </label>
+                <label class="chat-toolbar-more-toggle" x-show="_supportsFast(model)"
+                       :title="t('fast.title')">
+                  <span x-text="t('fast.label')"></span>
+                  <input type="checkbox" x-model="fastModeEnabled"
+                         @change="onFastModeChange()"
+                         :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"
+                         :aria-label="t('fast.label')">
+                </label>
+                <label class="chat-toolbar-more-toggle" x-show="_supportsThinking(model)"
+                       :title="t('thinking.title')">
+                  <span x-text="t('thinking.label')"></span>
+                  <input type="checkbox" x-model="thinkingEnabled"
+                         @change="onThinkingChange()"
+                         :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)"
+                         :aria-label="t('thinking.label')">
                 </label>
               </div>
             </div>
@@ -2922,13 +2839,14 @@
                    x-show="_supportsThinking(model)"
                    :title="t('thinking.title')">
               <input type="checkbox" x-model="thinkingEnabled" @change="onThinkingChange()"
-                     :disabled="_sessionSettingsBusy(currentId)">
+                     :disabled="workspaceSwitching || _sessionSettingsBusy(currentId)">
               <span x-text="t('thinking.label')"></span>
             </label>
             <!-- Context ring — % used. Click to compact. Right-click
                  opens the SDK breakdown popup (the dedicated magnifier
                  button was removed per user request). -->
             <button class="chat-toolbar-ring"
+                    :disabled="workspaceSwitching"
                     :class="{
                       warn: sessionUsage.context_used_pct >= 70 && sessionUsage.context_used_pct < 90,
                       danger: sessionUsage.context_used_pct >= 90,
@@ -2979,7 +2897,7 @@
                  Same shape + size + fill — they read as a sibling pair
                  (blue send / red stop). -->
             <button @click="send()"
-                    :disabled="!availableModels.length || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
+                    :disabled="workspaceSwitching || !availableModels.length || _sendWaitingForUpload || pendingImages.some(im => im.uploading) || pendingDocs.some(d => d.uploading) || (!input.trim() && !pendingImages.length && !pendingDocs.length)"
                     class="btn-primary chat-toolbar-send chat-toolbar-queue"
                     :title="_isBusy(currentId) ? t('queue.button_hint') : t('btn.send')">
               <span class="icon"><svg><use href="#i-send"/></svg></span><span x-text="t('btn.send')"></span>
@@ -2988,7 +2906,7 @@
                     x-text="_currentQueueLen()"></span>
             </button>
             <button x-show="isTabStreaming(currentId)" @click="stop()"
-                    :disabled="!!(tabState[currentId] && tabState[currentId]._stopping)"
+                    :disabled="workspaceSwitching || !!(tabState[currentId] && tabState[currentId]._stopping)"
                     class="btn-danger chat-toolbar-send chat-toolbar-stop"
                     :title="(tabState[currentId] && tabState[currentId]._stopping)
                               ? t('btn.stopping')
@@ -3007,15 +2925,15 @@
          Sits as a sibling of the panes in the same grid; on mobile, the panes
          become full-width and we swap which one is visible via mobileTab. -->
     <nav class="mobile-tab-bar" x-show="authed">
-      <button :class="{active: mobileTab==='files'}" @click="mobileTab='files'">
+      <button :class="{active: mobileTab==='files'}" @click="setMobileTab('files')">
         <span class="icon"><svg><use href="#i-folder"/></svg></span>
         <span x-text="t('pane.files')"></span>
       </button>
-      <button :class="{active: mobileTab==='preview'}" @click="mobileTab='preview'">
+      <button :class="{active: mobileTab==='preview'}" @click="setMobileTab('preview')">
         <span class="icon"><svg><use href="#i-file-text"/></svg></span>
         <span x-text="t('pane.preview')"></span>
       </button>
-      <button :class="{active: mobileTab==='chat'}" @click="mobileTab='chat'">
+      <button :class="{active: mobileTab==='chat'}" @click="setMobileTab('chat')">
         <span class="icon"><svg><use href="#i-brain"/></svg></span>
         <span x-text="t('pane.chat')"></span>
       </button>
@@ -3920,6 +3838,93 @@
             </div>
           </template>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ Server workspace folder browser ============ -->
+  <div class="modal-backdrop workspace-browser-backdrop"
+       x-show="workspaceBrowser.show" x-cloak
+       x-transition.opacity.duration.120ms
+       @click.self="closeWorkspaceBrowser()">
+    <div class="modal workspace-browser-modal"
+         @keydown.escape.window="workspaceBrowser.show && !modal.show && closeWorkspaceBrowser()"
+         role="dialog" aria-modal="true"
+         :aria-label="lang==='zh' ? '选择工作目录' : 'Select workspace folder'">
+      <div class="modal-head">
+        <span class="modal-title workspace-browser-title">
+          <svg><use href="#i-folder-plus"/></svg>
+          <span x-text="lang==='zh' ? '选择工作目录' : 'Select workspace folder'"></span>
+        </span>
+        <button class="modal-close" @click="closeWorkspaceBrowser()"
+                :disabled="workspaceSwitching"
+                :title="lang==='zh' ? '关闭' : 'Close'" aria-label="Close">×</button>
+      </div>
+      <div class="workspace-browser-location">
+        <button type="button" class="workspace-browser-up"
+                @click="browseWorkspaceDirectory(workspaceBrowser.parent)"
+                :disabled="workspaceBrowser.loading || !workspaceBrowser.parent"
+                :title="lang==='zh' ? '返回上级目录' : 'Go to parent folder'">
+          <svg><use href="#i-arrow-up"/></svg>
+        </button>
+        <div class="workspace-browser-path" :title="workspaceBrowser.path"
+             x-text="workspaceBrowser.path || (lang==='zh' ? '正在读取…' : 'Loading…')"></div>
+        <button type="button" class="workspace-browser-manual"
+                @click="addWorkspacePathManually()"
+                :disabled="workspaceSwitching"
+                :title="lang==='zh' ? '手动输入选择器范围外的绝对路径' : 'Enter an absolute path outside the browser roots'"
+                x-text="lang==='zh' ? '输入路径' : 'Enter path'"></button>
+      </div>
+      <div class="modal-body workspace-browser-body">
+        <div class="workspace-browser-error" x-show="workspaceBrowser.error"
+             x-text="workspaceBrowser.error"></div>
+        <div class="workspace-browser-loading" x-show="workspaceBrowser.loading">
+          <span class="spinner"></span>
+          <span x-text="lang==='zh' ? '正在检测文件夹…' : 'Detecting folders…'"></span>
+        </div>
+        <div class="workspace-browser-empty"
+             x-show="!workspaceBrowser.loading && !workspaceBrowser.error && !workspaceBrowser.directories.length"
+             x-text="lang==='zh' ? '这里没有可浏览的子目录' : 'No subfolders here'"></div>
+        <div class="workspace-browser-list" x-show="!workspaceBrowser.loading">
+          <template x-for="directory in workspaceBrowser.directories" :key="directory.path">
+            <div class="workspace-browser-row"
+                 :class="{ selected: workspaceBrowser.selected === directory.path, registered: directory.registered }"
+                 :data-workspace-path="directory.path">
+              <button type="button" class="workspace-browser-entry"
+                      @click="selectWorkspaceDirectory(directory)"
+                      @dblclick="browseWorkspaceDirectory(directory.path)"
+                      :aria-selected="workspaceBrowser.selected === directory.path"
+                      :title="directory.path">
+                <svg class="workspace-browser-folder"><use href="#i-folder"/></svg>
+                <span class="workspace-browser-entry-meta">
+                  <strong x-text="directory.name"></strong>
+                  <small x-show="directory.registered"
+                         x-text="lang==='zh' ? '已添加' : 'Already added'"></small>
+                  <small x-show="!directory.registered && directory.project"
+                         x-text="directory.project"></small>
+                </span>
+              </button>
+              <button type="button" class="workspace-browser-open"
+                      @click="browseWorkspaceDirectory(directory.path)"
+                      :title="lang==='zh' ? '进入文件夹' : 'Open folder'">
+                <svg><use href="#i-chevron-right"/></svg>
+              </button>
+            </div>
+          </template>
+        </div>
+        <div class="workspace-browser-truncated" x-show="workspaceBrowser.truncated"
+             x-text="lang==='zh' ? '目录较多，仅显示前 300 个。' : 'Showing the first 300 folders.'"></div>
+      </div>
+      <div class="modal-foot workspace-browser-foot">
+        <span class="workspace-browser-selection" :title="workspaceBrowserTarget()"
+              x-text="workspaceBrowserTargetLabel()"></span>
+        <button type="button" class="btn-ghost" @click="closeWorkspaceBrowser()"
+                :disabled="workspaceSwitching"
+                x-text="lang==='zh' ? '取消' : 'Cancel'"></button>
+        <button type="button" class="btn-primary workspace-browser-confirm"
+                @click="confirmWorkspaceBrowser()"
+                :disabled="workspaceBrowser.loading || workspaceSwitching || !workspaceBrowserTarget()"
+                x-text="workspaceSwitching ? (lang==='zh' ? '添加中…' : 'Adding…') : (lang==='zh' ? '添加目录' : 'Add folder')"></button>
       </div>
     </div>
   </div>

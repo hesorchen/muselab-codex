@@ -1,5 +1,6 @@
 """File CRUD + search + hidden-toggle endpoints."""
 import io
+from urllib.parse import quote
 
 
 # ---- list / read ----
@@ -26,6 +27,69 @@ def test_list_subdir(client, auth):
     r = client.get("/api/files/list?path=notes", headers=auth)
     names = {e["name"] for e in r.json()["entries"]}
     assert names == {"a.md", "b.txt", "deep"}
+
+
+def test_registered_workspace_isolates_all_file_requests(client, auth, temp_root):
+    other = temp_root.parent / "second-project"
+    other.mkdir()
+    (other / "README.md").write_text("# second\n", encoding="utf-8")
+    (other / "only-here.txt").write_text("secondary", encoding="utf-8")
+
+    registered = client.post(
+        "/api/chat/workspaces",
+        headers=auth,
+        json={"path": str(other), "name": "Second"},
+    )
+    assert registered.status_code == 200, registered.text
+    workspace_headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(other), safe=""),
+    }
+
+    listed = client.get("/api/files/list?path=", headers=workspace_headers)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["root"] == str(other)
+    assert {entry["name"] for entry in listed.json()["entries"]} == {
+        "README.md", "only-here.txt",
+    }
+
+    written = client.put(
+        "/api/files/write",
+        headers=workspace_headers,
+        json={"path": "created.md", "content": "second workspace\n"},
+    )
+    assert written.status_code == 200, written.text
+    assert (other / "created.md").read_text(encoding="utf-8") == "second workspace\n"
+    assert not (temp_root / "created.md").exists()
+
+    raw = client.get(
+        "/api/files/raw",
+        params={
+            "path": "only-here.txt",
+            "workspace": str(other),
+            "token": auth["X-Auth-Token"],
+        },
+    )
+    assert raw.status_code == 200
+    assert raw.text == "secondary"
+
+    primary = client.get("/api/files/list?path=", headers=auth)
+    assert primary.status_code == 200
+    assert "only-here.txt" not in {
+        entry["name"] for entry in primary.json()["entries"]
+    }
+
+
+def test_file_workspace_must_be_registered(client, auth, temp_root):
+    unregistered = temp_root.parent / "not-registered"
+    unregistered.mkdir()
+    headers = {
+        **auth,
+        "X-Muselab-Workspace": quote(str(unregistered), safe=""),
+    }
+    response = client.get("/api/files/list?path=", headers=headers)
+    assert response.status_code == 400
+    assert "not registered" in response.json()["detail"]
 
 
 def test_read_markdown(client, auth):
@@ -248,6 +312,33 @@ def test_raw_image_inline(client, temp_root):
     r = client.get(f"/api/files/raw?path=x.png&token={TEST_TOKEN}")
     assert r.status_code == 200
     assert r.headers["content-disposition"].startswith("inline")
+
+
+def test_html_preview_injects_image_and_scroll_bridge_only_on_request(
+    client, temp_root,
+):
+    from .conftest import TEST_TOKEN
+    source = "<!doctype html><html><body><p>report</p></body></html>"
+    (temp_root / "report.html").write_text(source, encoding="utf-8")
+
+    plain = client.get(
+        f"/api/files/raw?path=report.html&token={TEST_TOKEN}",
+    )
+    preview = client.get(
+        f"/api/files/raw?path=report.html&token={TEST_TOKEN}&preview=1",
+    )
+
+    assert plain.status_code == 200
+    assert "preview-img" not in plain.text
+    assert "preview-scroll" not in plain.text
+    assert preview.status_code == 200
+    assert "preview-img" in preview.text
+    assert "preview-scroll" in preview.text
+    assert "preview-scroll-restore" in preview.text
+    assert "preview-ready" in preview.text
+    assert "behavior:'instant'" in preview.text
+    assert "setProperty('scroll-behavior','auto','important')" in preview.text
+    assert preview.text.index("preview-scroll") < preview.text.index("</body>")
 
 
 # ---- new endpoints / edge cases ----

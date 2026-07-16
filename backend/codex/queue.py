@@ -11,6 +11,7 @@ import threading
 from typing import Any
 
 from ..settings import atomic_write_text
+from .threads import normalize_service_tier
 from .usage import _thread_id
 
 
@@ -39,6 +40,7 @@ class CodexQueueService:
     def enqueue(self, thread_id: str, text: str, image_ids: str = "",
                 permission: str = "", *, model: str = "",
                 model_provider: str = "", effort: str = "",
+                service_tier: str | None = None,
                 source_device_kind: str = "unknown") -> dict[str, Any]:
         sid = _thread_id(thread_id)
         text = text.strip()
@@ -52,6 +54,7 @@ class CodexQueueService:
                     "image_ids": image_ids, "permission": permission,
                     "model": model.strip(), "model_provider": model_provider.strip(),
                     "effort": effort.strip(),
+                    "service_tier": normalize_service_tier(service_tier),
                     "source_device_kind": (
                         source_device_kind
                         if source_device_kind in {"mobile", "desktop"}
@@ -181,6 +184,10 @@ def _valid_persisted_item(value: Any) -> dict[str, Any] | None:
         enqueued_at = float(raw_enqueued or 0)
     except (TypeError, ValueError):
         enqueued_at = 0.0
+    try:
+        service_tier = normalize_service_tier(value.get("service_tier"))
+    except (AttributeError, ValueError):
+        service_tier = None
     return {
         "id": item_id,
         "text": text,
@@ -189,6 +196,7 @@ def _valid_persisted_item(value: Any) -> dict[str, Any] | None:
         "model": str(value.get("model") or ""),
         "model_provider": str(value.get("model_provider") or ""),
         "effort": str(value.get("effort") or ""),
+        "service_tier": service_tier,
         "source_device_kind": source
         if source in {"mobile", "desktop"} else "unknown",
         "enqueued_at": enqueued_at,

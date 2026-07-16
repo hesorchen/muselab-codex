@@ -303,7 +303,12 @@ async def _lifespan(app: FastAPI):
     async def _bg_purge_trash() -> None:
         try:
             from . import files as _files_mod
-            purged = await _asyncio.to_thread(_files_mod.auto_purge_expired_trash)
+            roots = [Path(entry.path) for entry in
+                     app.state.codex_threads.list_workspaces()]
+            purged = sum(await _asyncio.gather(*[
+                _asyncio.to_thread(_files_mod.auto_purge_expired_trash, root)
+                for root in roots
+            ]))
             if purged:
                 sys.stderr.write(
                     f"[muselab] auto-purged {purged} expired trash item(s) "
