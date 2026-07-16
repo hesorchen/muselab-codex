@@ -89,7 +89,7 @@ async def test_push() -> dict:
         tag="push-test",
         force=True,
         context="manual-test",
-        mobile_only=True,
+        mobile_only=False,
     )
 
 

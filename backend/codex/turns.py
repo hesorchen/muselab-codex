@@ -98,6 +98,8 @@ class CodexTurnService:
         threads: CodexThreadService,
         history: CodexHistoryService | None = None,
         usage: CodexUsageService | None = None,
+        on_turn_started: Callable[[str, str], Awaitable[None]] | None = None,
+        on_turn_settled: Callable[[str, str], Awaitable[None]] | None = None,
         on_turn_finished: Callable[[str, str], Awaitable[None]] | None = None,
     ):
         self.runtime = runtime
@@ -105,6 +107,8 @@ class CodexTurnService:
         self.threads = threads
         self.history = history
         self.usage = usage
+        self.on_turn_started = on_turn_started
+        self.on_turn_settled = on_turn_settled
         self.on_turn_finished = on_turn_finished
         self._active: dict[str, TurnStream] = {}
         self._operations: set[str] = set()
@@ -209,6 +213,11 @@ class CodexTurnService:
             )
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
+            if self.on_turn_started is not None:
+                try:
+                    await self.on_turn_started(clean_id, clean_prompt[:500])
+                except Exception:
+                    pass
             return stream
 
     def active(self, thread_id: str) -> TurnStream | None:
@@ -328,15 +337,19 @@ class CodexTurnService:
                 stream.finish()
             if self._active.get(stream.thread_id) is stream:
                 self._active.pop(stream.thread_id, None)
-            if (self.on_turn_finished is not None
-                    and stream.status == "completed"):
+            if self.on_turn_settled is not None:
+                try:
+                    await self.on_turn_settled(stream.thread_id, stream.status)
+                except Exception:
+                    pass
+            if self.on_turn_finished is not None and stream.status == "completed":
                 try:
                     await self.on_turn_finished(stream.thread_id, stream.status)
                 except Exception:
-                    # Queue draining is an optional follow-up. It must never
-                    # turn a completed native turn into an SSE failure.
+                    # Activity/notification/queue follow-ups are optional and
+                    # must never turn a settled native turn into an SSE error.
                     pass
-            elif stream.status != "completed":
+            if stream.status != "completed":
                 # Failed/interrupted turns skip the success callback (no push,
                 # no queue drain), but their device-origin entry must not leak.
                 from ..turn_notifications import clear_turn_origin

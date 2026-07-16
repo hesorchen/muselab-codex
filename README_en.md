@@ -106,6 +106,7 @@ There is no separate chunking or application-owned RAG index. Every workspace ch
 
 - **Three-pane workspace** — Coordinate the file tree, preview pane, and chat; preview Markdown, code, images, PDF, CSV, XLSX, and HTML.
 - **Multiple workspaces** — Register and switch among local directories. The file tree, previews, session tabs, and new-thread cwd switch together, while each workspace retains its own tree expansion and preview tabs.
+- **Global activity center** — See running, approval-waiting, failed, and completed work across every workspace; jump to the owning thread, receive desktop/mobile Web Push, and use Dock/Home Screen unread badges in an installed web app.
 - **Native thread controls** — Effort, reasoning summaries, and the Fast service tier stay independent. Fast appears only for models that advertise it through `model/list` and persists per thread.
 - **Bilingual and themeable** — Switch languages without a reload; use light, dark, or eye-care themes and the mobile PWA.
 - **One native runtime** — Copy the remote command from Settings → About to enter the same live thread state from Codex CLI.

@@ -249,7 +249,8 @@ def list_subscriptions() -> list[dict]:
 
 def send_to_all(title: str, body: str, *, url: str = "/",
                  tag: str = "muselab-task", force: bool = False,
-                 context: str = "", mobile_only: bool = False) -> dict:
+                 context: str = "", mobile_only: bool = False,
+                 badge_count: int | None = None) -> dict:
     """Fire a push payload at every subscription. Dead subs (410/404
     from the push service) are dropped from the store. Returns
     {sent, dropped, errors}. ``mobile_only`` ignores desktop and legacy
@@ -282,7 +283,8 @@ def send_to_all(title: str, body: str, *, url: str = "/",
         _vapid_obj = (pem, Vapid.from_pem(pem.encode("ascii")))
     vapid_obj = _vapid_obj[1]
     payload = json.dumps({"title": title, "body": body, "url": url,
-                          "tag": tag, "force": bool(force)})
+                          "tag": tag, "force": bool(force),
+                          "badge_count": badge_count})
     # Snapshot the current subs under the lock, then run the (slow, network)
     # fan-out WITHOUT holding it so subscribe/unsubscribe stay responsive.
     # Dead-sub removals are collected and applied back under the lock at the

@@ -1,3 +1,4 @@
+import asyncio
 import functools
 import hashlib
 import logging
@@ -15,6 +16,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from .files import router as files_router
 from .api_push import router as push_router
+from .activity_api import router as activity_router
 from .settings import (
     ROOT,
     PORT,
@@ -218,6 +220,8 @@ async def _lifespan(app: FastAPI):
     app.state.codex_queue = CodexQueueService(
         ROOT / ".muselab-codex" / "queues")
     app.state.codex_threads = CodexThreadService(runtime, ROOT)
+    from .activity import ActivityService
+    app.state.activity = ActivityService(ROOT, app.state.codex_threads)
     app.state.codex_mcp = CodexMcpService(
         runtime,
         ROOT,
@@ -247,13 +251,25 @@ async def _lifespan(app: FastAPI):
         app.state.codex_queue,
         app.state.codex_turns,
         app.state.codex_attachments,
+        activity=app.state.activity,
     )
     app.state.codex_terminal = CodexTerminalService(
         runtime, app.state.codex_events, ROOT)
     from .turn_notifications import completed_turn_callback
+    app.state.codex_turns.on_turn_started = (
+        lambda thread_id, summary: app.state.activity.start(
+            thread_id, summary=summary))
+    async def settle_activity(thread_id, status):
+        item = await app.state.activity.finish(thread_id, status)
+        if item and item.get("state") not in {"completed", "cancelled"}:
+            from .turn_notifications import queue_attention_notification
+            queue_attention_notification(
+                item, app.state.activity.summary()["unread"])
+    app.state.codex_turns.on_turn_settled = settle_activity
     app.state.codex_turns.on_turn_finished = completed_turn_callback(
         app.state.codex_threads,
         _drain_after_turn(app.state.codex_queue_drain),
+        activity=app.state.activity,
     )
     app.state.codex_scheduler = CodexScheduler(
         ROOT, app.state.codex_threads, app.state.codex_turns)
@@ -264,13 +280,47 @@ async def _lifespan(app: FastAPI):
         app.state.codex_usage,
         timeout=CODEX_COMPACT_TIMEOUT,
     )
-    approvals.publisher = app.state.codex_turns.publish_permission
-    user_input.publisher = app.state.codex_turns.publish_user_input
-    elicitation.publisher = app.state.codex_turns.publish_elicitation
+    async def publish_permission(thread_id, data):
+        item = await app.state.activity.set_state(
+            thread_id, "waiting_approval",
+            summary=str(data.get("summary") or "Waiting for approval"))
+        if item:
+            from .turn_notifications import queue_attention_notification
+            queue_attention_notification(
+                item, app.state.activity.summary()["unread"])
+        await app.state.codex_turns.publish_permission(thread_id, data)
+
+    async def publish_user_input(thread_id, data):
+        item = await app.state.activity.set_state(
+            thread_id, "waiting_approval", summary="Waiting for your answer")
+        if item:
+            from .turn_notifications import queue_attention_notification
+            queue_attention_notification(
+                item, app.state.activity.summary()["unread"])
+        await app.state.codex_turns.publish_user_input(thread_id, data)
+
+    async def publish_elicitation(thread_id, mode, data):
+        item = await app.state.activity.set_state(
+            thread_id, "waiting_approval", summary="Waiting for your input")
+        if item:
+            from .turn_notifications import queue_attention_notification
+            queue_attention_notification(
+                item, app.state.activity.summary()["unread"])
+        await app.state.codex_turns.publish_elicitation(thread_id, mode, data)
+
+    approvals.publisher = publish_permission
+    user_input.publisher = publish_user_input
+    elicitation.publisher = publish_elicitation
     try:
         await runtime.start()
         await app.state.codex_events.start()
         await app.state.codex_scheduler.start()
+        # Existing activity rows from older builds only contain generic
+        # "Task completed" labels. Native thread previews can restore their
+        # actual task text without delaying service readiness.
+        _activity_refresh = asyncio.create_task(app.state.activity.refresh_metadata())
+        app.state.activity._tasks.add(_activity_refresh)
+        _activity_refresh.add_done_callback(app.state.activity._tasks.discard)
     except Exception:
         await app.state.codex_terminal.close()
         await app.state.codex_events.close()
@@ -359,6 +409,7 @@ async def _lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await app.state.activity.drain()
         await app.state.codex_turns.close()
         await app.state.codex_terminal.close()
         await approvals.close()
@@ -423,6 +474,7 @@ app.include_router(settings_router)
 if scheduler_router is not None:
     app.include_router(scheduler_router)
 app.include_router(push_router)
+app.include_router(activity_router)
 
 
 @functools.lru_cache(maxsize=1)

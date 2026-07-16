@@ -45,6 +45,18 @@ self.addEventListener("push", (event) => {
   // multi-device (desktop SSE alive => phone push suppressed too).
   // Moving the decision client-side fixes that.
   event.waitUntil((async () => {
+    // Dock / Home Screen badge is an absolute server-owned unread count, not
+    // a local increment (several devices and grouped pushes can race).
+    if (Number.isFinite(Number(data.badge_count))) {
+      const count = Math.max(0, Number(data.badge_count));
+      try {
+        if (count > 0 && self.navigator.setAppBadge) {
+          await self.navigator.setAppBadge(count);
+        } else if (count === 0 && self.navigator.clearAppBadge) {
+          await self.navigator.clearAppBadge();
+        }
+      } catch (_) {}
+    }
     // `force` payloads (settings-page test push) skip the visibility
     // check entirely — the user pressing "send test push" necessarily
     // has a visible muselab window, and suppressing the test on that

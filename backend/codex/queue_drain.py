@@ -18,11 +18,22 @@ class CodexQueueDrainService:
     """
 
     def __init__(self, queue: CodexQueueService, turns: CodexTurnService,
-                 attachments: CodexAttachmentService):
+                 attachments: CodexAttachmentService, activity=None):
         self.queue = queue
         self.turns = turns
         self.attachments = attachments
+        self.activity = activity
         self._locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+    async def _mark_paused(self, thread_id: str) -> None:
+        if self.activity is None:
+            return
+        item = await self.activity.set_state(
+            thread_id, "paused", summary="Queue paused: task could not start")
+        if item:
+            from ..turn_notifications import queue_attention_notification
+            queue_attention_notification(
+                item, self.activity.summary()["unread"])
 
     async def drain(self, thread_id: str) -> bool:
         async with self._locks[thread_id]:
@@ -54,10 +65,12 @@ class CodexQueueDrainService:
                 clear_turn_origin(thread_id)
                 self.queue.restore_head(thread_id, item)
                 self.queue.pause(thread_id, True)
+                await self._mark_paused(thread_id)
                 return False
             except Exception:
                 clear_turn_origin(thread_id)
                 self.queue.restore_head(thread_id, item)
                 self.queue.pause(thread_id, True)
+                await self._mark_paused(thread_id)
                 return False
             return True

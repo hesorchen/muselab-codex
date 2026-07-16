@@ -455,6 +455,10 @@ def test_open_session_revision_is_only_advanced_after_transcript_load():
     assert "_reconcileTargetUpdated" in reconcile
     assert "const stillBehind" in reconcile
     assert "st._pendingExternalUpdate = true" in reconcile
+    assert "const acceptedTarget = Number(st._reconcileTargetUpdated) || newU" in reconcile
+    assert reconcile.index("if (succeeded) {") > reconcile.index(
+        "loaded = await this.loadSession")
+    assert "acceptedTarget," in reconcile
 
 
 def test_delayed_session_list_preserves_pending_setting_echoes():
@@ -939,6 +943,10 @@ def test_multi_workspace_ui_is_app_level_and_new_sessions_inherit_it():
     assert 'headers["X-Muselab-Workspace"] = encodeURIComponent(this.activeWorkspace)' in app
     assert '"&workspace=" + encodeURIComponent(workspace)' in app
     assert "workspace-picker" in html
+    workspace_picker = html.index('class="workspace-picker chat-head-workspace"')
+    assert html.rfind('<header class="pane-head">', 0, workspace_picker) > html.index(
+        '<aside class="pane chat"')
+    assert workspace_picker < html.index('<div class="chat-tabs-wrap">')
     assert ':disabled="workspaceSwitching || _creatingSession"' in html
     assert "workspaceOpenTabIds()" in html
     assert "chat-toolbar-workspace" not in html
@@ -950,6 +958,38 @@ def test_multi_workspace_ui_is_app_level_and_new_sessions_inherit_it():
     assert "if (!path || seen.has(path)) return false" in app
     assert "async _refreshSessionsAfterWorkspaceRegistryChange()" in app
     assert app.count("await this._refreshSessionsAfterWorkspaceRegistryChange()") == 2
+
+
+def test_workspace_switch_restores_runtime_cache_before_background_refresh():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    capture_start = app.index("_captureWorkspaceSurface(path = \"\")")
+    switch_start = app.index("async _changeWorkspaceSurface(path)", capture_start)
+    switch_end = app.index("\n    async switchWorkspace(path)", switch_start)
+    capture = app[capture_start:switch_start]
+    switch = app[switch_start:switch_end]
+
+    assert "_workspaceRuntimeCaches" in app
+    assert "previewCache: this._previewCache" in capture
+    assert "visible: (this.visible || []).map" in capture
+    assert switch.index("this.visible = runtime") < switch.index("this.loadRoot()")
+    assert "this._previewCache = new Map(runtime" in switch
+    assert "const refreshSurface = Promise.allSettled([this.loadRoot(), this.loadTrash()])" in switch
+    assert "if (!runtime) await refreshSurface" in switch
+
+
+def test_global_activity_center_and_app_badge_are_cross_workspace():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    sw = (FRONTEND / "sw.js").read_text(encoding="utf-8")
+
+    assert 'fetch("/api/activity' in app or '"/api/activity?limit=150"' in app
+    assert "workspaceActivity(workspace.path).running" in html
+    assert 'class="activity-center-btn"' in html
+    assert 'class="modal activity-modal"' in html
+    assert "openActivityEvent(item)" in html
+    assert "navigator.setAppBadge(count)" in app
+    assert "self.navigator.setAppBadge(count)" in sw
+    assert "data.badge_count" in sw
 
 
 def test_session_history_and_workspace_use_distinct_semantic_icons():
@@ -1026,6 +1066,59 @@ def test_workspace_async_file_surfaces_reject_late_previous_owner_results():
         "this._previewCacheDel(savePath)")
     assert "const requestSeq = ++this._paletteFileSeq" in palette
     assert "requestSeq === this._paletteFileSeq" in palette
+
+
+def test_workspace_and_activity_caches_are_bounded_and_revalidated():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    activity = (Path("backend/activity_api.py")).read_text(encoding="utf-8")
+
+    assert 'sessionStorage.getItem(cacheKey)' in app
+    assert "Date.now() - Number(cached.savedAt || 0) < 10 * 60_000" in app
+    assert "serialized.length <= 1024 * 1024" in app
+    assert "Date.now() - Number(value.savedAt || 0) > 10 * 60_000" in app
+    assert 'headers["If-None-Match"]' in app
+    assert "if (r.status === 304) return false" in app
+    assert "_activityFetchPromises" in app
+    assert "private, no-cache" in activity
+    assert 'request.headers.get("if-none-match")' in activity
+
+
+def test_preview_metadata_cache_is_workspace_scoped_and_bounded():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    assert 'return `${this.currentWorkspacePath()}\\0${path || ""}`' in app
+    assert "Date.now() - Number(metaEntry.savedAt || 0) < 5000" in app
+    assert "while (this._fileMetaCache.size > 64)" in app
+
+
+def test_activity_center_shows_task_text_before_generic_status():
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    assert "item.task_summary || item.summary || item.session_name" in html
+    assert "item.status_detail" in html
+    assert "activityUnreadLabel(item)" in html
+    assert 'key: "unread"' in app
+    assert "unreadOnly: true" in app
+    assert "readOnly: true" in app
+    assert ".activity-unread-pill" in css
+
+
+def test_streaming_assistant_keeps_stable_text_dom_until_final_markdown():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    html = (FRONTEND / "index.html").read_text(encoding="utf-8")
+    css = (FRONTEND / "styles.css").read_text(encoding="utf-8")
+    render_start = app.index("const renderNow = (final = false) =>")
+    render_end = app.index("const scheduleRender = () =>", render_start)
+    render = app[render_start:render_end]
+
+    assert 'streamText: "", _streaming: true' in app
+    assert "curBubble.streamText = acc" in render
+    assert "curBubble._streaming = false" in render
+    assert "_mdRenderUncached(acc, { streaming: !final })" not in render
+    assert 'x-show="m._streaming === true"' in html
+    assert 'x-text="m.streamText || \'\'"' in html
+    assert 'x-show="m._streaming !== true"' in html
+    assert ".assistant-stream-text" in css
 
 
 def test_context_upload_keeps_the_workspace_that_opened_the_file_picker():

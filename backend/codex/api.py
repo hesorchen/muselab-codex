@@ -1522,6 +1522,11 @@ async def submit_permission(
         raise HTTPException(400, str(exc)) from exc
     if not submitted:
         raise HTTPException(404, "no pending permission request with that id")
+    try:
+        await request.app.state.activity.set_state(
+            thread_id, "running", summary="Muse is working")
+    except Exception:
+        pass
     return {"ok": True}
 
 
@@ -1543,6 +1548,11 @@ async def submit_user_input(
         raise HTTPException(400, str(exc)) from exc
     if not submitted:
         raise HTTPException(404, "no pending user input request with that id")
+    try:
+        await request.app.state.activity.set_state(
+            thread_id, "running", summary="Muse is working")
+    except Exception:
+        pass
     return {"ok": True}
 
 
