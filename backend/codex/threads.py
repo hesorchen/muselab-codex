@@ -100,13 +100,15 @@ class CodexThreadService:
         self.approval_policy = approval_policy
         self.sandbox = sandbox
         self._metadata_path = self.workspace / ".muselab-codex" / "threads.json"
+        self._pending_path = (
+            self.workspace / ".muselab-codex" / "pending-threads.json")
         self._workspaces_path = self.workspace / ".muselab-codex" / "workspaces.json"
         self._metadata_lock = threading.RLock()
         self._pinned = self._load_pinned()
         self._settings = self._load_settings()
         self._workspace_lock = threading.RLock()
         self._workspaces = self._load_workspaces()
-        self._pending: dict[str, dict[str, Any]] = {}
+        self._pending, self._materialized = self._load_pending()
         self._list_cache: dict[
             tuple[str | None, int, bool, str | None],
             tuple[float, ThreadPage],
@@ -156,7 +158,9 @@ class CodexThreadService:
             await self.rename(thread["id"], name)
             thread = dict(thread)
             thread["name"] = name.strip()
-        self._pending[thread["id"]] = dict(thread)
+        self._pending[thread["id"]] = _pending_snapshot(thread)
+        self._materialized.discard(thread["id"])
+        self._write_pending()
         if clean_service_tier is not None:
             self.remember_service_tier(thread["id"], clean_service_tier)
         self.invalidate_list_cache()
@@ -198,7 +202,7 @@ class CodexThreadService:
             # Bound it well below the generic turn timeout so a wedged
             # generation is discarded quickly instead of leaving refresh
             # blank for a minute.
-            result = await self.requester.request(
+            result = await self._read_request(
                 "thread/list", params, timeout=_THREAD_LIST_TIMEOUT_SECONDS)
             self._sync_runtime_generation()
             if not isinstance(result, dict) or not isinstance(result.get("data"), list):
@@ -243,7 +247,7 @@ class CodexThreadService:
         self._sync_runtime_generation()
         clean_id = _thread_id(thread_id)
         try:
-            result = await self.requester.request(
+            result = await self._read_request(
                 "thread/read",
                 {
                     "threadId": clean_id,
@@ -309,7 +313,10 @@ class CodexThreadService:
         succeed for a pre-first-turn thread without creating its rollout.
         turn/start is the first reliable materialization boundary.
         """
-        self._pending.pop(_thread_id(thread_id), None)
+        clean_id = _thread_id(thread_id)
+        self._pending.pop(clean_id, None)
+        self._materialized.add(clean_id)
+        self._write_pending()
         self.invalidate_list_cache()
 
     async def rename(self, thread_id: str, name: str) -> None:
@@ -326,16 +333,27 @@ class CodexThreadService:
         _empty_result("thread/name/set", result)
         if clean_id in self._pending:
             self._pending[clean_id]["name"] = clean_name
+            self._pending[clean_id]["updatedAt"] = time.time()
+            self._write_pending()
         self.invalidate_list_cache()
 
     async def delete(self, thread_id: str) -> None:
         self._sync_runtime_generation()
         clean_id = _thread_id(thread_id)
-        result = await self.requester.request("thread/delete", {
-            "threadId": clean_id,
-        })
-        _empty_result("thread/delete", result)
+        try:
+            result = await self.requester.request("thread/delete", {
+                "threadId": clean_id,
+            })
+            _empty_result("thread/delete", result)
+        except AppServerResponseError as exc:
+            # Empty pre-first-turn threads may exist only in the local durable
+            # sidecar after an app-server restart. Deleting such a known local
+            # thread is still a successful lifecycle operation.
+            if exc.code != -32600 or clean_id not in self._pending:
+                raise
         self._pending.pop(clean_id, None)
+        self._materialized.discard(clean_id)
+        self._write_pending()
         self._delete_local_metadata(clean_id)
         self.invalidate_list_cache()
 
@@ -375,7 +393,9 @@ class CodexThreadService:
         result = await self.requester.request("thread/fork", params)
         self._sync_runtime_generation()
         thread = _thread_from_result("thread/fork", result)
-        self._pending[thread["id"]] = dict(thread)
+        self._pending[thread["id"]] = _pending_snapshot(thread)
+        self._materialized.discard(thread["id"])
+        self._write_pending()
         if clean_service_tier is not None:
             self.remember_service_tier(thread["id"], clean_service_tier)
         self.invalidate_list_cache()
@@ -836,6 +856,54 @@ class CodexThreadService:
         return [thread for thread in pending
                 if needle in str(thread.get("name") or thread.get("preview") or "").casefold()]
 
+    async def _read_request(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        read_request = getattr(self.requester, "read_request", None)
+        request = read_request if callable(read_request) else self.requester.request
+        return await request(method, params, timeout=timeout)
+
+    def _load_pending(self) -> tuple[dict[str, dict[str, Any]], set[str]]:
+        try:
+            payload = json.loads(self._pending_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}, set()
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            return {}, set()
+        pending: dict[str, dict[str, Any]] = {}
+        raw_pending = payload.get("pending")
+        if isinstance(raw_pending, list):
+            for raw in raw_pending:
+                if not isinstance(raw, dict):
+                    continue
+                thread_id = raw.get("id")
+                if isinstance(thread_id, str) and thread_id.strip():
+                    pending[thread_id.strip()] = _pending_snapshot(raw)
+        raw_materialized = payload.get("materialized")
+        materialized = {
+            value.strip() for value in raw_materialized or []
+            if isinstance(value, str) and value.strip()
+        } if isinstance(raw_materialized, list) else set()
+        materialized.difference_update(pending)
+        return pending, materialized
+
+    def _write_pending(self) -> None:
+        if not self._pending and not self._materialized:
+            self._pending_path.unlink(missing_ok=True)
+            return
+        atomic_write_text(
+            self._pending_path,
+            json.dumps({
+                "version": 1,
+                "pending": list(self._pending.values()),
+                "materialized": sorted(self._materialized),
+            }, ensure_ascii=False, separators=(",", ":")),
+        )
+
     def _load_pinned(self) -> set[str]:
         try:
             payload = json.loads(self._metadata_path.read_text(encoding="utf-8"))
@@ -921,6 +989,8 @@ class CodexThreadService:
             merged = dict(native_settings) if isinstance(native_settings, dict) else {}
             merged.update(local_settings)
             decorated["_settings"] = merged
+        if isinstance(thread_id, str):
+            decorated["materialized"] = thread_id not in self._pending
         return decorated
 
     def invalidate_list_cache(self) -> None:
@@ -950,12 +1020,12 @@ class CodexThreadService:
         health_fn = getattr(self.requester, "health", None)
         if not callable(health_fn):
             return
-        restart_count = health_fn().restart_count
-        previous = getattr(self, "_restart_count", restart_count)
-        if restart_count != previous:
-            self._pending.clear()
+        health = health_fn()
+        generation = getattr(health, "generation", health.restart_count)
+        previous = getattr(self, "_runtime_generation", generation)
+        if generation != previous:
             self.invalidate_list_cache()
-        self._restart_count = restart_count
+        self._runtime_generation = generation
 
 
 def _thread_id(value: str) -> str:
@@ -963,6 +1033,20 @@ def _thread_id(value: str) -> str:
     if not clean:
         raise ValueError("thread id cannot be empty")
     return clean
+
+
+def _pending_snapshot(thread: dict[str, Any]) -> dict[str, Any]:
+    """Persist only empty-thread metadata, never transcript/prompt payloads."""
+    thread_id = _thread_id(str(thread.get("id") or ""))
+    snapshot: dict[str, Any] = {"id": thread_id, "turns": []}
+    for key in (
+        "name", "preview", "model", "modelProvider", "cwd", "status",
+        "createdAt", "updatedAt", "parentThreadId",
+    ):
+        value = thread.get(key)
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            snapshot[key] = value
+    return snapshot
 
 
 def _thread_from_result(method: str, result: Any) -> dict[str, Any]:

@@ -515,7 +515,7 @@ function portal() {
     // bubbles from tabState[id].messages (data always survives; only the DOM is
     // dropped). _MAX_RESIDENT_PANES caps the set.
     _residentTabIds: [],
-    _MAX_RESIDENT_PANES: 4,
+    _MAX_RESIDENT_PANES: 2,
     renamingTabId: "",   // session id whose name is currently being inline-edited
     renameDraft: "",     // current value of the inline rename <input>
     tabCtxMenu: null,    // {id, x, y} for the right-click tab menu, or null
@@ -5218,6 +5218,9 @@ function portal() {
         _serverActiveObserved: false,
         _streamHealthProbe: null,
         _reconnectTimer: null,
+        _canonicalResyncTimer: null,
+        _canonicalResyncPending: false,
+        _outcomeUnknown: false,
         _renderStreamingHtml: null,
         _pendingHtmlRender: null,
         // Monotonic per-session guards for async controls.  Root Alpine
@@ -5255,6 +5258,7 @@ function portal() {
         scrollTop: 0,
         _userScrollAt: 0,
         _autoScrolling: false,
+        _restoringPosition: false,
         _settleToken: 0,
         // updated_at represented by the transcript currently rendered in this
         // transcript. Kept per session so background updates can reconcile.
@@ -5637,7 +5641,6 @@ function portal() {
         if ((uText || uImages.length || uDocs.length)
             && !alreadyInjected && !alreadyInHistory) {
           const wasFollowing = st.atBottom !== false;
-          if (wasFollowing) this._capLiveMessages(st);
           msgs.push({
             role: "user",
             text: uText,
@@ -5645,6 +5648,7 @@ function portal() {
             docs: uDocs,
             _turn_id: activeTurnId,
           });
+          this._capLiveMessages(st, sid);
           if (wasFollowing) this.scrollToBottom(true, sid);
         }
         if (activeTurnId) st._attachedUserTurnId = activeTurnId;
@@ -5925,7 +5929,8 @@ function portal() {
       const list = (this._residentTabIds || []).filter(x => x !== tid);
       list.unshift(tid);   // MRU at the front
       const visible = new Set(this.currentId ? [this.currentId] : []);
-      while (list.length > this._MAX_RESIDENT_PANES) {
+      const budget = this._MAX_RESIDENT_PANES;
+      while (list.length > budget) {
         let evicted = false;
         // Scan from the LRU end for the first evictable (unprotected) pane.
         for (let i = list.length - 1; i >= 0; i--) {
@@ -6321,12 +6326,61 @@ function portal() {
         }
       }
     },
+    _scheduleCanonicalStreamReload(sid, st, { minimumWaitMs = 0 } = {}) {
+      if (!sid || !st || this.tabState[sid] !== st) return;
+      if (st._canonicalResyncTimer) return;
+      st._canonicalResyncPending = true;
+      const started = Date.now();
+      const poll = async () => {
+        st._canonicalResyncTimer = null;
+        if (this.tabState[sid] !== st) return;
+        let active = true;
+        try {
+          const controller = new AbortController();
+          const timeout = setTimeout(() => controller.abort(), 8000);
+          try {
+            const r = await fetch(`/api/chat/sessions/${encodeURIComponent(sid)}/active`, {
+              headers: this.hdr(), signal: controller.signal,
+            });
+            if (r.ok) active = !!(await r.json()).active;
+          } finally {
+            clearTimeout(timeout);
+          }
+        } catch (_) {
+          active = true;
+        }
+        const waited = Date.now() - started;
+        if (active || waited < minimumWaitMs) {
+          if (waited < 31 * 60_000) {
+            st._canonicalResyncTimer = setTimeout(poll, 1000);
+            return;
+          }
+        }
+        this._retireStaleSessionStream(sid, st);
+        st._pendingExternalUpdate = true;
+        const loaded = await this.loadSession(sid, {
+          quiet: sid === this.currentId,
+        });
+        if (this.tabState[sid] !== st) return;
+        st._canonicalResyncPending = false;
+        st._outcomeUnknown = false;
+        if (loaded) {
+          st._loaded = true;
+          st._pendingExternalUpdate = false;
+          this._syncQueueFromServer(sid);
+        }
+      };
+      st._canonicalResyncTimer = setTimeout(poll, 250);
+    },
     _retireStaleSessionStream(sid, st) {
       // Server metadata has authoritatively moved active → idle (or its
       // revision advanced well after our local stream began), but this page
       // never received the terminal SSE event. Retire the dead transport so a
       // quiet canonical transcript load can replace the partial bubbles.
       if (st.es) { try { st.es.close(); } catch {} st.es = null; }
+      if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
+      st._canonicalResyncTimer = null;
+      st._canonicalResyncPending = false;
       if (st._streamTimer) {
         clearInterval(st._streamTimer);
         st._streamTimer = null;
@@ -9303,6 +9357,13 @@ function portal() {
       // as cancellation of root-level UI work.
       const targetSid = this.currentId;
       if (!targetSid) return;
+      // Visibility changes on the shared scroller emit synthetic scroll
+      // events before the deferred position restore runs. Freeze this tab's
+      // saved follow/offset state across that window so a transient
+      // near-bottom geometry cannot turn a mid-history reader into a
+      // tail-follower or overwrite the offset we are about to restore.
+      const targetState = this._ensureTabState(targetSid);
+      targetState._restoringPosition = true;
       const cur = this.sessions.find(s => s.id === targetSid);
       // Re-baseline the open-session resync cursor on every switch — incl. the
       // instant "already-loaded" path below that skips loadSession (which would
@@ -9354,7 +9415,7 @@ function portal() {
         // thinking: default true when the field is absent (legacy sessions).
         this.thinkingEnabled = cur.thinking !== false;
       }
-      const st = this._ensureTabState(targetSid);
+      const st = targetState;
       const metaUpdated = Number(cur && cur.updated_at) || 0;
       const staleFromList = st._seenUpdated !== undefined
         && metaUpdated > st._seenUpdated;
@@ -9367,12 +9428,16 @@ function portal() {
           if (metaUpdated) st._seenUpdated = metaUpdated;
         }
       }
-      if (this.currentId !== targetSid) return;
+      if (this.currentId !== targetSid) {
+        st._restoringPosition = false;
+        return;
+      }
       if (st._loaded && !st.streaming && !st.es) {
         this._checkActiveTurn(targetSid);
       }
       if (!st._loaded) {
         await this._ensureSessionLoaded(targetSid);
+        st._restoringPosition = false;
         return;
       } else if (_wasMounted) {
         // Already loaded — content is in the DOM, the switch is just an x-show
@@ -9466,8 +9531,12 @@ function portal() {
     _restoreChatPosition(sid = this.currentId) {
       const st = sid && this.tabState ? this.tabState[sid] : null;
       const el = this._chatScrollEl(sid);
-      if (!st || !el) return;
+      if (!st || !el) {
+        if (st) st._restoringPosition = false;
+        return;
+      }
       if (st.atBottom !== false) {
+        st._restoringPosition = false;
         this._settleScrollToBottom({ sid });
         if (sid === this.currentId) this.atBottom = true;
         return;
@@ -9479,6 +9548,7 @@ function portal() {
       st._autoScrolling = false;
       el.scrollTop = Math.max(0, Number(st.scrollTop) || 0);
       st.scrollTop = el.scrollTop;
+      st._restoringPosition = false;
       if (sid === this.currentId) this.atBottom = false;
     },
     // Run `fn` AFTER the browser has painted the current frame. A single
@@ -10209,7 +10279,7 @@ function portal() {
     // in the JSONL); historyTruncated() then surfaces the "not everything is
     // reachable" hint. Bounds memory on pathological thousands-of-bubbles
     // sessions even if the user keeps clicking "Load earlier".
-    MAX_IN_MEMORY: 2000,
+    MAX_IN_MEMORY: 240,
     // Live-session DOM ceiling. loadSession's INITIAL_LOAD / MAX caps
     // only apply when (re)entering a session — NOTHING trims messages[] while
     // a session is actively chatted in, so a long coding session grows DOM
@@ -10217,7 +10287,7 @@ function portal() {
     // headroom to mask it). Before each new user turn _capLiveMessages evicts
     // the oldest rendered bubbles back into the _earlierMessages stash so
     // "Load earlier" can page them back in. Mobile uses a tighter ceiling.
-    LIVE_MESSAGE_CAP: 200,
+    LIVE_MESSAGE_CAP: 120,
     // Reactivity ping: bumped whenever refreshOutlineFromBackend writes
     // new data. outlineMessages() reads it so Alpine knows to re-render
     // the msg-outline-modal when async fetch completes. Without this,
@@ -10408,19 +10478,65 @@ function portal() {
     // The evicted bubbles already carry .html, so paging them back via
     // "Load earlier" re-renders nothing. Eviction happens at the TOP while
     // the user sits at the bottom sending, so there's no scroll jump.
-    _capLiveMessages(st) {
-      if (!st || !st.messages) return;
+    _capLiveMessages(st, sid = "") {
+      if (!st || !st.messages) return 0;
       const cap = this._isMobileLayout()
-        ? Math.min(50, this.LIVE_MESSAGE_CAP)
+        ? Math.min(60, this.LIVE_MESSAGE_CAP)
         : this.LIVE_MESSAGE_CAP;
       const overflow = st.messages.length - cap;
-      if (overflow <= 0) return;
+      if (overflow <= 0) return 0;
+
+      // A live turn must stay bounded even while the user is reading above
+      // the tail. Measure the DOM rows that are about to leave and compensate
+      // scrollTop after Alpine applies the splice; this keeps the same content
+      // under the reader instead of making memory safety depend on atBottom.
+      const visibleSid = sid || this.currentId;
+      const scrollEl = visibleSid === this.currentId
+        ? this._chatScrollEl(visibleSid) : null;
+      const preserveReadingPosition = !!scrollEl && st.atBottom === false;
+      let retainedAnchor = null;
+      let retainedAnchorTop = 0;
+      if (preserveReadingPosition) {
+        // Anchor the first row that will survive. Measuring the actual row
+        // after Alpine reconciles accounts for grid gaps, collapsed margins,
+        // and the browser's own scroll anchoring; summing removed row heights
+        // cannot model all three reliably.
+        const leading = this._leadingMsgEls(overflow + 1, visibleSid);
+        retainedAnchor = leading[overflow] || null;
+        if (retainedAnchor) {
+          retainedAnchorTop = retainedAnchor.getBoundingClientRect().top;
+        }
+      }
       const evicted = st.messages.splice(0, overflow);
       // Append to the END of the stash: these bubbles are newer than
       // everything already stashed but older than what stays visible, so
       // they're the "closest in time" batch loadEarlierMessages pops first.
       st._earlierMessages = (st._earlierMessages || []).concat(evicted);
+      // Keep the data cache bounded as well as the mounted DOM. Entries
+      // discarded from the oldest edge remain authoritative in the backend
+      // transcript and can be fetched again by advancing the window offset.
+      let held = st.messages.length + st._earlierMessages.length;
+      if (held > this.MAX_IN_MEMORY) {
+        const drop = Math.min(held - this.MAX_IN_MEMORY,
+                              st._earlierMessages.length);
+        st._earlierMessages.splice(0, drop);
+        st._loadedOffset = (st._loadedOffset || 0) + drop;
+        held -= drop;
+      }
       st._hasMoreHistory = st._earlierMessages.length > 0 || st._loadedOffset > 0;
+      if (preserveReadingPosition && retainedAnchor) {
+        this.$nextTick(() => {
+          if (this.tabState[visibleSid] !== st) return;
+          if (retainedAnchor.isConnected) {
+            const drift = retainedAnchor.getBoundingClientRect().top - retainedAnchorTop;
+            scrollEl.scrollTop = Math.max(0, scrollEl.scrollTop + drift);
+          }
+          st.scrollTop = scrollEl.scrollTop;
+          st.atBottom = false;
+          if (visibleSid === this.currentId) this.atBottom = false;
+        });
+      }
+      return overflow;
     },
     hasMoreHistory(sid) {
       sid = sid || this.currentId;
@@ -10933,12 +11049,16 @@ function portal() {
         if (st._streamTimer) clearInterval(st._streamTimer);
         if (st._stallWatch) clearInterval(st._stallWatch);
         if (st._reconnectTimer) clearTimeout(st._reconnectTimer);
+        if (st._canonicalResyncTimer) clearTimeout(st._canonicalResyncTimer);
         if (st._reconcileRetryTimer) clearTimeout(st._reconcileRetryTimer);
         st.es = null;
         st.streaming = false;
         st._streamTimer = null;
         st._stallWatch = null;
         st._reconnectTimer = null;
+        st._canonicalResyncTimer = null;
+        st._canonicalResyncPending = false;
+        st._outcomeUnknown = false;
         st._streamHealthProbe = null;
         st._serverActiveObserved = false;
         st._reconcileRetryTimer = null;
@@ -16517,6 +16637,7 @@ function portal() {
       const st = sid ? this._ensureTabState(sid) : null;
       const el = (ev && ev.currentTarget) || this._chatScrollEl(sid);
       if (!el) return;
+      if (st && (st._autoScrolling || st._restoringPosition)) return;
       // Single-view conversations share `.chat-body`; save the offset on
       // every scroll so an LRU-evicted pane can restore the exact reading
       // position when it is rebuilt later.
@@ -16527,7 +16648,6 @@ function portal() {
       // so letting it run doubles the per-switch layout thrash (~40ms/switch in
       // profiling). The settle sets `atBottom` itself, so this recompute is
       // redundant during that window — skip it.
-      if (st && st._autoScrolling) return;
       // Strict "at bottom": 2px tolerance only — just enough to absorb
       // sub-pixel geometry (browser zoom / high-DPI displays can report
       // distance as 0.4–1.x even when visually at bottom; pure ==0 would
@@ -16968,7 +17088,7 @@ function portal() {
       if (!isReconnect) {
         // Trim the live backlog before growing it again — keeps long
         // sessions from ballooning the DOM past the mobile crash point.
-        this._capLiveMessages(sendState);
+        this._capLiveMessages(sendState, sendSid);
         sendState.messages.push({
           role: "user", text,
           images: readyImages.map(im => ({
@@ -17288,7 +17408,7 @@ function portal() {
         }
       };
       ["text", "thinking", "tool_use", "tool_result", "rate_limit", "ping",
-       "done", "error"].forEach(
+       "done", "error", "resync"].forEach(
         t => es.addEventListener(t, _bumpSse));
       if (streamState._stallWatch) clearInterval(streamState._stallWatch);
       streamState._stallWatch = setInterval(() => {
@@ -17340,11 +17460,11 @@ function portal() {
         // ballooning DOM eventually freezes the WebView. Trim from the
         // front on every render/append tick: it's O(1) when under cap, and
         // splice(0, overflow) can never touch the streaming tail bubble.
-        // Gate on atBottom — the same guard scrollToBottom uses — so we
-        // never evict (and visually jump) while the user has scrolled up to
-        // read history. Evicted bubbles land in the "Load earlier" stash.
-        if (streamState.atBottom !== false) this._capLiveMessages(streamState);
-        this.scrollToBottom(false, streamSid);
+        // Memory safety is independent of follow mode. When the reader is
+        // above the tail, _capLiveMessages compensates the removed row height
+        // and keeps the viewport anchored; only auto-follow remains gated.
+        this._capLiveMessages(streamState, streamSid);
+        if (streamState.atBottom !== false) this.scrollToBottom(false, streamSid);
       };
       const _scheduleScroll = () => {
         if (pendingScrollTimer) return;
@@ -17875,8 +17995,30 @@ function portal() {
           this.$nextTick(() => this._drainPendingQueue(streamSid, d.turn_id || ""));
         }
       });
+      es.addEventListener("resync", ev => {
+        flushRender();
+        let reason = "replay_truncated";
+        try { reason = JSON.parse(ev.data).reason || reason; } catch (_) {}
+        streamState._canonicalResyncPending = true;
+        streamState._serverActiveObserved = true;
+        try { es.close(); } catch (_) {}
+        if (streamState._stallWatch) clearInterval(streamState._stallWatch);
+        streamState._stallWatch = null;
+        streamState.es = null;
+        if (this.currentId === streamSid) this.es = null;
+        this.toast(this.lang === "zh"
+          ? "回复数据量较大，完成后会自动从会话记录同步"
+          : "This reply exceeded the live replay window; canonical history will sync when it finishes",
+          "info", 5000);
+        this._scheduleCanonicalStreamReload(streamSid, streamState);
+        streamState._canonicalResyncReason = reason;
+      });
       es.addEventListener("error", ev => {
         flushRender();
+        // A bounded-stream resync (or an outcome-unknown start) owns recovery
+        // through canonical history. Closing EventSource can enqueue another
+        // browser error; never feed that into the ordinary reconnect loop.
+        if (streamState._canonicalResyncPending) return;
         // Two distinct error paths share this handler:
         //   1. Server-sent `event: error` (well-formed JSON in ev.data) —
         //      a real turn failure (vendor 401, quota, 30-min timeout).
@@ -17892,12 +18034,14 @@ function portal() {
         let errKind = "unknown";
         let errCta = "retry";
         let errRetryable = true;
+        let outcomeUnknown = false;
         try {
           const d = JSON.parse(ev.data);
           if (d && d.error) serverError = d.error;
           if (d && d.kind) errKind = d.kind;
           if (d && typeof d.cta === "string") errCta = d.cta;
           if (d && typeof d.retryable === "boolean") errRetryable = d.retryable;
+          outcomeUnknown = !!(d && (d.outcome_unknown || d.kind === "outcome_unknown"));
         } catch (_) {
           // ev.data missing → transport-level. Fall through to auto-retry.
         }
@@ -17910,6 +18054,30 @@ function portal() {
           retryable: errRetryable,
           text: serverError || "",
         });
+
+        if (outcomeUnknown) {
+          // turn/start crossed the native transport boundary, so the prompt
+          // may already be durable even though no acknowledgement arrived.
+          // A direct retry can duplicate the user turn. Keep the session busy,
+          // wait briefly for native persistence/activity, then replace the
+          // optimistic UI from canonical history before exposing any action.
+          streamState._outcomeUnknown = true;
+          streamState._canonicalResyncPending = true;
+          streamState._serverActiveObserved = true;
+          try { es.close(); } catch (_) {}
+          if (streamState._stallWatch) clearInterval(streamState._stallWatch);
+          streamState._stallWatch = null;
+          streamState.es = null;
+          if (this.currentId === streamSid) this.es = null;
+          this.toast(this.lang === "zh"
+            ? "发送结果正在确认，将自动从会话记录同步"
+            : "Send outcome is being reconciled from canonical history",
+            "info", 5000);
+          this._scheduleCanonicalStreamReload(streamSid, streamState, {
+            minimumWaitMs: 15_000,
+          });
+          return;
+        }
 
         // Benign: "no active turn" means a RECONNECT raced a turn that already
         // finished on the server (and aged past the grace-keep TTL, so it's not

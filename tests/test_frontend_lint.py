@@ -515,6 +515,44 @@ def test_large_markdown_preview_skips_rich_dom_postprocessing():
     assert "this._mdRenderUncached(body, { streaming: true })" in method
 
 
+def test_bounded_stream_resync_uses_canonical_history_without_retry_loop():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    handler_start = app.index('es.addEventListener("resync"')
+    handler_end = app.index('es.addEventListener("error"', handler_start)
+    handler = app[handler_start:handler_end]
+    error_end = app.index("// NOTE: errors are owned exclusively", handler_end)
+    error = app[handler_end:error_end]
+    helper_start = app.index("_scheduleCanonicalStreamReload(sid, st")
+    helper_end = app.index("\n    _retireStaleSessionStream", helper_start)
+    helper = app[helper_start:helper_end]
+
+    assert '"done", "error", "resync"' in app
+    assert "streamState._canonicalResyncPending = true" in handler
+    assert "this._scheduleCanonicalStreamReload(streamSid, streamState)" in handler
+    assert "if (streamState._canonicalResyncPending) return" in error
+    assert "/active" in helper
+    assert "this.loadSession(sid" in helper
+    assert "31 * 60_000" in helper
+
+
+def test_outcome_unknown_reconciles_before_retry_is_exposed():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    start = app.index(
+        'es.addEventListener("error"', app.index('es.addEventListener("done"')
+    )
+    end = app.index("// NOTE: errors are owned exclusively", start)
+    handler = app[start:end]
+
+    assert 'd.kind === "outcome_unknown"' in handler
+    assert "streamState._outcomeUnknown = true" in handler
+    assert "minimumWaitMs: 15_000" in handler
+    unknown_start = handler.index("if (outcomeUnknown)")
+    unknown_end = handler.index("\n        // Benign:", unknown_start)
+    unknown = handler[unknown_start:unknown_end]
+    assert "markUserFailed()" not in unknown
+    assert "return;" in unknown
+
+
 def test_open_file_updates_shared_preview_tabs_immutably():
     app = (FRONTEND / "app.js").read_text(encoding="utf-8")
     start = app.index("async openFile(n, opts = {})")
@@ -1241,6 +1279,47 @@ def test_idle_preload_stays_in_workspace_and_yields_to_visible_stream():
     assert "currentState && currentState.streaming" in method
     assert "_idlePreloadRetryTimer" in method
     assert "}, 1000)" in method
+
+
+def test_live_transcript_memory_is_bounded_even_while_reader_is_above_tail():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    cap_start = app.index("_capLiveMessages(st, sid = \"\")")
+    cap_end = app.index("\n    hasMoreHistory(sid)", cap_start)
+    cap = app[cap_start:cap_end]
+    scroll_start = app.index("const _scrollNow = () =>")
+    scroll_end = app.index("const _scheduleScroll = () =>", scroll_start)
+    scroll = app[scroll_start:scroll_end]
+
+    assert "_MAX_RESIDENT_PANES: 2" in app
+    assert "MAX_IN_MEMORY: 240" in app
+    assert "LIVE_MESSAGE_CAP: 120" in app
+    assert "Math.min(60, this.LIVE_MESSAGE_CAP)" in cap
+    assert "st.atBottom === false" in cap
+    assert "retainedAnchor.getBoundingClientRect().top" in cap
+    assert "scrollEl.scrollTop + drift" in cap
+    assert "st.atBottom = false" in cap
+    assert "st._loadedOffset = (st._loadedOffset || 0) + drop" in cap
+    assert "this._capLiveMessages(streamState, streamSid)" in scroll
+    assert "if (streamState.atBottom !== false) this.scrollToBottom" in scroll
+    assert "if (streamState.atBottom !== false) this._capLiveMessages" not in scroll
+
+
+def test_tab_switch_freezes_scroll_intent_until_position_restore():
+    app = (FRONTEND / "app.js").read_text(encoding="utf-8")
+    switch_start = app.index("async switchSession()")
+    switch_end = app.index("\n    _restoreChatPosition", switch_start)
+    switch = app[switch_start:switch_end]
+    scroll_start = app.index("onChatScroll(tid = \"\", ev = null)")
+    scroll_end = app.index("\n    // Stamp the last genuine", scroll_start)
+    scroll = app[scroll_start:scroll_end]
+    restore_start = app.index("_restoreChatPosition(sid = this.currentId)")
+    restore_end = app.index("\n    // Run `fn` AFTER", restore_start)
+    restore = app[restore_start:restore_end]
+
+    assert "_restoringPosition: false" in app
+    assert "targetState._restoringPosition = true" in switch
+    assert "st && (st._autoScrolling || st._restoringPosition)" in scroll
+    assert "st._restoringPosition = false" in restore
 
 
 def test_visible_session_management_calls_have_native_backend_routes():

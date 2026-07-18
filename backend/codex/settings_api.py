@@ -24,8 +24,11 @@ class ProviderEnabledIn(BaseModel):
 @router.get("", dependencies=[Depends(require_token)])
 async def get_settings(request: Request) -> dict[str, Any]:
     """Return the native model surface without credential or routing controls."""
+    runtime = request.app.state.codex_runtime
+    read_request = getattr(runtime, "read_request", None)
+    read = read_request if callable(read_request) else runtime.request
     try:
-        result = await request.app.state.codex_runtime.request("model/list", {
+        result = await read("model/list", {
             "limit": 100,
             "includeHidden": False,
         })
@@ -36,7 +39,7 @@ async def get_settings(request: Request) -> dict[str, Any]:
                     if isinstance(item, dict) and item.get("isDefault")), "")
     try:
         workspace = str(request.app.state.codex_threads.workspace)
-        config_result = await request.app.state.codex_runtime.request("config/read", {
+        config_result = await read("config/read", {
             "cwd": workspace,
             "includeLayers": False,
         })

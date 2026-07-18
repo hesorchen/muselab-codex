@@ -23,6 +23,7 @@ class RuntimeHealth:
     running: bool
     restart_count: int
     error: str | None
+    generation: int = 0
 
 
 class CodexRuntime:
@@ -39,12 +40,18 @@ class CodexRuntime:
         self._state: RuntimeState = "stopped"
         self._error: str | None = None
         self._restart_count = 0
+        self._generation = 0
         self._started_once = False
         self._lock = asyncio.Lock()
 
     @property
     def server(self) -> CodexAppServer | None:
         return self._server
+
+    @property
+    def generation(self) -> int:
+        """Monotonic identity of the currently selected app-server client."""
+        return self._generation
 
     def health(self) -> RuntimeHealth:
         running = self._server is not None and self._server.running
@@ -58,6 +65,7 @@ class CodexRuntime:
             running=running,
             restart_count=self._restart_count,
             error=error,
+            generation=self._generation,
         )
 
     async def start(self) -> CodexAppServer:
@@ -85,11 +93,12 @@ class CodexRuntime:
         timeout: float | None = None,
     ) -> Any:
         server = await self.ensure_ready()
+        generation = self._generation
         try:
             return await server.request(method, params, timeout=timeout)
         except (AppServerProcessError, AppServerTimeoutError) as exc:
             async with self._lock:
-                if self._server is server:
+                if self._server is server and self._generation == generation:
                     # A live process that stopped answering JSON-RPC is not
                     # healthy.  Keeping it around makes every later request
                     # wait for the full timeout while /api/health continues
@@ -100,6 +109,17 @@ class CodexRuntime:
                     await self._close_server_locked()
                     self._state = "failed"
                     self._error = str(exc)
+            if isinstance(exc, AppServerTimeoutError):
+                # The request crossed the transport boundary before its
+                # deadline.  Mutations are never retried implicitly: callers
+                # receive an explicit unknown-outcome marker and the exact
+                # generation is retired so a late response/notification can
+                # never settle work issued on its replacement.
+                raise AppServerTimeoutError(
+                    str(exc),
+                    outcome_unknown=exc.outcome_unknown,
+                    generation=generation,
+                ) from exc
             raise
 
     async def read_request(
@@ -116,7 +136,16 @@ class CodexRuntime:
         use local data without interrupting unrelated active turns.
         """
         server = await self.ensure_ready()
-        return await server.request(method, params, timeout=timeout)
+        generation = self._generation
+        try:
+            return await server.request(method, params, timeout=timeout)
+        except AppServerTimeoutError as exc:
+            # A transport timeout removes only this request id from the
+            # pending map.  Keep the shared generation alive; any late reply
+            # is ignored by CodexAppServer._dispatch.
+            raise AppServerTimeoutError(
+                str(exc), outcome_unknown=False, generation=generation,
+            ) from exc
 
     async def close(self) -> None:
         async with self._lock:
@@ -144,6 +173,7 @@ class CodexRuntime:
         if is_restart:
             self._restart_count += 1
         self._started_once = True
+        self._generation += 1
         self._state = "ready"
         return server
 

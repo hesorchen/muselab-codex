@@ -1,5 +1,6 @@
 """Offline tests for the workspace-scoped Codex thread service."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -399,6 +400,28 @@ async def test_empty_pre_turn_thread_is_merged_from_pending_sidecar(tmp_path):
 
     await service.delete("pending-1")
     assert (await service.list()).data == []
+
+
+@pytest.mark.asyncio
+async def test_pending_empty_thread_and_materialized_fence_survive_restart(tmp_path):
+    requester = PendingRequester(tmp_path.resolve())
+    first = CodexThreadService(requester, tmp_path)
+    thread = await first.start(name="Durable empty")
+    sidecar = tmp_path / ".muselab-codex" / "pending-threads.json"
+    assert sidecar.exists()
+
+    restarted = CodexThreadService(requester, tmp_path)
+    restored = await restarted.read(thread["id"])
+    assert restored["name"] == "Durable empty"
+    assert restored["materialized"] is False
+    restarted.mark_materialized(thread["id"])
+
+    payload = json.loads(sidecar.read_text())
+    assert payload["pending"] == []
+    assert payload["materialized"] == [thread["id"]]
+    after_turn = CodexThreadService(requester, tmp_path)
+    assert after_turn._with_local_metadata(
+        {"id": thread["id"]})["materialized"] is True
 
 
 @pytest.mark.asyncio

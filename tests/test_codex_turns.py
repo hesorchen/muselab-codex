@@ -114,6 +114,20 @@ async def test_replay_compacts_deltas_without_delaying_live_subscribers():
     }
 
 
+def test_replay_binary_compaction_handles_100k_single_byte_deltas():
+    stream = TurnStream(
+        "thread-stress", "hello", "gpt-test",
+        replay_max_events=128, replay_max_bytes=512_000,
+    )
+    for _ in range(100_000):
+        stream.publish("text", {"text": "x"})
+
+    assert len(stream.events) <= 20
+    assert sum(event["data"]["text"].count("x")
+               for event in stream.events) == 100_000
+    assert stream._replay_bytes <= 512_000
+
+
 @pytest.mark.parametrize(("permission", "approval", "sandbox", "mode"), [
     ("default", None, None, "default"),
     ("acceptEdits", "untrusted", "workspaceWrite", "default"),
@@ -425,4 +439,89 @@ async def test_reserved_thread_operation_blocks_new_turns():
     assert service.busy("thread-1") is False
     await service.start("thread-1", "hello")
     assert service.busy("thread-1") is True
+    await service.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_stream_bounds_replay_and_isolates_slow_subscriber():
+    stream = TurnStream(
+        "thread-1", "hello", "gpt-test",
+        replay_max_events=1, replay_max_bytes=4096,
+        subscriber_max_events=1, subscriber_max_bytes=4096,
+    )
+    slow = stream.subscribe()
+    stream.publish("tool_use", {"id": "one"})
+    stream.publish("tool_result", {"id": "two"})
+
+    assert await slow.get() == {
+        "event": "resync",
+        "data": {"reason": "slow_subscriber", "retryable": True},
+    }
+    replay = stream.subscribe()
+    assert await replay.get() == {
+        "event": "resync",
+        "data": {"reason": "replay_truncated", "retryable": True},
+    }
+    assert stream.events == []
+
+
+class PerThreadEvents:
+    async def subscribe(self, _thread_id):
+        return Subscription()
+
+
+class CoordinatedRuntime:
+    generation = 1
+
+    def __init__(self):
+        self.entered = 0
+        self.inflight = 0
+        self.max_inflight = 0
+        self.two_entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def health(self):
+        return type("Health", (), {"restart_count": 0})()
+
+    async def request(self, method, params=None, *, timeout=None):
+        assert method == "turn/start"
+        self.entered += 1
+        self.inflight += 1
+        self.max_inflight = max(self.max_inflight, self.inflight)
+        if self.entered >= 2:
+            self.two_entered.set()
+        await self.release.wait()
+        self.inflight -= 1
+        return {"turn": {
+            "id": f"turn-{self.entered}", "status": "inProgress", "items": [],
+        }}
+
+
+@pytest.mark.asyncio
+async def test_turn_coordinator_parallelizes_threads_but_serializes_one_thread():
+    runtime = CoordinatedRuntime()
+    service = CodexTurnService(runtime, PerThreadEvents(), Threads(), History())
+    different = [
+        asyncio.create_task(service.start("thread-1", "one")),
+        asyncio.create_task(service.start("thread-2", "two")),
+    ]
+    await asyncio.wait_for(runtime.two_entered.wait(), 1)
+    assert runtime.max_inflight == 2
+    runtime.release.set()
+    await asyncio.gather(*different)
+    await service.close()
+
+    runtime = CoordinatedRuntime()
+    service = CodexTurnService(runtime, PerThreadEvents(), Threads(), History())
+    first = asyncio.create_task(service.start("same", "one"))
+    while runtime.entered < 1:
+        await asyncio.sleep(0)
+    second = asyncio.create_task(service.start("same", "two"))
+    await asyncio.sleep(0)
+    assert runtime.entered == 1
+    runtime.release.set()
+    await first
+    with pytest.raises(TurnAlreadyActive):
+        await second
+    assert runtime.max_inflight == 1
     await service.close()
