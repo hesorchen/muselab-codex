@@ -315,6 +315,22 @@ async def _lifespan(app: FastAPI):
         await runtime.start()
         await app.state.codex_events.start()
         await app.state.codex_scheduler.start()
+        # Recover local queue/attachment transactions before accepting new
+        # sends. Queue v2 has already rolled crash-left ``starting`` rows back
+        # to ``queued`` with the same clientUserMessageId; ownership reconcile
+        # adopts v1 rows, reclaims orphan reservations, and quarantines corrupt
+        # staged pairs without ever reading conversation archives.
+        await asyncio.to_thread(
+            app.state.codex_attachments.reconcile,
+            app.state.codex_queue.attachment_references(),
+        )
+        for thread_id in app.state.codex_queue.thread_ids():
+            task = asyncio.create_task(
+                app.state.codex_queue_drain.drain(thread_id),
+                name=f"codex-queue-reconcile-{thread_id}",
+            )
+            _BG_TASKS.add(task)
+            task.add_done_callback(_BG_TASKS.discard)
         # Existing activity rows from older builds only contain generic
         # "Task completed" labels. Native thread previews can restore their
         # actual task text without delaying service readiness.

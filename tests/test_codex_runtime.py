@@ -81,8 +81,11 @@ async def test_timeout_discards_live_but_unresponsive_process_before_next_reques
     ))
     await runtime.start()
 
-    with pytest.raises(AppServerTimeoutError, match="timed out"):
+    initial_generation = runtime.generation
+    with pytest.raises(AppServerTimeoutError, match="timed out") as timed_out:
         await runtime.request("thread/list", {"cwd": "/tmp/fixture"})
+    assert timed_out.value.outcome_unknown is True
+    assert timed_out.value.generation == initial_generation
     assert runtime.health().state == "failed"
     assert runtime.health().running is False
 
@@ -91,6 +94,7 @@ async def test_timeout_discards_live_but_unresponsive_process_before_next_reques
         assert result["thread"]["id"] == "thread-1"
         assert runtime.health().state == "ready"
         assert runtime.health().restart_count == 1
+        assert runtime.generation > initial_generation
     finally:
         await runtime.close()
 
@@ -116,8 +120,12 @@ async def test_read_timeout_does_not_discard_shared_runtime():
     ))
     await runtime.start()
     try:
-        with pytest.raises(AppServerTimeoutError):
+        generation = runtime.generation
+        with pytest.raises(AppServerTimeoutError) as timed_out:
             await runtime.read_request("thread/items/list")
+        assert timed_out.value.outcome_unknown is False
+        assert timed_out.value.generation == generation
+        assert runtime.generation == generation
         assert runtime.health().state == "ready"
         assert runtime.health().running is True
     finally:

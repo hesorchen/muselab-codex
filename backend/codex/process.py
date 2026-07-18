@@ -34,6 +34,8 @@ ServerRequestHandler = Callable[
 ]
 
 _QUEUE_CLOSED = object()
+_DEFAULT_NOTIFICATION_MAX_EVENTS = 4096
+_DEFAULT_NOTIFICATION_MAX_BYTES = 16 * 1024 * 1024
 _APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
@@ -55,6 +57,17 @@ class AppServerProcessError(AppServerError):
 
 class AppServerTimeoutError(AppServerError):
     """An app-server request exceeded the client-side response deadline."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        outcome_unknown: bool = False,
+        generation: int | None = None,
+    ):
+        self.outcome_unknown = outcome_unknown
+        self.generation = generation
+        super().__init__(message)
 
 
 class AppServerResponseError(AppServerError):
@@ -83,6 +96,8 @@ class CodexAppServer:
         strip_openai_api_key: bool = True,
         initialize_timeout: float = 15.0,
         request_timeout: float = 60.0,
+        notification_max_events: int = _DEFAULT_NOTIFICATION_MAX_EVENTS,
+        notification_max_bytes: int = _DEFAULT_NOTIFICATION_MAX_BYTES,
         client_version: str = "0.1.0",
     ):
         if not command:
@@ -94,6 +109,10 @@ class CodexAppServer:
         self.strip_openai_api_key = strip_openai_api_key
         self.initialize_timeout = initialize_timeout
         self.request_timeout = request_timeout
+        if notification_max_events < 1 or notification_max_bytes < 1:
+            raise ValueError("notification limits must be positive")
+        self.notification_max_events = notification_max_events
+        self.notification_max_bytes = notification_max_bytes
         self.client_version = client_version
 
         self._process: asyncio.subprocess.Process | None = None
@@ -102,6 +121,7 @@ class CodexAppServer:
         self._server_request_tasks: set[asyncio.Task] = set()
         self._pending: dict[int, tuple[asyncio.Future, str]] = {}
         self._notifications: asyncio.Queue = asyncio.Queue()
+        self._notification_bytes = 0
         self._notifications_closed = False
         self._request_ids = itertools.count(1)
         self._write_lock = asyncio.Lock()
@@ -187,25 +207,36 @@ class CodexAppServer:
         request_id = next(self._request_ids)
         future = asyncio.get_running_loop().create_future()
         self._pending[request_id] = (future, method)
-        try:
-            await self._send({
-                "method": method,
-                "id": request_id,
-                "params": params or {},
-            })
-        except BaseException:
-            self._pending.pop(request_id, None)
-            future.cancel()
-            raise
+        crossed_transport_boundary = False
+
+        def mark_transport_started() -> None:
+            nonlocal crossed_transport_boundary
+            crossed_transport_boundary = True
 
         wait_timeout = self.request_timeout if timeout is None else timeout
         try:
-            return await asyncio.wait_for(asyncio.shield(future), wait_timeout)
+            # One deadline covers lock acquisition, transport write/flush and
+            # response wait.  Timing only the response left a wedged writer or
+            # socket send able to block the entire runtime forever.
+            async with asyncio.timeout(wait_timeout):
+                await self._send({
+                    "method": method,
+                    "id": request_id,
+                    "params": params or {},
+                }, on_transport_started=mark_transport_started)
+                return await asyncio.shield(future)
         except TimeoutError as exc:
             self._pending.pop(request_id, None)
             future.cancel()
-            raise AppServerTimeoutError(f"{method} timed out") from exc
+            raise AppServerTimeoutError(
+                f"{method} timed out",
+                outcome_unknown=crossed_transport_boundary,
+            ) from exc
         except asyncio.CancelledError:
+            self._pending.pop(request_id, None)
+            future.cancel()
+            raise
+        except BaseException:
             self._pending.pop(request_id, None)
             future.cancel()
             raise
@@ -225,10 +256,15 @@ class CodexAppServer:
                 item = await asyncio.wait_for(self._notifications.get(), timeout)
         except TimeoutError as exc:
             raise AppServerError("timed out waiting for app-server notification") from exc
+        if isinstance(item, tuple) and len(item) == 2:
+            notification, size = item
+            self._notification_bytes = max(
+                0, self._notification_bytes - int(size))
+            return notification
         if item is _QUEUE_CLOSED:
             self._notifications.put_nowait(_QUEUE_CLOSED)
             raise self._terminal_error or AppServerProcessError("app-server notification stream closed")
-        return item
+        raise AppServerProcessError("app-server notification stream is invalid")
 
     async def close(self) -> None:
         if self._closing:
@@ -272,7 +308,12 @@ class CodexAppServer:
         if not self.running or self._closing:
             raise self._terminal_error or AppServerProcessError("app-server is not running")
 
-    async def _send(self, message: JsonObject) -> None:
+    async def _send(
+        self,
+        message: JsonObject,
+        *,
+        on_transport_started: Callable[[], None] | None = None,
+    ) -> None:
         process = self._process
         if process is None or process.stdin is None or process.returncode is not None:
             raise AppServerProcessError("app-server stdin is unavailable")
@@ -280,6 +321,8 @@ class CodexAppServer:
         try:
             async with self._write_lock:
                 process.stdin.write(encoded)
+                if on_transport_started is not None:
+                    on_transport_started()
                 await process.stdin.drain()
         except (BrokenPipeError, ConnectionResetError) as exc:
             raise AppServerProcessError("app-server stdin closed") from exc
@@ -329,7 +372,7 @@ class CodexAppServer:
                 self._server_request_tasks.add(task)
                 task.add_done_callback(self._server_request_tasks.discard)
             else:
-                self._notifications.put_nowait(message)
+                self._publish_notification(message)
             return
 
         if "id" in message and ("result" in message or "error" in message):
@@ -404,6 +447,33 @@ class CodexAppServer:
         if not self._notifications_closed:
             self._notifications_closed = True
             self._notifications.put_nowait(_QUEUE_CLOSED)
+
+    def _publish_notification(self, message: JsonObject) -> None:
+        try:
+            size = len(json.dumps(
+                message, ensure_ascii=False, separators=(",", ":")
+            ).encode("utf-8"))
+        except (TypeError, ValueError):
+            size = self.notification_max_bytes + 1
+        if (self._notifications.qsize() >= self.notification_max_events
+                or self._notification_bytes + size
+                > self.notification_max_bytes):
+            error = AppServerProcessError(
+                "app-server notification buffer overflow")
+            self._terminal_error = error
+            self._fail_pending(error)
+            while not self._notifications.empty():
+                with suppress(asyncio.QueueEmpty):
+                    self._notifications.get_nowait()
+            self._notification_bytes = 0
+            self._close_notifications()
+            process = self._process
+            if process is not None and process.returncode is None:
+                with suppress(ProcessLookupError):
+                    process.terminate()
+            return
+        self._notification_bytes += size
+        self._notifications.put_nowait((message, size))
 
 
 class CodexSharedAppServer(CodexAppServer):
@@ -510,12 +580,19 @@ class CodexSharedAppServer(CodexAppServer):
         finally:
             await self._close_listener()
 
-    async def _send(self, message: JsonObject) -> None:
+    async def _send(
+        self,
+        message: JsonObject,
+        *,
+        on_transport_started: Callable[[], None] | None = None,
+    ) -> None:
         websocket = self._websocket
         if websocket is None or self._closing:
             raise AppServerProcessError("app-server websocket is unavailable")
         try:
             async with self._write_lock:
+                if on_transport_started is not None:
+                    on_transport_started()
                 await websocket.send(json.dumps(message, separators=(",", ":")))
         except ConnectionClosed as exc:
             raise AppServerProcessError("app-server websocket closed") from exc

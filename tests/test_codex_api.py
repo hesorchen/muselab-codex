@@ -3,6 +3,7 @@
 # ruff: noqa: E402 -- backend.settings validates env during import.
 
 import asyncio
+import json
 import os
 import sys
 import io
@@ -24,6 +25,7 @@ Path(os.environ["MUSELAB_ROOT"]).mkdir(parents=True, exist_ok=True)
 from backend.auth import require_token, require_token_header_or_query
 from backend.codex import (
     CodexAppServer,
+    AppServerTimeoutError,
     CodexAttachmentService,
     CodexApprovalBroker,
     CodexCompactService,
@@ -76,6 +78,50 @@ def test_stream_flushes_ping_before_touching_native_runtime():
 
     assert event.event == "ping"
     assert event.data == ""
+
+
+def test_stream_outcome_unknown_is_not_directly_retryable():
+    class Turns:
+        async def start(self, *_args, **_kwargs):
+            raise AppServerTimeoutError(
+                "turn/start timed out", outcome_unknown=True)
+
+    state = SimpleNamespace(
+        codex_threads=object(),
+        codex_turns=Turns(),
+        codex_attachments=SimpleNamespace(prepare=lambda *_args: SimpleNamespace(
+            inputs=[], images=[], docs=[], client_user_message_id="client-1",
+        )),
+        codex_providers=SimpleNamespace(thread_config=lambda _provider: None),
+    )
+    request = SimpleNamespace(app=SimpleNamespace(state=state))
+    params = {
+        "prompt": "deduplicate me",
+        "session_id": "thread-outcome-unknown",
+        "model": "",
+        "model_provider": "",
+        "permission": "",
+        "effort": "",
+        "service_tier": "",
+        "image_ids": "",
+        "source_device_kind": "desktop",
+    }
+
+    async def events():
+        generator = _stream_ticket_events(request, params)
+        try:
+            return [await anext(generator), await anext(generator)]
+        finally:
+            await generator.aclose()
+
+    ping, error = asyncio.run(events())
+    payload = json.loads(error.data)
+
+    assert ping.event == "ping"
+    assert error.event == "error"
+    assert payload["kind"] == "outcome_unknown"
+    assert payload["outcome_unknown"] is True
+    assert payload["retryable"] is False
 
 
 def test_enqueue_can_atomically_drain_when_busy_state_went_stale():
@@ -525,6 +571,10 @@ def test_native_session_model_and_stream_roundtrip(tmp_path, monkeypatch):
         assert paused.json()["paused"] is True
         removed = client.delete(f"/api/chat/sessions/thread-1/queue/{item_id}")
         assert removed.status_code == 200
+        assert client.get(
+            f"/api/chat/queued-image/{queued_id}",
+            params={"token": os.environ["MUSELAB_TOKEN"]},
+        ).status_code == 404
 
         skills = client.get("/api/chat/skills?force_reload=true")
         assert skills.status_code == 200
@@ -961,7 +1011,6 @@ def test_purge_old_is_server_authoritative_and_cleans_queue(tmp_path):
             f"/api/chat/sessions/{victim['id']}/queue",
             json={"text": "queued"},
         ).status_code == 200
-
         preview = client.post("/api/chat/sessions/purge-old", json={
             "days": 7, "keep_id": keep["id"], "dry_run": True,
         })

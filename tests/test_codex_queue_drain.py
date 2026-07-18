@@ -1,5 +1,7 @@
 """Queue-to-turn handoff must be FIFO, bounded, and failure-safe."""
 
+import json
+
 import pytest
 
 from backend.codex.queue import CodexQueueService
@@ -8,11 +10,14 @@ from backend.codex.turns import TurnAlreadyActive
 
 
 class Attachments:
-    def prepare(self, _thread_id, _image_ids):
+    def prepare(self, _thread_id, _image_ids, **_kwargs):
         return type("Prepared", (), {
             "inputs": [], "images": [], "docs": [],
             "client_user_message_id": None,
         })()
+
+    def ack_queue(self, _thread_id, _item_id, _image_ids):
+        return None
 
 
 class Turns:
@@ -20,9 +25,20 @@ class Turns:
         self.fail = fail
         self.is_busy = busy
         self.started = []
+        self.threads = type("Threads", (), {
+            "read": staticmethod(lambda *_args, **_kwargs: None),
+        })()
 
     def busy(self, _thread_id):
         return self.is_busy
+
+    async def begin_operation(self, _thread_id, *, ensure_loaded=False):
+        del ensure_loaded
+        if self.is_busy:
+            raise TurnAlreadyActive("previous turn still running")
+
+    async def end_operation(self, _thread_id):
+        return None
 
     async def start(self, thread_id, prompt, **kwargs):
         if self.fail:
@@ -51,6 +67,7 @@ async def test_drain_starts_fifo_head_once_when_thread_is_idle():
     assert kwargs["model_provider"] == "openai"
     assert kwargs["effort"] == "high"
     assert kwargs["service_tier"] == "priority"
+    assert kwargs["client_user_message_id"]
     from backend import turn_notifications
     assert turn_notifications._turn_origins["thread-1"] == "desktop"
     turn_notifications.clear_turn_origin("thread-1")
@@ -104,3 +121,46 @@ def test_queue_survives_service_restart_and_persists_every_mutation(tmp_path):
     assert CodexQueueService(state_dir).get("thread-1") == {
         "items": [], "paused": False,
     }
+
+
+def test_queue_v2_keeps_uncertain_starting_as_replay_fence(tmp_path):
+    state_dir = tmp_path / "queues"
+    queue = CodexQueueService(state_dir)
+    queued = queue.enqueue("thread-1", "once")
+    starting = queue.begin_next("thread-1")
+    assert starting["state"] == "starting"
+
+    recovered = CodexQueueService(state_dir)
+    item = recovered.get("thread-1")["items"][0]
+    assert item["state"] == "starting"
+    assert item["client_user_message_id"] == queued["client_user_message_id"]
+    assert recovered.begin_next("thread-1") is None
+    assert recovered.rollback_start("thread-1", queued["id"]) is True
+    assert recovered.begin_next("thread-1")["id"] == queued["id"]
+    assert recovered.ack_started("thread-1", queued["id"]) is True
+
+    payload = json.loads((state_dir / "thread-1.json").read_text())
+    assert payload["version"] == 2
+    assert payload["items"] == []
+    assert payload["tombstones"][0]["client_user_message_id"] == (
+        queued["client_user_message_id"])
+
+
+def test_queue_v1_is_backed_up_and_migrated(tmp_path):
+    state_dir = tmp_path / "queues"
+    state_dir.mkdir()
+    path = state_dir / "thread-1.json"
+    path.write_text(json.dumps({
+        "items": [{
+            "id": "legacy-1", "text": "legacy", "image_ids": "",
+            "enqueued_at": 1,
+        }],
+        "paused": False,
+    }))
+
+    queue = CodexQueueService(state_dir)
+    item = queue.get("thread-1")["items"][0]
+    assert item["state"] == "queued"
+    assert item["client_user_message_id"]
+    assert (state_dir / "thread-1.json.v1.bak").exists()
+    assert json.loads(path.read_text())["version"] == 2

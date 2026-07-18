@@ -25,6 +25,7 @@ from fastapi import HTTPException, UploadFile
 _MAX_BYTES = 10 * 1024 * 1024
 _MAX_TEXT_BYTES = 200 * 1024
 _MAX_ATTACHMENTS = 8
+_STAGED_TTL_SECONDS = 24 * 60 * 60
 _ID_RE = re.compile(r"[0-9a-f]{32}")
 _THREAD_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
 _IMAGE_EXTENSIONS = {
@@ -64,7 +65,7 @@ class CodexAttachmentService:
         except (OSError, ValueError):
             raise ValueError("attachment directory must stay inside the workspace") from None
         children = []
-        for name in ("staged", "threads"):
+        for name in ("staged", "threads", "quarantine"):
             raw = self.base / name
             raw.mkdir(parents=True, exist_ok=True)
             resolved = raw.resolve()
@@ -74,7 +75,7 @@ class CodexAttachmentService:
                 raise ValueError(
                     "attachment subdirectories must stay inside the workspace") from None
             children.append(resolved)
-        self.staged, self.threads = children
+        self.staged, self.threads, self.quarantine = children
 
     async def upload(self, file: UploadFile) -> dict[str, Any]:
         name = _safe_name(file.filename or "upload")
@@ -118,14 +119,26 @@ class CodexAttachmentService:
             "attach_ext": extension.removeprefix(".") if kind == "image" else "",
         }
 
-    def prepare(self, thread_id: str, attachment_ids: str) -> PreparedAttachments:
+    def prepare(
+        self,
+        thread_id: str,
+        attachment_ids: str,
+        *,
+        queue_item_id: str | None = None,
+        client_user_message_id: str | None = None,
+    ) -> PreparedAttachments:
         clean_thread = _thread_id(thread_id)
         ids = _attachment_ids(attachment_ids)
         inputs: list[dict[str, Any]] = []
         images: list[dict[str, Any]] = []
         docs: list[dict[str, Any]] = []
         for attachment_id in ids:
-            metadata, path = self._claim(clean_thread, attachment_id)
+            metadata, path = self._claim(
+                clean_thread,
+                attachment_id,
+                queue_item_id=queue_item_id,
+                client_user_message_id=client_user_message_id,
+            )
             if metadata["kind"] == "image":
                 inputs.append({"type": "localImage", "path": str(path)})
                 images.append(self._image_ui(clean_thread, metadata))
@@ -139,8 +152,10 @@ class CodexAttachmentService:
                     "name": metadata["name"],
                     "kind": metadata["kind"],
                 })
-        client_id = secrets.token_hex(16) if docs else None
-        if client_id is not None:
+        client_id = client_user_message_id or (secrets.token_hex(16) if docs else None)
+        if client_id is not None and not _ID_RE.fullmatch(client_id):
+            raise ValueError("invalid client user message id")
+        if client_id is not None and docs:
             message_dir = self._message_directory(clean_thread, create=True)
             _atomic_write(
                 message_dir / f"{client_id}.json",
@@ -154,6 +169,135 @@ class CodexAttachmentService:
             docs=docs,
             client_user_message_id=client_id,
         )
+
+    def reserve_for_queue(
+        self,
+        thread_id: str,
+        queue_item_id: str,
+        attachment_ids: str,
+    ) -> None:
+        """Atomically assign staged uploads to one durable queue row."""
+        clean_thread = _thread_id(thread_id)
+        if not queue_item_id:
+            raise ValueError("queue item id cannot be empty")
+        originals: list[tuple[Path, dict[str, Any]]] = []
+        try:
+            for attachment_id in _attachment_ids(attachment_ids):
+                meta_path = self.staged / f"{attachment_id}.json"
+                metadata = self._read_metadata(meta_path)
+                if metadata is None:
+                    raise ValueError(
+                        f"attachment is missing or expired: {attachment_id}")
+                data_path = self._staged_path(metadata)
+                if data_path is None:
+                    raise ValueError(f"attachment is invalid: {attachment_id}")
+                if (not data_path.is_file() or data_path.is_symlink()
+                        or data_path.parent.resolve() != self.staged):
+                    raise ValueError(f"attachment is invalid: {attachment_id}")
+                owner = (
+                    metadata.get("queue_owner_thread"),
+                    metadata.get("queue_owner_item"),
+                )
+                if owner != (None, None) and owner != (clean_thread, queue_item_id):
+                    raise ValueError("attachment already belongs to another queue item")
+                originals.append((meta_path, dict(metadata)))
+                updated = dict(metadata)
+                updated["queue_owner_thread"] = clean_thread
+                updated["queue_owner_item"] = queue_item_id
+                updated["reserved_at"] = time.time()
+                _atomic_write(meta_path, json.dumps(
+                    updated, ensure_ascii=False, separators=(",", ":")
+                ).encode())
+        except BaseException:
+            for meta_path, metadata in originals:
+                _atomic_write(meta_path, json.dumps(
+                    metadata, ensure_ascii=False, separators=(",", ":")
+                ).encode())
+            raise
+
+    def release_queue(
+        self,
+        thread_id: str,
+        queue_item_id: str,
+        attachment_ids: str,
+        client_user_message_id: str | None = None,
+    ) -> int:
+        """Reclaim staged bytes owned by a removed/cleared queue row."""
+        clean_thread = _thread_id(thread_id)
+        removed = 0
+        for attachment_id in _attachment_ids(attachment_ids):
+            meta_path = self.staged / f"{attachment_id}.json"
+            metadata = self._read_metadata(meta_path)
+            if metadata is None:
+                continue
+            if (metadata.get("queue_owner_thread"), metadata.get("queue_owner_item")) != (
+                clean_thread, queue_item_id,
+            ):
+                continue
+            data_path = self._staged_path(metadata)
+            if data_path is not None:
+                data_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+            removed += 1
+        try:
+            directory = self._thread_directory(clean_thread)
+        except ValueError:
+            directory = None
+        if directory is not None:
+            for attachment_id in _attachment_ids(attachment_ids):
+                meta_path = directory / f"{attachment_id}.json"
+                metadata = self._read_metadata(meta_path)
+                if metadata is None:
+                    continue
+                if (metadata.get("queue_owner_thread"),
+                        metadata.get("queue_owner_item")) != (
+                    clean_thread, queue_item_id,
+                ):
+                    continue
+                filename = str(metadata.get("filename") or "")
+                if filename and Path(filename).name == filename:
+                    (directory / filename).unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                removed += 1
+        if (isinstance(client_user_message_id, str)
+                and _ID_RE.fullmatch(client_user_message_id)):
+            try:
+                messages = self._message_directory(clean_thread)
+            except ValueError:
+                pass
+            else:
+                (messages / f"{client_user_message_id}.json").unlink(
+                    missing_ok=True)
+        return removed
+
+    def ack_queue(
+        self,
+        thread_id: str,
+        queue_item_id: str,
+        attachment_ids: str,
+    ) -> None:
+        """Transfer claimed queue files to durable thread-history ownership."""
+        clean_thread = _thread_id(thread_id)
+        try:
+            directory = self._thread_directory(clean_thread)
+        except ValueError:
+            return
+        for attachment_id in _attachment_ids(attachment_ids):
+            meta_path = directory / f"{attachment_id}.json"
+            metadata = self._read_metadata(meta_path)
+            if metadata is None:
+                continue
+            if (metadata.get("queue_owner_thread"),
+                    metadata.get("queue_owner_item")) != (
+                clean_thread, queue_item_id,
+            ):
+                continue
+            for key in ("queue_owner_thread", "queue_owner_item", "reserved_at"):
+                metadata.pop(key, None)
+            metadata.pop("queue_client_user_message_id", None)
+            _atomic_write(meta_path, json.dumps(
+                metadata, ensure_ascii=False, separators=(",", ":")
+            ).encode())
 
     def describe_staged(self, attachment_ids: str) -> list[dict[str, Any]]:
         """Return safe UI metadata for attachments waiting in a queue.
@@ -262,7 +406,19 @@ class CodexAttachmentService:
         return path, str(metadata.get("mime") or "application/octet-stream")
 
     def delete_thread(self, thread_id: str) -> None:
-        raw = self.threads / _thread_id(thread_id)
+        clean_thread = _thread_id(thread_id)
+        # Queue state can be lost/corrupt independently. Reclaim any staged
+        # reservation whose durable owner is the deleted thread as a final
+        # lifecycle fence.
+        for meta_path in self.staged.glob("*.json"):
+            metadata = self._read_metadata(meta_path)
+            if metadata is None or metadata.get("queue_owner_thread") != clean_thread:
+                continue
+            data_path = self._staged_path(metadata)
+            if data_path is not None:
+                data_path.unlink(missing_ok=True)
+            meta_path.unlink(missing_ok=True)
+        raw = self.threads / clean_thread
         if raw.is_symlink():
             raw.unlink(missing_ok=True)
             return
@@ -272,21 +428,50 @@ class CodexAttachmentService:
             return
         shutil.rmtree(directory, ignore_errors=True)
 
-    def _claim(self, thread_id: str, attachment_id: str) -> tuple[dict[str, Any], Path]:
+    def _claim(
+        self,
+        thread_id: str,
+        attachment_id: str,
+        *,
+        queue_item_id: str | None = None,
+        client_user_message_id: str | None = None,
+    ) -> tuple[dict[str, Any], Path]:
         directory = self._thread_directory(thread_id, create=True)
         existing_meta = self._read_metadata(directory / f"{attachment_id}.json")
         if existing_meta is not None:
-            existing = directory / str(existing_meta.get("filename") or "")
-            if existing.is_file():
-                return existing_meta, existing.resolve()
+            filename = str(existing_meta.get("filename") or "")
+            if Path(filename).name != filename:
+                raise ValueError(f"attachment is invalid: {attachment_id}")
+            existing = directory / filename
+            owner = (
+                existing_meta.get("queue_owner_thread"),
+                existing_meta.get("queue_owner_item"),
+            )
+            if owner != (None, None) and owner != (thread_id, queue_item_id):
+                raise ValueError("attachment belongs to another queued message")
+            try:
+                resolved = existing.resolve(strict=True)
+                resolved.relative_to(directory)
+            except (OSError, ValueError):
+                resolved = None
+            if (resolved is not None and resolved.is_file()
+                    and not existing.is_symlink()):
+                return existing_meta, resolved
 
         staged_meta = self._read_metadata(self.staged / f"{attachment_id}.json")
         if staged_meta is None:
             raise ValueError(f"attachment is missing or expired: {attachment_id}")
-        source = self.staged / str(staged_meta.get("filename") or "")
+        source = self._staged_path(staged_meta)
+        if source is None:
+            raise ValueError(f"attachment is invalid: {attachment_id}")
         if (not source.is_file() or source.is_symlink()
                 or source.parent.resolve() != self.staged):
             raise ValueError(f"attachment is invalid: {attachment_id}")
+        owner_thread = staged_meta.get("queue_owner_thread")
+        owner_item = staged_meta.get("queue_owner_item")
+        if owner_thread is not None or owner_item is not None:
+            if (owner_thread, owner_item) != (thread_id, queue_item_id):
+                raise ValueError("attachment belongs to another queued message")
         destination = directory / source.name
         os.replace(source, destination)
         try:
@@ -297,7 +482,147 @@ class CodexAttachmentService:
         except BaseException:
             os.replace(destination, source)
             raise
-        return staged_meta, destination.resolve()
+        claimed_meta = dict(staged_meta)
+        if queue_item_id is None:
+            for key in ("queue_owner_thread", "queue_owner_item", "reserved_at"):
+                claimed_meta.pop(key, None)
+        elif (isinstance(client_user_message_id, str)
+                and _ID_RE.fullmatch(client_user_message_id)):
+            claimed_meta["queue_client_user_message_id"] = (
+                client_user_message_id)
+        _atomic_write(
+            directory / f"{attachment_id}.json",
+            json.dumps(
+                claimed_meta, ensure_ascii=False, separators=(",", ":")
+            ).encode(),
+        )
+        return claimed_meta, destination.resolve()
+
+    def reconcile(
+        self,
+        queue_references: dict[str, tuple[str, str]],
+        *,
+        ttl_seconds: float = _STAGED_TTL_SECONDS,
+        now: float | None = None,
+    ) -> dict[str, int]:
+        """Repair staged ownership and quarantine malformed filesystem rows."""
+        if ttl_seconds < 0:
+            raise ValueError("attachment TTL cannot be negative")
+        current = time.time() if now is None else now
+        result = {"adopted": 0, "expired": 0, "reclaimed": 0, "quarantined": 0}
+        seen_data: set[str] = set()
+        for meta_path in list(self.staged.glob("*.json")):
+            attachment_id = meta_path.stem
+            metadata = self._read_metadata(meta_path)
+            if (metadata is None or not _ID_RE.fullmatch(attachment_id)
+                    or metadata.get("id") != attachment_id):
+                self._quarantine(meta_path)
+                result["quarantined"] += 1
+                continue
+            filename = str(metadata.get("filename") or "")
+            data_path = self._staged_path(metadata)
+            if (data_path is None or not data_path.is_file()
+                    or data_path.is_symlink()):
+                self._quarantine(meta_path, data_path)
+                result["quarantined"] += 1
+                continue
+            seen_data.add(filename)
+            expected = queue_references.get(attachment_id)
+            owner = (
+                metadata.get("queue_owner_thread"),
+                metadata.get("queue_owner_item"),
+            )
+            if expected is not None:
+                if owner == (None, None):
+                    metadata["queue_owner_thread"], metadata["queue_owner_item"] = expected
+                    metadata["reserved_at"] = current
+                    _atomic_write(meta_path, json.dumps(
+                        metadata, ensure_ascii=False, separators=(",", ":")
+                    ).encode())
+                    result["adopted"] += 1
+                elif owner != expected:
+                    self._quarantine(meta_path, data_path)
+                    result["quarantined"] += 1
+                continue
+            if owner != (None, None):
+                data_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                result["reclaimed"] += 1
+                continue
+            try:
+                created_at = float(metadata.get("created_at") or 0)
+            except (TypeError, ValueError):
+                created_at = 0
+            if current - created_at >= ttl_seconds:
+                data_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                result["expired"] += 1
+        for data_path in list(self.staged.iterdir()):
+            if data_path.suffix == ".json" or data_path.name in seen_data:
+                continue
+            self._quarantine(data_path)
+            result["quarantined"] += 1
+        self._reconcile_claimed(queue_references, result)
+        return result
+
+    def _reconcile_claimed(
+        self,
+        queue_references: dict[str, tuple[str, str]],
+        result: dict[str, int],
+    ) -> None:
+        for directory in list(self.threads.iterdir()):
+            if (not directory.is_dir() or directory.is_symlink()
+                    or not _THREAD_RE.fullmatch(directory.name)):
+                continue
+            for meta_path in list(directory.glob("*.json")):
+                metadata = self._read_metadata(meta_path)
+                if metadata is None:
+                    continue
+                owner = (
+                    metadata.get("queue_owner_thread"),
+                    metadata.get("queue_owner_item"),
+                )
+                if owner == (None, None):
+                    continue
+                attachment_id = str(metadata.get("id") or "")
+                expected = queue_references.get(attachment_id)
+                filename = str(metadata.get("filename") or "")
+                data_path = (
+                    directory / filename
+                    if filename and Path(filename).name == filename else None
+                )
+                if expected == owner:
+                    continue
+                if expected is not None:
+                    self._quarantine(meta_path, data_path)
+                    result["quarantined"] += 1
+                    continue
+                if data_path is not None:
+                    data_path.unlink(missing_ok=True)
+                meta_path.unlink(missing_ok=True)
+                client_id = metadata.get("queue_client_user_message_id")
+                if isinstance(client_id, str) and _ID_RE.fullmatch(client_id):
+                    (directory / "messages" / f"{client_id}.json").unlink(
+                        missing_ok=True)
+                result["reclaimed"] += 1
+
+    def _staged_path(self, metadata: dict[str, Any]) -> Path | None:
+        filename = str(metadata.get("filename") or "")
+        if not filename or Path(filename).name != filename:
+            return None
+        path = self.staged / filename
+        return path if path.parent == self.staged else None
+
+    def _quarantine(self, *paths: Path | None) -> None:
+        stamp = f"{time.time_ns()}-{secrets.token_hex(3)}"
+        for path in paths:
+            if path is None or not path.exists():
+                continue
+            destination = self.quarantine / f"{stamp}-{path.name}"
+            try:
+                os.replace(path, destination)
+            except OSError:
+                path.unlink(missing_ok=True)
 
     def _metadata_for_path(self, thread_id: str, path: Path) -> dict[str, Any] | None:
         try:

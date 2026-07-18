@@ -32,7 +32,11 @@ from ..auth import require_token, require_token_header_or_query, require_token_q
 from .approvals import CodexApprovalBroker
 from .attachments import CodexAttachmentService
 from .elicitation import CodexElicitationBroker
-from .process import AppServerError, AppServerResponseError
+from .process import (
+    AppServerError,
+    AppServerResponseError,
+    AppServerTimeoutError,
+)
 from .providers import model_for_provider, provider_for_model
 from .queue import CodexQueueService
 from .threads import CodexThreadService
@@ -215,6 +219,48 @@ class TerminalWriteRequest(BaseModel):
 
 def _services(request: Request) -> tuple[CodexThreadService, CodexTurnService]:
     return request.app.state.codex_threads, request.app.state.codex_turns
+
+
+async def _cleanup_thread_storage(request: Request, thread_id: str) -> None:
+    """Remove every muselab-codex sidecar owned by a native thread."""
+    queued = request.app.state.codex_queue.clear(
+        thread_id, include_starting=True)
+    for item in queued:
+        request.app.state.codex_attachments.release_queue(
+            thread_id,
+            str(item.get("id") or ""),
+            str(item.get("image_ids") or ""),
+            str(item.get("client_user_message_id") or ""),
+        )
+    await asyncio.to_thread(
+        request.app.state.codex_attachments.delete_thread, thread_id)
+    request.app.state.codex_usage.delete(thread_id)
+
+
+async def _delete_thread(
+    request: Request,
+    thread_id: str,
+    *,
+    missing_ok: bool = False,
+) -> bool:
+    """Use one native + local cleanup path for single and bulk deletion."""
+    threads, turns = _services(request)
+    missing = False
+    await turns.begin_operation(thread_id, ensure_loaded=False)
+    try:
+        try:
+            await threads.delete(thread_id)
+        except AppServerResponseError as exc:
+            if exc.code not in {-32004, -32600}:
+                raise
+            missing = True
+        await _cleanup_thread_storage(request, thread_id)
+        turns.forget_thread(thread_id)
+    finally:
+        await turns.end_operation(thread_id)
+    if missing and not missing_ok:
+        raise HTTPException(404, "session not found")
+    return not missing
 
 
 @router.get("/workspaces", dependencies=[Depends(require_token)])
@@ -434,24 +480,11 @@ async def purge_old_sessions(
     deleted: list[str] = []
     skipped: list[str] = []
     for thread_id in victims:
-        # A stale timestamp is not permission to kill work that became active
-        # after the initial list snapshot.
-        if turns.busy(thread_id):
-            skipped.append(thread_id)
-            continue
         try:
-            await threads.delete(thread_id)
-        except AppServerResponseError as exc:
-            if exc.code not in {-32004, -32600}:
-                skipped.append(thread_id)
-                continue
-        except (AppServerError, ValueError):
+            await _delete_thread(request, thread_id, missing_ok=True)
+        except (AppServerError, TurnAlreadyActive, ValueError):
             skipped.append(thread_id)
             continue
-        await asyncio.to_thread(
-            request.app.state.codex_attachments.delete_thread, thread_id)
-        request.app.state.codex_usage.delete(thread_id)
-        request.app.state.codex_queue.clear(thread_id)
         deleted.append(thread_id)
     return {
         "ok": True,
@@ -472,7 +505,7 @@ async def get_session(
     limit: int = Query(0, ge=0),
 ) -> dict[str, Any]:
     del full
-    _threads, turns = _services(request)
+    _threads, _turns = _services(request)
     history = request.app.state.codex_history
     try:
         thread = await history.read(thread_id)
@@ -493,7 +526,7 @@ async def get_session(
     else:
         start, end = 0, total
     return {
-        **_session_meta(thread, turns),
+        **_session_meta(thread, _turns),
         "history_unavailable": history.degraded(thread_id),
         "messages": messages[start:end],
         "total": total,
@@ -603,7 +636,10 @@ async def patch_session(
     unsupported = body.system_prompt is not None
     if unsupported:
         raise HTTPException(400, "field is not supported by the Codex-native runtime")
+    reserved = False
     try:
+        await turns.begin_operation(thread_id, ensure_loaded=False)
+        reserved = True
         if (body.permission is not None and body.permission not in {
             "default", "plan", "bypassPermissions",
         }):
@@ -642,12 +678,17 @@ async def patch_session(
         if body.pinned is not None:
             threads.set_pinned(thread_id, body.pinned)
             thread = {**thread, "pinned": body.pinned}
+    except TurnAlreadyActive as exc:
+        raise HTTPException(409, str(exc)) from exc
     except AppServerResponseError as exc:
         if exc.code in {-32004, -32600}:
             raise HTTPException(404, "session not found") from exc
         raise _http_error(exc) from exc
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
+    finally:
+        if reserved:
+            await turns.end_operation(thread_id)
     return _session_meta(
         thread,
         turns,
@@ -659,21 +700,15 @@ async def patch_session(
 
 @router.delete("/sessions/{thread_id}", dependencies=[Depends(require_token)])
 async def delete_session(request: Request, thread_id: str) -> dict[str, Any]:
-    threads, turns = _services(request)
-    if turns.busy(thread_id):
-        raise HTTPException(409, "thread operation still running")
+    _threads, _turns = _services(request)
     try:
-        await threads.delete(thread_id)
-    except AppServerResponseError as exc:
-        if exc.code == -32004:
-            raise HTTPException(404, "session not found") from exc
-        raise _http_error(exc) from exc
+        await _delete_thread(request, thread_id)
+    except TurnAlreadyActive as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except HTTPException:
+        raise
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
-    await asyncio.to_thread(
-        request.app.state.codex_attachments.delete_thread, thread_id)
-    request.app.state.codex_usage.delete(thread_id)
-    request.app.state.codex_queue.clear(thread_id)
     return {"ok": True}
 
 
@@ -684,9 +719,10 @@ async def fork_session(
     body: ForkSessionRequest,
 ) -> dict[str, Any]:
     threads, turns = _services(request)
-    if turns.busy(thread_id):
-        raise HTTPException(409, "thread operation still running")
+    reserved = False
     try:
+        await turns.begin_operation(thread_id, ensure_loaded=False)
+        reserved = True
         provider = _native_provider_id(body.model, body.model_provider)
         config = dict(
             request.app.state.codex_providers.thread_config(provider)
@@ -710,12 +746,17 @@ async def fork_session(
             cwd=body.cwd or None,
         )
         threads.set_effort(str(thread["id"]), body.effort)
+    except TurnAlreadyActive as exc:
+        raise HTTPException(409, str(exc)) from exc
     except AppServerResponseError as exc:
         if exc.code in {-32004, -32600}:
             raise HTTPException(404, "session not found") from exc
         raise _http_error(exc) from exc
     except (AppServerError, ValueError) as exc:
         raise _http_error(exc) from exc
+    finally:
+        if reserved:
+            await turns.end_operation(thread_id)
     return _session_meta(
         thread,
         turns,
@@ -799,8 +840,13 @@ async def get_queue(request: Request, thread_id: str) -> dict[str, Any]:
 @router.post("/sessions/{thread_id}/queue", dependencies=[Depends(require_token)])
 async def enqueue_queue(request: Request, thread_id: str,
                         body: QueueEnqueueRequest) -> dict[str, Any]:
+    item_id = secrets.token_hex(16)
+    client_user_message_id = secrets.token_hex(16)
+    attachments: CodexAttachmentService = request.app.state.codex_attachments
     try:
         provider = _native_provider_id(body.model, body.model_provider)
+        if body.image_ids.strip():
+            attachments.reserve_for_queue(thread_id, item_id, body.image_ids)
         item = request.app.state.codex_queue.enqueue(
             thread_id,
             body.text,
@@ -811,11 +857,24 @@ async def enqueue_queue(request: Request, thread_id: str,
             effort=body.effort,
             service_tier=body.service_tier,
             source_device_kind=body.source_device_kind,
+            item_id=item_id,
+            client_user_message_id=client_user_message_id,
         )
     except OverflowError as exc:
+        if body.image_ids.strip():
+            attachments.release_queue(
+                thread_id, item_id, body.image_ids, client_user_message_id)
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
+        if body.image_ids.strip():
+            attachments.release_queue(
+                thread_id, item_id, body.image_ids, client_user_message_id)
         raise HTTPException(400, str(exc)) from exc
+    except BaseException:
+        if body.image_ids.strip():
+            attachments.release_queue(
+                thread_id, item_id, body.image_ids, client_user_message_id)
+        raise
     started = False
     if body.drain_if_idle:
         started = await request.app.state.codex_queue_drain.drain(thread_id)
@@ -830,8 +889,12 @@ async def enqueue_queue(request: Request, thread_id: str,
 @router.delete("/sessions/{thread_id}/queue/{item_id}", dependencies=[Depends(require_token)])
 async def remove_queue(request: Request, thread_id: str, item_id: str) -> dict[str, Any]:
     try:
-        if not request.app.state.codex_queue.remove(thread_id, item_id):
+        item = request.app.state.codex_queue.remove_item(thread_id, item_id)
+        if item is None:
             raise HTTPException(404, "queue item not found")
+        request.app.state.codex_attachments.release_queue(
+            thread_id, item_id, str(item.get("image_ids") or ""),
+            str(item.get("client_user_message_id") or ""))
         return {"ok": True, **_queue_state(request, thread_id)}
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -840,7 +903,14 @@ async def remove_queue(request: Request, thread_id: str, item_id: str) -> dict[s
 @router.delete("/sessions/{thread_id}/queue", dependencies=[Depends(require_token)])
 async def clear_queue(request: Request, thread_id: str) -> dict[str, Any]:
     try:
-        request.app.state.codex_queue.clear(thread_id)
+        items = request.app.state.codex_queue.clear(thread_id)
+        for item in items:
+            request.app.state.codex_attachments.release_queue(
+                thread_id,
+                str(item.get("id") or ""),
+                str(item.get("image_ids") or ""),
+                str(item.get("client_user_message_id") or ""),
+            )
         return {"ok": True, **_queue_state(request, thread_id)}
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
@@ -872,7 +942,7 @@ async def reorder_queue(request: Request, thread_id: str,
 async def providers(request: Request) -> dict[str, Any]:
     runtime = request.app.state.codex_runtime
     try:
-        result = await runtime.request("model/list", {
+        result = await _runtime_read(runtime, "model/list", {
             "limit": 100,
             "includeHidden": False,
         })
@@ -997,7 +1067,8 @@ async def cost_dashboard(
 ) -> dict[str, Any]:
     """Prefer Codex's authoritative account activity, with a local fallback."""
     try:
-        result = await request.app.state.codex_runtime.request(
+        result = await _runtime_read(
+            request.app.state.codex_runtime,
             "account/usage/read", None, timeout=15)
         if not isinstance(result, dict):
             raise ValueError("account/usage/read returned an invalid result")
@@ -1021,7 +1092,8 @@ async def search_chat_messages(
     threads, turns = _services(request)
     rows: list[dict[str, Any]] = []
     try:
-        result = await request.app.state.codex_runtime.request(
+        result = await _runtime_read(
+            request.app.state.codex_runtime,
             "thread/search",
             {
                 "searchTerm": query,
@@ -1163,7 +1235,8 @@ async def codex_rate_limit(request: Request, refresh: bool = False) -> dict[str,
     """Read the native account rate-limit snapshot when Codex auth supports it."""
     del refresh  # app-server always returns the current snapshot.
     try:
-        result = await request.app.state.codex_runtime.request(
+        result = await _runtime_read(
+            request.app.state.codex_runtime,
             "account/rateLimits/read", None, timeout=15)
     except AppServerError as exc:
         return {"ok": False, "provider_authoritative": False,
@@ -1344,8 +1417,6 @@ async def terminate_terminal_process(request: Request, process_id: str) -> dict[
 )
 async def compact_session(request: Request, thread_id: str) -> dict[str, Any]:
     _threads, turns = _services(request)
-    if turns.busy(thread_id):
-        raise HTTPException(409, "previous turn still running")
     try:
         return await request.app.state.codex_compact.compact(thread_id)
     except TurnAlreadyActive as exc:
@@ -1444,10 +1515,17 @@ async def _stream_ticket_events(request: Request, params: dict[str, Any]):
             return
         except (AppServerError, ValueError) as exc:
             clear_turn_origin(session_id)
+            outcome_unknown = bool(
+                isinstance(exc, AppServerTimeoutError)
+                and exc.outcome_unknown)
             yield ServerSentEvent(event="error", data=json.dumps({
                 "error": str(exc),
-                "kind": "turn_start_failed",
-                "retryable": True,
+                "kind": "outcome_unknown" if outcome_unknown else "turn_start_failed",
+                # A transport-boundary timeout may already have created the
+                # native turn. The browser must reconcile canonical history
+                # before it can safely offer a retry.
+                "retryable": not outcome_unknown,
+                "outcome_unknown": outcome_unknown,
             }, ensure_ascii=False, separators=(",", ":")))
             return
         except BaseException:
@@ -1876,4 +1954,23 @@ def _outline_preview(text: str) -> str:
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ValueError):
         return HTTPException(400, str(exc))
+    if isinstance(exc, AppServerTimeoutError) and exc.outcome_unknown:
+        return HTTPException(504, {
+            "error": str(exc),
+            "kind": "outcome_unknown",
+            "outcome_unknown": True,
+            "generation": exc.generation,
+        })
     return HTTPException(502, str(exc))
+
+
+async def _runtime_read(
+    runtime,
+    method: str,
+    params: dict[str, Any] | None = None,
+    *,
+    timeout: float | None = None,
+) -> Any:
+    read_request = getattr(runtime, "read_request", None)
+    request = read_request if callable(read_request) else runtime.request
+    return await request(method, params, timeout=timeout)

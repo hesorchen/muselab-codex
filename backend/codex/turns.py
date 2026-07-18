@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from collections.abc import Awaitable, Callable
 from typing import Any
+from weakref import WeakValueDictionary
 
-from .event_router import CodexEventRouter, EventSubscription
+from .event_router import (
+    CodexEventRouter,
+    EventSubscription,
+    EventSubscriptionResyncRequired,
+)
 from .history import CodexHistoryService
 from .process import AppServerError, AppServerProtocolError
 from .runtime import CodexRuntime
@@ -17,6 +24,79 @@ from .usage import CodexUsageService
 
 
 _STREAM_CLOSED = object()
+_STREAM_REPLAY_MAX_EVENTS = 512
+_STREAM_REPLAY_MAX_BYTES = 2 * 1024 * 1024
+_STREAM_SUBSCRIBER_MAX_EVENTS = 256
+_STREAM_SUBSCRIBER_MAX_BYTES = 1024 * 1024
+_LOADED_THREADS_MAX = 2048
+_CANONICAL_POLL_SECONDS = 2.0
+_TERMINAL_TURN_STATUSES = frozenset({
+    "completed", "failed", "interrupted", "cancelled",
+})
+
+
+def _envelope_size(envelope: dict[str, Any]) -> int:
+    try:
+        return len(json.dumps(
+            envelope, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8"))
+    except (TypeError, ValueError):
+        return _STREAM_SUBSCRIBER_MAX_BYTES + 1
+
+
+class _TurnSubscriber:
+    """Byte- and item-bounded live SSE handoff for one HTTP client."""
+
+    def __init__(self, max_events: int, max_bytes: int):
+        self._queue: asyncio.Queue = asyncio.Queue()
+        self._max_events = max_events
+        self._max_bytes = max_bytes
+        self._pending_bytes = 0
+        self._accepting = True
+
+    async def get(self):
+        item = await self._queue.get()
+        if isinstance(item, tuple) and len(item) == 2:
+            envelope, size = item
+            self._pending_bytes = max(0, self._pending_bytes - int(size))
+            return envelope
+        return item
+
+    def publish(self, envelope: dict[str, Any]) -> bool:
+        if not self._accepting:
+            return False
+        size = _envelope_size(envelope)
+        if (self._queue.qsize() >= self._max_events
+                or self._pending_bytes + size > self._max_bytes):
+            self.resync("slow_subscriber")
+            return False
+        self._pending_bytes += size
+        self._queue.put_nowait((envelope, size))
+        return True
+
+    def replay(self, envelope: dict[str, Any]) -> bool:
+        return self.publish({"event": envelope["event"], "data": dict(envelope["data"])})
+
+    def resync(self, reason: str) -> None:
+        if not self._accepting:
+            return
+        self._accepting = False
+        while not self._queue.empty():
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._pending_bytes = 0
+        self._queue.put_nowait({
+            "event": "resync",
+            "data": {"reason": reason, "retryable": True},
+        })
+        self._queue.put_nowait(_STREAM_CLOSED)
+
+    def close(self) -> None:
+        if self._accepting:
+            self._accepting = False
+            self._queue.put_nowait(_STREAM_CLOSED)
 
 
 @dataclass
@@ -32,12 +112,18 @@ class TurnStream:
     done: bool = False
     status: str = "inProgress"
     session_usage: dict[str, Any] | None = None
+    replay_max_events: int = _STREAM_REPLAY_MAX_EVENTS
+    replay_max_bytes: int = _STREAM_REPLAY_MAX_BYTES
+    subscriber_max_events: int = _STREAM_SUBSCRIBER_MAX_EVENTS
+    subscriber_max_bytes: int = _STREAM_SUBSCRIBER_MAX_BYTES
     # Relative timing must use a monotonic clock. ``started_at`` remains the
     # wall-clock epoch exposed for diagnostics/deduplication, but subtracting
     # it from a browser's Date.now() is invalid when browser and server run on
     # different devices with slightly different clocks.
     _started_monotonic: float = field(default_factory=time.monotonic, repr=False)
-    _subscribers: set[asyncio.Queue] = field(default_factory=set, repr=False)
+    _subscribers: set[_TurnSubscriber] = field(default_factory=set, repr=False)
+    _replay_bytes: int = field(default=0, repr=False)
+    _replay_truncated: bool = field(default=False, repr=False)
 
     @property
     def elapsed_seconds(self) -> float:
@@ -51,41 +137,81 @@ class TurnStream:
         # memory than the text itself, so compact only consecutive, plain-text
         # deltas in the replay buffer.  Use a separate envelope so extending
         # the replay copy never mutates an event already queued to a client.
-        previous = self.events[-1] if self.events else None
-        previous_data = previous.get("data") if isinstance(previous, dict) else None
-        if (
+        replay = {"event": event, "data": dict(data)}
+        self.events.append(replay)
+        self._replay_bytes += _envelope_size(replay)
+        compactable = (
             event in {"text", "thinking"}
             and set(data) == {"text"}
             and isinstance(data.get("text"), str)
-            and isinstance(previous, dict)
-            and previous.get("event") == event
-            and isinstance(previous_data, dict)
-            and set(previous_data) == {"text"}
-            and isinstance(previous_data.get("text"), str)
-        ):
-            previous["data"] = {"text": previous_data["text"] + data["text"]}
-        else:
-            self.events.append({"event": event, "data": dict(data)})
-        for queue in tuple(self._subscribers):
-            queue.put_nowait(envelope)
+        )
+        if compactable:
+            # Binary compaction keeps replay exact without the O(n²) copying
+            # of repeatedly appending every token to one ever-growing string.
+            # One-byte deltas form power-of-two chunks, so 100k deltas retain
+            # only O(log n) replay envelopes and each byte is copied O(log n).
+            while len(self.events) >= 2:
+                left = self.events[-2]
+                right = self.events[-1]
+                left_data = left.get("data") if isinstance(left, dict) else None
+                right_data = right.get("data") if isinstance(right, dict) else None
+                if (
+                    not isinstance(left_data, dict)
+                    or not isinstance(right_data, dict)
+                    or left.get("event") != event
+                    or right.get("event") != event
+                    or set(left_data) != {"text"}
+                    or set(right_data) != {"text"}
+                    or not isinstance(left_data.get("text"), str)
+                    or not isinstance(right_data.get("text"), str)
+                    or len(left_data["text"]) > len(right_data["text"])
+                ):
+                    break
+                merged = {
+                    "event": event,
+                    "data": {"text": left_data["text"] + right_data["text"]},
+                }
+                self._replay_bytes -= (
+                    _envelope_size(left) + _envelope_size(right))
+                self.events[-2:] = [merged]
+                self._replay_bytes += _envelope_size(merged)
+        if (len(self.events) > self.replay_max_events
+                or self._replay_bytes > self.replay_max_bytes):
+            # Partial replay is more dangerous than no replay: it can append
+            # half a tool/result or assistant response to canonical history.
+            # Keep live delivery intact, discard the reconnect copy, and make
+            # every later subscriber explicitly reload canonical history.
+            self.events.clear()
+            self._replay_bytes = 0
+            self._replay_truncated = True
+        for subscriber in tuple(self._subscribers):
+            if not subscriber.publish(envelope):
+                self._subscribers.discard(subscriber)
 
     def finish(self) -> None:
         self.done = True
-        for queue in tuple(self._subscribers):
-            queue.put_nowait(_STREAM_CLOSED)
+        for subscriber in tuple(self._subscribers):
+            subscriber.close()
+        self._subscribers.clear()
 
-    def subscribe(self) -> asyncio.Queue:
-        queue: asyncio.Queue = asyncio.Queue()
+    def subscribe(self) -> _TurnSubscriber:
+        subscriber = _TurnSubscriber(
+            self.subscriber_max_events, self.subscriber_max_bytes)
+        if self._replay_truncated:
+            subscriber.resync("replay_truncated")
+            return subscriber
         for event in self.events:
-            queue.put_nowait(event)
+            if not subscriber.replay(event):
+                return subscriber
         if self.done:
-            queue.put_nowait(_STREAM_CLOSED)
+            subscriber.close()
         else:
-            self._subscribers.add(queue)
-        return queue
+            self._subscribers.add(subscriber)
+        return subscriber
 
-    def unsubscribe(self, queue: asyncio.Queue) -> None:
-        self._subscribers.discard(queue)
+    def unsubscribe(self, subscriber: _TurnSubscriber) -> None:
+        self._subscribers.discard(subscriber)
+        subscriber.close()
 
 
 class CodexTurnService:
@@ -112,9 +238,40 @@ class CodexTurnService:
         self.on_turn_finished = on_turn_finished
         self._active: dict[str, TurnStream] = {}
         self._operations: set[str] = set()
-        self._loaded_generation: dict[str, int] = {}
+        self._loaded_generation: OrderedDict[str, int] = OrderedDict()
+        self._loaded_runtime_generation: int | None = None
+        self._external_active: dict[str, str] = {}
         self._tasks: set[asyncio.Task] = set()
-        self._lock = asyncio.Lock()
+        self._thread_locks: WeakValueDictionary[str, asyncio.Lock] = (
+            WeakValueDictionary())
+
+    def _coordinator(self, thread_id: str) -> asyncio.Lock:
+        lock = self._thread_locks.get(thread_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._thread_locks[thread_id] = lock
+        return lock
+
+    def _runtime_generation(self) -> int:
+        generation = getattr(self.runtime, "generation", None)
+        if isinstance(generation, int):
+            return generation
+        return int(getattr(self.runtime.health(), "restart_count", 0))
+
+    def _current_generation(self) -> int:
+        generation = self._runtime_generation()
+        if (self._loaded_runtime_generation is not None
+                and self._loaded_runtime_generation != generation):
+            self._loaded_generation.clear()
+        self._loaded_runtime_generation = generation
+        return generation
+
+    def _remember_loaded(self, thread_id: str) -> None:
+        generation = self._current_generation()
+        self._loaded_generation[thread_id] = generation
+        self._loaded_generation.move_to_end(thread_id)
+        while len(self._loaded_generation) > _LOADED_THREADS_MAX:
+            self._loaded_generation.popitem(last=False)
 
     async def start(
         self,
@@ -131,6 +288,7 @@ class CodexTurnService:
         user_images: list[dict[str, Any]] | None = None,
         user_docs: list[dict[str, Any]] | None = None,
         client_user_message_id: str | None = None,
+        _reserved_operation: bool = False,
     ) -> TurnStream:
         clean_id = thread_id.strip()
         clean_prompt = prompt.strip()
@@ -143,13 +301,19 @@ class CodexTurnService:
         if effective_service_tier is None:
             effective_service_tier = self.threads.service_tier(clean_id)
 
-        async with self._lock:
+        async with self._coordinator(clean_id):
             existing = self._active.get(clean_id)
             if existing is not None and not existing.done:
                 raise TurnAlreadyActive("previous turn still running")
-            if clean_id in self._operations:
+            if clean_id in self._external_active:
+                raise TurnAlreadyActive("native turn status requires resync")
+            if _reserved_operation:
+                if clean_id not in self._operations:
+                    raise RuntimeError("thread operation was not reserved")
+                self._operations.discard(clean_id)
+            elif clean_id in self._operations:
                 raise TurnAlreadyActive("thread operation still running")
-            generation = self.runtime.health().restart_count
+            generation = self._current_generation()
             if self._loaded_generation.get(clean_id) != generation:
                 # A persisted thread is not automatically loaded into a fresh
                 # app-server process. ``turn/start`` against that unloaded id
@@ -165,7 +329,7 @@ class CodexTurnService:
                 if effective_service_tier is not None:
                     resume_kwargs["service_tier"] = effective_service_tier
                 await self.threads.resume(clean_id, **resume_kwargs)
-                self._loaded_generation[clean_id] = generation
+                self._remember_loaded(clean_id)
             subscription = await self.events.subscribe(clean_id)
             stream = TurnStream(
                 clean_id,
@@ -200,13 +364,19 @@ class CodexTurnService:
             try:
                 result = await self.runtime.request("turn/start", params)
                 turn = _turn_from_result(result)
-                self.threads.mark_materialized(clean_id)
                 stream.turn_id = turn["id"]
                 stream.status = str(turn.get("status") or "inProgress")
             except BaseException:
                 self._active.pop(clean_id, None)
                 await subscription.close()
                 raise
+            try:
+                # Native success is the commit point.  A secondary sidecar
+                # fsync failure must not make the caller retry an already
+                # accepted turn.
+                self.threads.mark_materialized(clean_id)
+            except OSError:
+                pass
             task = asyncio.create_task(
                 self._pump(stream, subscription),
                 name=f"codex-turn-{stream.turn_id}",
@@ -225,31 +395,48 @@ class CodexTurnService:
         return stream if stream is not None and not stream.done else None
 
     def busy(self, thread_id: str) -> bool:
-        return self.active(thread_id) is not None or thread_id in self._operations
+        return (self.active(thread_id) is not None
+                or thread_id in self._operations
+                or thread_id in self._external_active)
 
-    async def begin_operation(self, thread_id: str, *, model: str = "") -> None:
+    async def begin_operation(
+        self,
+        thread_id: str,
+        *,
+        model: str = "",
+        ensure_loaded: bool = True,
+    ) -> None:
         clean_id = thread_id.strip()
         if not clean_id:
             raise ValueError("thread id cannot be empty")
-        async with self._lock:
+        async with self._coordinator(clean_id):
             stream = self._active.get(clean_id)
             if stream is not None and not stream.done:
                 raise TurnAlreadyActive("previous turn still running")
+            if clean_id in self._external_active:
+                raise TurnAlreadyActive("native turn status requires resync")
             if clean_id in self._operations:
                 raise TurnAlreadyActive("thread operation still running")
             self._operations.add(clean_id)
             try:
-                generation = self.runtime.health().restart_count
-                if self._loaded_generation.get(clean_id) != generation:
+                generation = self._current_generation()
+                if (ensure_loaded
+                        and self._loaded_generation.get(clean_id) != generation):
                     await self.threads.resume(clean_id, model=model or None)
-                    self._loaded_generation[clean_id] = generation
+                    self._remember_loaded(clean_id)
             except BaseException:
                 self._operations.discard(clean_id)
                 raise
 
     async def end_operation(self, thread_id: str) -> None:
-        async with self._lock:
-            self._operations.discard(thread_id.strip())
+        clean_id = thread_id.strip()
+        async with self._coordinator(clean_id):
+            self._operations.discard(clean_id)
+
+    def forget_thread(self, thread_id: str) -> None:
+        clean_id = thread_id.strip()
+        self._loaded_generation.pop(clean_id, None)
+        self._external_active.pop(clean_id, None)
 
     async def publish_permission(self, thread_id: str, data: dict[str, Any]) -> None:
         stream = self.active(thread_id)
@@ -275,16 +462,19 @@ class CodexTurnService:
         )
 
     async def interrupt(self, thread_id: str) -> bool:
-        stream = self.active(thread_id)
-        if stream is None or stream.turn_id is None:
-            return False
-        result = await self.runtime.request("turn/interrupt", {
-            "threadId": thread_id,
-            "turnId": stream.turn_id,
-        })
-        if result != {}:
-            raise AppServerProtocolError("turn/interrupt returned an invalid result")
-        return True
+        clean_id = thread_id.strip()
+        async with self._coordinator(clean_id):
+            stream = self.active(clean_id)
+            if stream is None or stream.turn_id is None:
+                return False
+            result = await self.runtime.request("turn/interrupt", {
+                "threadId": clean_id,
+                "turnId": stream.turn_id,
+            })
+            if result != {}:
+                raise AppServerProtocolError(
+                    "turn/interrupt returned an invalid result")
+            return True
 
     async def close(self) -> None:
         tasks = tuple(self._tasks)
@@ -315,6 +505,12 @@ class CodexTurnService:
                     break
         except asyncio.CancelledError:
             raise
+        except EventSubscriptionResyncRequired:
+            stream.status = "resyncRequired"
+            stream.publish("resync", {
+                "reason": "event_subscriber_overflow",
+                "retryable": True,
+            })
         except AppServerError as exc:
             stream.publish("error", {
                 "error": str(exc),

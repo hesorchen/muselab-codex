@@ -1543,7 +1543,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           const last = app.messages[app.messages.length - 1];
           return app.streaming === true
             && last && last.role === "assistant"
-            && last.html.includes("MID_STREAM_VISIBLE_1")
+            && last.streamText.includes("MID_STREAM_VISIBLE_1")
             && body.includes("MID_STREAM_VISIBLE_1");
         }""",
         timeout=10000,
@@ -1555,7 +1555,7 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         return {
           streaming: app.streaming,
           textLength: last.text.length,
-          htmlLength: last.html.length,
+          streamTextLength: last.streamText.length,
         };
         """,
     )
@@ -1574,8 +1574,8 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
           return app.streaming === true
             && last && last.role === "assistant"
             && last.text.length > prev.textLength
-            && last.html.length >= prev.htmlLength
-            && last.html.includes("MID_STREAM_VISIBLE_2")
+            && last.streamText.length > prev.streamTextLength
+            && last.streamText.includes("MID_STREAM_VISIBLE_2")
             && body.includes("MID_STREAM_VISIBLE_2");
         }""",
         arg=mid_1,
@@ -1645,4 +1645,92 @@ def test_120kb_mixed_sse_stream_renders_final_assistant_html(
         """,
     )
 
+    _assert_no_browser_errors(page, errors)
+
+
+def test_mobile_live_cap_preserves_reader_anchor_and_bounds_dom(
+    page: Page, backend_url, auth_token
+):
+    """Evict a growing live head without moving a reader above the tail."""
+    errors = _capture_browser_errors(page)
+    page.set_viewport_size({"width": 390, "height": 844})
+    _login(page, backend_url, auth_token)
+    sid = "perf-live-reader-anchor"
+    _bootstrap_session_for_real_load(page, sid, "Perf live reader anchor")
+
+    _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        st._loaded = true;
+        st._loadedOffset = 0;
+        st._earlierMessages = [];
+        st.messages = Array.from({ length: 180 }, (_, i) => ({
+          role: i % 2 ? "assistant" : "user",
+          text: `LIVE_CAP_${String(i).padStart(3, "0")} ${"reader anchor ".repeat(10)}`,
+          html: i % 2 ? `<p>LIVE_CAP_${String(i).padStart(3, "0")} ${"reader anchor ".repeat(10)}</p>` : "",
+          uuid: `live-cap-${i}`,
+          _k: `live-cap-${i}`,
+          _noAnim: true,
+        }));
+        app.messages = st.messages;
+        app.messagesReady = true;
+        return true;
+        """,
+        sid,
+    )
+    page.wait_for_function(
+        """() => Array.from(document.querySelectorAll('.msg-pane'))
+          .filter(p => getComputedStyle(p).display !== 'none')
+          .reduce((n, p) => n + p.querySelectorAll('.msg[data-uuid]').length, 0) === 180""",
+        timeout=10000,
+    )
+
+    before = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const body = app._chatScrollEl(arg);
+        const anchor = body.querySelector('[data-uuid="live-cap-150"]');
+        anchor.scrollIntoView({ block: "center" });
+        st.atBottom = false;
+        app.atBottom = false;
+        const top = anchor.getBoundingClientRect().top;
+        app._capLiveMessages(st, arg);
+        return { top, scrollTop: body.scrollTop };
+        """,
+        sid,
+    )
+    page.wait_for_function(
+        """() => Array.from(document.querySelectorAll('.msg-pane'))
+          .filter(p => getComputedStyle(p).display !== 'none')
+          .reduce((n, p) => n + p.querySelectorAll('.msg[data-uuid]').length, 0) === 60""",
+        timeout=10000,
+    )
+    page.wait_for_timeout(50)
+    after = _app_eval(
+        page,
+        """
+        const st = app._ensureTabState(arg);
+        const body = app._chatScrollEl(arg);
+        const anchor = body.querySelector('[data-uuid="live-cap-150"]');
+        return {
+          top: anchor && anchor.getBoundingClientRect().top,
+          messages: st.messages.length,
+          earlier: st._earlierMessages.length,
+          loadedOffset: st._loadedOffset,
+          atBottom: st.atBottom,
+          scrollTop: body.scrollTop,
+        };
+        """,
+        sid,
+    )
+
+    assert after["messages"] == 60
+    assert after["earlier"] == 120
+    assert after["loadedOffset"] == 0
+    assert after["atBottom"] is False
+    assert after["top"] is not None
+    assert abs(after["top"] - before["top"]) < 3
+    assert after["scrollTop"] < before["scrollTop"]
     _assert_no_browser_errors(page, errors)
