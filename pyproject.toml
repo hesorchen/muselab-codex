@@ -76,7 +76,7 @@ Documentation = "https://github.com/hesorchen/muselab-codex/blob/main/docs/READM
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.5.0",
+    "httpx2>=2.7.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     # Pinned alongside dev deps so `scripts/lint.sh` and CI both have a
