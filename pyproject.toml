@@ -40,7 +40,7 @@ classifiers = [
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.138.1",
-    "sse-starlette>=3.4.4",
+    "sse-starlette>=3.4.6",
     # Pin starlette above the fastapi-transitive 1.0.0, which carries
     # PYSEC-2026-161 (fixed in 1.0.1). Direct constraint so the pip-audit
     # CVE-scan CI job stays green.
